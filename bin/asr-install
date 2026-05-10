@@ -1,0 +1,11 @@
+#!/usr/bin/env bun
+
+import { ensureIbusComponentInstalled } from "../src/runtime/ibus.ts";
+
+const result = await ensureIbusComponentInstalled();
+if (!result.ok) {
+    console.error(result.error.message);
+    process.exit(1);
+}
+
+console.log(result.value);

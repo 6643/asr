@@ -1,0 +1,36 @@
+# dependencies (bun install)
+node_modules
+
+# output
+out
+dist
+*.tgz
+
+# credentials and secrets
+config/doubao.json
+*.pem
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# code coverage
+coverage
+*.lcov
+
+# logs
+logs
+*.log
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# IntelliJ based IDEs
+.idea
+.vscode
+
+# Finder (MacOS) folder config
+.DS_Store
