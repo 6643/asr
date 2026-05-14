@@ -1,6 +1,7 @@
 // 音频处理
 
 import type { Config } from "./config.ts";
+import { err, isErr, ok, type Result } from "../../util.ts";
 
 // WAV 文件头结构
 interface WavHeader {
@@ -10,100 +11,128 @@ interface WavHeader {
     dataSize: number;
 }
 
+interface WavParseState extends WavHeader {
+    offset: number;
+}
+
+interface WavChunk {
+    id: string;
+    size: number;
+    offset: number;
+}
+
 // 解析 WAV 文件头
-const parseWavHeader = (data: Uint8Array): WavHeader => {
+const parseWavHeader = (data: Uint8Array): Result<WavHeader> => {
+    if (data.length < 12) {
+        return err(new Error("Not a valid WAV file: file too short"));
+    }
     const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
 
     // 检查 "RIFF" 标记
     const riff = String.fromCharCode(data[0]!, data[1]!, data[2]!, data[3]!);
     if (riff !== "RIFF") {
-        throw new Error("Not a valid WAV file: missing RIFF header");
+        return err(new Error("Not a valid WAV file: missing RIFF header"));
     }
 
     // 检查 "WAVE" 标记
     const wave = String.fromCharCode(data[8]!, data[9]!, data[10]!, data[11]!);
     if (wave !== "WAVE") {
-        throw new Error("Not a valid WAV file: missing WAVE header");
+        return err(new Error("Not a valid WAV file: missing WAVE header"));
     }
 
-    let offset = 12;
-    let sampleRate = 0;
-    let channels = 0;
-    let bitsPerSample = 0;
-    let dataSize = 0;
+    return parseWavChunks(data, view, { offset: 12, sampleRate: 0, channels: 0, bitsPerSample: 0, dataSize: 0 });
+};
 
-    // 解析 chunks
-    while (offset < data.length) {
-        const chunkId = String.fromCharCode(data[offset]!, data[offset + 1]!, data[offset + 2]!, data[offset + 3]!);
-        const chunkSize = view.getUint32(offset + 4, true);
+const parseWavChunks = (data: Uint8Array, view: DataView, state: WavParseState): Result<WavHeader> => {
+    if (state.offset >= data.length) return ok(state);
+    const chunk = readWavChunk(data, view, state.offset);
+    if (isErr(chunk)) return err(chunk.error);
+    const nextState = applyWavChunk(view, state, chunk.value);
+    if (isErr(nextState)) return err(nextState.error);
+    if (chunk.value.id === "data") return ok(nextState.value);
+    return parseWavChunks(data, view, nextState.value);
+};
 
-        if (chunkId === "fmt ") {
-            const audioFormat = view.getUint16(offset + 8, true);
-            if (audioFormat !== 1 && audioFormat !== 3) {
-                throw new Error(`Unsupported WAV format: ${audioFormat} (only PCM and Float supported)`);
-            }
-            channels = view.getUint16(offset + 10, true);
-            sampleRate = view.getUint32(offset + 12, true);
-            bitsPerSample = view.getUint16(offset + 22, true);
-        } else if (chunkId === "data") {
-            dataSize = chunkSize;
-            break;
-        }
+const readWavChunk = (data: Uint8Array, view: DataView, offset: number): Result<WavChunk> => {
+    if (offset + 8 > data.length) return err(new Error("Not a valid WAV file: truncated chunk header"));
+    const id = String.fromCharCode(data[offset]!, data[offset + 1]!, data[offset + 2]!, data[offset + 3]!);
+    const size = view.getUint32(offset + 4, true);
+    if (offset + 8 + size > data.length) return err(new Error(`Not a valid WAV file: truncated ${id} chunk`));
+    return ok({ id, size, offset });
+};
 
-        offset += 8 + chunkSize;
-        if (chunkSize % 2 === 1) offset++; // 对齐
+const applyWavChunk = (view: DataView, state: WavParseState, chunk: WavChunk): Result<WavParseState> => {
+    if (chunk.id === "fmt ") return applyFormatWavChunk(view, state, chunk);
+    if (chunk.id === "data") return ok({ ...state, dataSize: chunk.size });
+    return ok({ ...state, offset: nextWavChunkOffset(chunk) });
+};
+
+const applyFormatWavChunk = (view: DataView, state: WavParseState, chunk: WavChunk): Result<WavParseState> => {
+    const audioFormat = view.getUint16(chunk.offset + 8, true);
+    if (audioFormat !== 1 && audioFormat !== 3) {
+        return err(new Error(`Unsupported WAV format: ${audioFormat} (only PCM and Float supported)`));
     }
+    return ok({
+        ...state,
+        channels: view.getUint16(chunk.offset + 10, true),
+        sampleRate: view.getUint32(chunk.offset + 12, true),
+        bitsPerSample: view.getUint16(chunk.offset + 22, true),
+        offset: nextWavChunkOffset(chunk),
+    });
+};
 
-    return { sampleRate, channels, bitsPerSample, dataSize };
+const nextWavChunkOffset = (chunk: WavChunk): number => {
+    const nextOffset = chunk.offset + 8 + chunk.size;
+    return chunk.size % 2 === 1 ? nextOffset + 1 : nextOffset;
 };
 
 // 读取 WAV 文件的 PCM 数据
 export const readWavPcm = async (
     wavPath: string,
-): Promise<{
-    sampleRate: number;
-    channels: number;
-    pcmData: Uint8Array;
-}> => {
+): Promise<
+    Result<{
+        sampleRate: number;
+        channels: number;
+        pcmData: Uint8Array;
+    }>
+> => {
     const file = Bun.file(wavPath);
     const arrayBuffer = await file.arrayBuffer();
     const data = new Uint8Array(arrayBuffer);
+    if (data.length < 44) {
+        return err(new Error("WAV file is too short"));
+    }
 
     const header = parseWavHeader(data);
+    if (isErr(header)) return err(header.error);
+    const wavHeader = header.value;
 
-    if (header.bitsPerSample !== 16) {
-        throw new Error(`Only 16-bit PCM WAV is supported, got ${header.bitsPerSample}-bit`);
+    if (wavHeader.bitsPerSample !== 16) {
+        return err(new Error(`Only 16-bit PCM WAV is supported, got ${wavHeader.bitsPerSample}-bit`));
     }
 
-    // 查找 data chunk 的起始位置
-    let offset = 12;
-    let dataOffset = 0;
     const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-
-    while (offset < data.length) {
-        const chunkId = String.fromCharCode(data[offset]!, data[offset + 1]!, data[offset + 2]!, data[offset + 3]!);
-        const chunkSize = view.getUint32(offset + 4, true);
-
-        if (chunkId === "data") {
-            dataOffset = offset + 8;
-            break;
-        }
-
-        offset += 8 + chunkSize;
-        if (chunkSize % 2 === 1) offset++;
-    }
+    const dataOffset = findWavDataOffset(data, view, 12);
 
     if (dataOffset === 0) {
-        throw new Error("WAV data chunk not found");
+        return err(new Error("WAV data chunk not found"));
     }
 
-    const pcmData = data.slice(dataOffset, dataOffset + header.dataSize);
+    const pcmData = data.slice(dataOffset, dataOffset + wavHeader.dataSize);
 
-    return {
-        sampleRate: header.sampleRate,
-        channels: header.channels,
+    return ok({
+        sampleRate: wavHeader.sampleRate,
+        channels: wavHeader.channels,
         pcmData,
-    };
+    });
+};
+
+const findWavDataOffset = (data: Uint8Array, view: DataView, offset: number): number => {
+    if (offset >= data.length) return 0;
+    const chunkId = String.fromCharCode(data[offset]!, data[offset + 1]!, data[offset + 2]!, data[offset + 3]!);
+    const chunkSize = view.getUint32(offset + 4, true);
+    if (chunkId === "data") return offset + 8;
+    return findWavDataOffset(data, view, nextWavChunkOffset({ id: chunkId, size: chunkSize, offset }));
 };
 
 // 音频编码器接口
@@ -120,36 +149,38 @@ export const createAudioEncoder = (config: Config): AudioEncoder => ({
 export const splitPcmFrames = async (encoder: AudioEncoder, pcmData: Uint8Array): Promise<Uint8Array[]> => {
     const samplesPerFrame = Math.floor((encoder.config.sampleRate * encoder.config.frameDurationMs) / 1000);
     const bytesPerFrame = samplesPerFrame * 2; // 16-bit
-    const frames: Uint8Array[] = [];
-    for (let i = 0; i < pcmData.length; i += bytesPerFrame) {
-        let frame = pcmData.slice(i, i + bytesPerFrame);
-        // 补零
-        if (frame.length < bytesPerFrame) {
-            const padded = new Uint8Array(bytesPerFrame);
-            padded.set(frame);
-            frame = padded;
-        }
-        frames.push(frame);
-    }
-    return frames;
+    const frameCount = Math.ceil(pcmData.length / bytesPerFrame);
+    return Array.from({ length: frameCount }, (_, index) => createPcmFrame(pcmData, index * bytesPerFrame, bytesPerFrame));
+};
+
+const createPcmFrame = (pcmData: Uint8Array, start: number, bytesPerFrame: number): Uint8Array => {
+    const frame = pcmData.slice(start, start + bytesPerFrame);
+    if (frame.length >= bytesPerFrame) return frame;
+    const padded = new Uint8Array(bytesPerFrame);
+    padded.set(frame);
+    return padded;
 };
 
 // 将音频文件转换为 PCM
 export const convertAudioToPcm = async (
     audioPath: string,
-    sampleRate: number = 16000,
-    channels: number = 1,
-): Promise<Uint8Array> => {
+    _sampleRate: number = 16000,
+    _channels: number = 1,
+): Promise<Result<Uint8Array>> => {
     // 检查是否为 WAV 文件
-    if (audioPath.toLowerCase().endsWith(".wav")) {
-        const { pcmData } = await readWavPcm(audioPath);
-        // 注意：这里没有进行重采样。如果 WAV 的采样率不是 16000，需要重采样。
-        return pcmData;
-    }
+    if (audioPath.toLowerCase().endsWith(".wav")) return convertWavToPcm(audioPath);
 
     // 其他格式需要 ffmpeg 或其他工具转换
-    throw new Error(
-        `Unsupported audio format. Please convert to WAV (16-bit PCM) first.\n` +
-            `You can use: ffmpeg -i ${audioPath} -acodec pcm_s16le -ar 16000 -ac 1 output.wav`,
+    return err(
+        new Error(
+            `Unsupported audio format. Please convert to WAV (16-bit PCM) first.\n` +
+                `You can use: ffmpeg -i ${audioPath} -acodec pcm_s16le -ar 16000 -ac 1 output.wav`,
+        ),
     );
+};
+
+const convertWavToPcm = async (audioPath: string): Promise<Result<Uint8Array>> => {
+    const wavResult = await readWavPcm(audioPath);
+    if (isErr(wavResult)) return err(wavResult.error);
+    return ok(wavResult.value.pcmData);
 };

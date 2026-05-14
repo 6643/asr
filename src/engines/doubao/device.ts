@@ -11,6 +11,7 @@ import {
   USER_AGENT,
 } from "./constants.ts";
 import type { DeviceCredentials } from "./types.ts";
+import { err, isErr, ok, trySyncResult, type Result } from "../../util.ts";
 
 const bytesToHex = (bytes: Uint8Array): string =>
   Array.from(bytes)
@@ -165,7 +166,7 @@ const fetchWithTimeout = (url: string, init: RequestInit, timeoutMs = FETCH_TIME
 };
 
 // 注册设备
-export const registerDevice = async (): Promise<DeviceCredentials> => {
+export const registerDevice = async (): Promise<Result<DeviceCredentials>> => {
   const cdid = generateCDID();
   const openudid = generateOpenUDID();
   const clientudid = generateClientUDID();
@@ -211,13 +212,13 @@ export const registerDevice = async (): Promise<DeviceCredentials> => {
   });
 
   if (!response.ok) {
-    throw new Error(`Device registration failed: ${response.status}`);
+    return err(new Error(`Device registration failed: ${response.status}`));
   }
 
   const data = (await response.json()) as DeviceRegisterResponse;
 
   if (data.device_id && data.device_id !== 0) {
-    return {
+    return ok({
       device_id: String(data.device_id),
       install_id: String(data.install_id),
       cdid,
@@ -226,14 +227,14 @@ export const registerDevice = async (): Promise<DeviceCredentials> => {
       token: "",
       sami_token: null,
       wave_session: null,
-    };
+    });
   }
 
-  throw new Error("Device registration failed: invalid response");
+  return err(new Error("Device registration failed: invalid response"));
 };
 
 // 获取 ASR token
-export const getAsrToken = async (deviceId: string, cdid: string | null): Promise<string> => {
+export const getAsrToken = async (deviceId: string, cdid: string | null): Promise<Result<string>> => {
   if (!cdid) {
     cdid = generateCDID();
   }
@@ -266,29 +267,28 @@ export const getAsrToken = async (deviceId: string, cdid: string | null): Promis
   });
 
   if (!response.ok) {
-    throw new Error(`Get ASR token failed: ${response.status}`);
+    return err(new Error(`Get ASR token failed: ${response.status}`));
   }
 
   const data = (await response.json()) as SettingsResponse;
-  return data.data.settings.asr_config.app_key;
+  return ok(data.data.settings.asr_config.app_key);
 };
 
 // 简单的 JWT 过期检查
 export const isJwtExpired = (token: string, margin: number = 60): boolean => {
-  try {
     const parts = token.split(".");
     if (parts.length < 2) return false;
 
     const payloadB64 = parts[1];
     if (!payloadB64) return false;
     const padded = payloadB64 + "=".repeat((4 - (payloadB64.length % 4)) % 4);
-    const payload = JSON.parse(Buffer.from(padded, "base64").toString("utf-8"));
+
+  const payloadResult = trySyncResult(() => JSON.parse(Buffer.from(padded, "base64").toString("utf-8")) as Record<string, unknown>);
+  if (isErr(payloadResult)) return false;
+  const payload = payloadResult.value;
 
     const exp = payload.exp;
     if (exp === undefined) return false;
 
-    return Date.now() / 1000 >= exp - margin;
-  } catch {
-    return false;
-  }
-}
+    return Date.now() / 1_000 >= (exp as number) - margin;
+};

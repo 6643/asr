@@ -13,5 +13,5 @@ export interface RecognitionEngine<TClient> {
     createClient: () => TClient;
     prepare: (client: TClient) => Promise<Result<void>>;
     describe: (client: TClient) => string[];
-    startSession: (client: TClient) => Promise<Result<RecognitionSession>>;
+    startSession: (client: TClient, options?: { debugEnabled?: boolean }) => Promise<Result<RecognitionSession>>;
 }

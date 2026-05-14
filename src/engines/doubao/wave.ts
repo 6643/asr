@@ -4,6 +4,8 @@ import { createCipheriv, createHash } from "crypto";
 
 import { HANDSHAKE_URL, HKDF_INFO, USER_AGENT } from "./constants.ts";
 import type { WaveSession } from "./types.ts";
+import { err, isErr, ok, tryAsyncResult, type Result } from "../../util.ts";
+import { printTimedDomainError } from "../../runtime/output.ts";
 
 // 密钥交换信息
 export interface KeyShare {
@@ -109,6 +111,13 @@ const deriveKey = async (sharedKey: Uint8Array, salt: Uint8Array, info: Uint8Arr
 
 // 执行握手
 export const handshake = async (client: WaveClient): Promise<boolean> => {
+    const result = await tryAsyncResult(() => handshakeUnchecked(client));
+    if (!isErr(result)) return result.value;
+    printTimedDomainError("doubao", `Handshake failed: ${result.error.message}`);
+    return false;
+};
+
+const handshakeUnchecked = async (client: WaveClient): Promise<boolean> => {
     const keyPair = await generateKeyPair();
     client.privateKey = keyPair.privateKey;
     client.publicKey = keyPair.publicKey;
@@ -137,73 +146,74 @@ export const handshake = async (client: WaveClient): Promise<boolean> => {
         "User-Agent": USER_AGENT,
     };
 
-    try {
-        const response = await fetch(HANDSHAKE_URL, {
-            method: "POST",
-            headers,
-            body: requestJson,
-        });
+    const response = await fetch(HANDSHAKE_URL, {
+        method: "POST",
+        headers,
+        body: requestJson,
+    });
 
-        if (!response.ok) {
-            return false;
-        }
+    if (!response.ok) return false;
 
-        const resp = (await response.json()) as HandshakeResponse;
+    const resp = (await response.json()) as HandshakeResponse;
+    const serverPubkey = Buffer.from(resp.key_share.pubkey, "base64");
+    const sharedKey = await computeSharedKey(client, new Uint8Array(serverPubkey));
+    const serverRandom = Buffer.from(resp.random, "base64");
+    const salt = concatBytes([clientRandom, serverRandom]);
+    const encryptionKey = await deriveKey(sharedKey, salt, HKDF_INFO);
 
-        const serverPubkey = Buffer.from(resp.key_share.pubkey, "base64");
-        let sharedKey: Uint8Array;
-        try {
-            const serverPublicKey = await crypto.subtle.importKey(
-                "raw",
-                toBufferSource(new Uint8Array(serverPubkey)),
-                { name: "X25519" },
-                false,
-                [],
-            ) as CryptoKey;
-            const bits = await crypto.subtle.deriveBits(
-                {
-                    name: "X25519",
-                    public: serverPublicKey,
-                },
-                client.privateKey!,
-                256,
-            );
-            sharedKey = new Uint8Array(bits);
-            if (client.session) {
-                client.session.shared_key = sharedKey;
-            }
-        } catch (e) {
-            console.error("Failed to compute shared secret:", e);
-            sharedKey = new Uint8Array(32);
-        }
-
-        const serverRandom = Buffer.from(resp.random, "base64");
-
-        const salt = concatBytes([clientRandom, serverRandom]);
-        const encryptionKey = await deriveKey(sharedKey, salt, HKDF_INFO);
-
-        client.session = {
-            ticket: resp.ticket,
-            ticket_long: resp.ticket_long,
-            encryption_key: encryptionKey,
-            client_random: clientRandom,
-            server_random: serverRandom,
-            shared_key: sharedKey,
-            ticket_exp: resp.ticket_exp,
-            ticket_long_exp: resp.ticket_long_exp,
-            expires_at: Date.now() / 1000 + resp.ticket_exp - 60,
-        };
-
-        if (client.onSessionUpdate && client.session) {
-            client.onSessionUpdate(client.session);
-        }
-
-        return true;
-    } catch (e) {
-        console.error("Handshake failed:", e);
-        return false;
-    }
+    client.session = createWaveSession(resp, encryptionKey, clientRandom, serverRandom, sharedKey);
+    client.onSessionUpdate?.(client.session);
+    return true;
 };
+
+const computeSharedKey = async (client: WaveClient, serverPubkey: Uint8Array): Promise<Uint8Array> => {
+    const result = await tryAsyncResult(() => deriveSharedKey(client.privateKey!, serverPubkey));
+    if (isErr(result)) return fallbackSharedKey(result.error);
+    if (client.session) client.session.shared_key = result.value;
+    return result.value;
+};
+
+const deriveSharedKey = async (privateKey: CryptoKey, serverPubkey: Uint8Array): Promise<Uint8Array> => {
+    const serverPublicKey = await crypto.subtle.importKey(
+        "raw",
+        toBufferSource(serverPubkey),
+        { name: "X25519" },
+        false,
+        [],
+    ) as CryptoKey;
+    const bits = await crypto.subtle.deriveBits(
+        {
+            name: "X25519",
+            public: serverPublicKey,
+        },
+        privateKey,
+        256,
+    );
+    return new Uint8Array(bits);
+};
+
+const fallbackSharedKey = (error: Error): Uint8Array => {
+    printTimedDomainError("doubao", `Failed to compute shared secret: ${error.message}`);
+    return new Uint8Array(32);
+};
+
+const createWaveSession = (
+    resp: HandshakeResponse,
+    encryptionKey: Uint8Array,
+    clientRandom: Uint8Array,
+    serverRandom: Uint8Array,
+    sharedKey: Uint8Array,
+): WaveSession => ({
+    ticket: resp.ticket,
+    ticket_long: resp.ticket_long,
+    encryption_key: encryptionKey,
+    client_random: clientRandom,
+    server_random: serverRandom,
+    shared_key: sharedKey,
+    ticket_exp: resp.ticket_exp,
+    ticket_long_exp: resp.ticket_long_exp,
+    expires_at: Date.now() / 1000 + resp.ticket_exp - 60,
+});
 
 // 检查会话是否过期
 const isSessionExpired = (client: WaveClient): boolean => {
@@ -212,24 +222,27 @@ const isSessionExpired = (client: WaveClient): boolean => {
 }
 
 // 确保会话有效
-const ensureSession = (client: WaveClient): void => {
+const ensureSession = (client: WaveClient): Result<WaveSession> => {
     if (client.session === null || isSessionExpired(client)) {
-        throw new Error("Session expired or not initialized. Call handshake() first.");
+        return err(new Error("Session expired or not initialized. Call handshake() first."));
     }
+    return ok(client.session);
 }
 
 // 准备加密请求
-export const prepareRequest = (client: WaveClient, plaintext: Uint8Array, extraHeaders?: Record<string, string>): [Uint8Array, Record<string, string>] => {
-    ensureSession(client);
+export const prepareRequest = (client: WaveClient, plaintext: Uint8Array, extraHeaders?: Record<string, string>): Result<[Uint8Array, Record<string, string>]> => {
+    const sessionResult = ensureSession(client);
+    if (isErr(sessionResult)) return err(sessionResult.error);
+    const session = sessionResult.value;
 
     const nonce = crypto.getRandomValues(new Uint8Array(12));
-    const ciphertext = chacha20Crypt(client.session!.encryption_key, nonce, plaintext);
+    const ciphertext = chacha20Crypt(session.encryption_key, nonce, plaintext);
     const stub = simpleHash(ciphertext).toUpperCase();
 
     const headers: Record<string, string> = {
         "Content-Type": "application/json",
         "x-tt-e-b": "1",
-        "x-tt-e-t": client.session!.ticket,
+        "x-tt-e-t": session.ticket,
         "x-tt-e-p": Buffer.from(nonce).toString("base64"),
         "x-ss-stub": stub,
     };
@@ -238,27 +251,20 @@ export const prepareRequest = (client: WaveClient, plaintext: Uint8Array, extraH
         Object.assign(headers, extraHeaders);
     }
 
-    return [ciphertext, headers];
+    return ok([ciphertext, headers]);
 };
 
 // 解密数据
-export const waveDecrypt = (client: WaveClient, ciphertext: Uint8Array, nonce: Uint8Array): Uint8Array => {
+export const waveDecrypt = (client: WaveClient, ciphertext: Uint8Array, nonce: Uint8Array): Result<Uint8Array> => {
     if (!client.session) {
-        throw new Error("No active session. Call handshake() first.");
+        return err(new Error("No active session. Call handshake() first."));
     }
 
-    return chacha20Crypt(client.session.encryption_key, nonce, ciphertext);
+    return ok(chacha20Crypt(client.session.encryption_key, nonce, ciphertext));
 };
 
-// 简单的哈希（用于 stub，实际应实现 MD5）
 const simpleHash = (data: Uint8Array): string => {
-    let hash = 0;
-    for (let i = 0; i < data.length; i++) {
-        const char = data[i]!;
-        hash = (hash << 5) - hash + char;
-        hash = hash & hash;
-    }
-    return Math.abs(hash).toString(16).padStart(8, "0");
+    return createHash("md5").update(Buffer.from(data)).digest("hex");
 }
 
 // 辅助函数：连接字节数组

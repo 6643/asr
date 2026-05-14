@@ -2,8 +2,11 @@
  * Text commit: IBus only.
  */
 
-import net from "net";
-import fs from "fs";
+import { err, isErr, ok, tryAsyncResult, type Result } from "../util.ts";
+import { isIbusRuntimeStatusReady } from "./ibus.ts";
+import { callIbusServiceStringMethodInWorker } from "./ibus-rpc-worker-client.ts";
+import { printTimedDomain } from "./output.ts";
+import { isDebugEnabled } from "./config.ts";
 
 export interface CommitResult {
     success: boolean;
@@ -11,119 +14,119 @@ export interface CommitResult {
     message: string;
 }
 
-const DEFAULT_IBUS_SOCKET = process.env.ASR_IBUS_SOCKET || "/tmp/asr_ibus.sock";
 const RETRYABLE_IBUS_RESPONSES = new Set([
-    `ERR connect ENOENT ${DEFAULT_IBUS_SOCKET}`,
     "ERR empty_response",
+    "ERR engine_not_active",
     "ERR engine_not_created",
+    "ERR engine_not_enabled",
     "ERR engine_not_focused",
     "ERR timeout",
+    "ERR service_unavailable",
 ]);
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const IBUS_COMMIT_RETRY_PLAN = {
+    maxAttempts: 3,
+    timeoutMs: 1500,
+    delayMs: 200,
+} as const;
 
-export const probeIbusSocket = (socketPath: string, timeoutMs = 300): Promise<boolean> => {
-    return new Promise((resolve) => {
-        const socket = new net.Socket();
-        const timer = setTimeout(() => {
-            socket.destroy();
-            resolve(false);
-        }, timeoutMs);
+export const getIbusCommitRetryPlan = (): typeof IBUS_COMMIT_RETRY_PLAN => IBUS_COMMIT_RETRY_PLAN;
 
-        socket.once("connect", () => {
-            clearTimeout(timer);
-            socket.end();
-            resolve(true);
-        });
-        socket.once("error", () => {
-            clearTimeout(timer);
-            socket.destroy();
-            resolve(false);
-        });
-
-        try {
-            socket.connect(socketPath);
-        } catch {
-            clearTimeout(timer);
-            socket.destroy();
-            resolve(false);
-        }
-    });
+const isCommitDebugEnabled = (): boolean => {
+    return isDebugEnabled();
 };
 
-const waitForSocket = async (socketPath: string, attempts = 40, intervalMs = 100): Promise<boolean> => {
-    for (let i = 0; i < attempts; i++) {
-        if (await probeIbusSocket(socketPath)) return true;
-        await sleep(intervalMs);
-    }
-    return await probeIbusSocket(socketPath);
+const normalizeIbusResponse = (response: string): string => {
+    const trimmed = response.trim();
+    if (!trimmed) return "ERR empty_response";
+    return trimmed.replace(/^ERR\s+ERR\s+/, "ERR ");
+};
+
+const debugCommit = (message: string): void => {
+    if (!isCommitDebugEnabled()) return;
+    printTimedDomain("ibus", message);
+};
+
+const readIbusStatusInWorker = (timeoutMs: number): Promise<Result<string>> => {
+    return callIbusServiceStringMethodInWorker("GetStatus", [], timeoutMs);
+};
+
+const waitForIbusRuntimeReadyInWorker = async (timeoutMs: number): Promise<Result<void>> => {
+    const status = await readIbusStatusInWorker(timeoutMs);
+    if (isErr(status)) return err(status.error);
+    if (isIbusRuntimeStatusReady(status.value)) return ok(undefined);
+    return err(new Error(status.value));
+};
+
+const commitIbusTextInWorker = (text: string, timeoutMs: number): Promise<Result<string>> => {
+    return callIbusServiceStringMethodInWorker("CommitText", [text], timeoutMs);
 };
 
 export const isRetryableIbusResponse = (response: string): boolean => {
-    return RETRYABLE_IBUS_RESPONSES.has(response.trim());
+    return RETRYABLE_IBUS_RESPONSES.has(normalizeIbusResponse(response));
 };
 
 const commitViaIbus = async (text: string): Promise<{ ok: boolean; response: string }> => {
-    try {
-        if (!(await waitForSocket(DEFAULT_IBUS_SOCKET))) {
-            return { ok: false, response: `ERR connect ENOENT ${DEFAULT_IBUS_SOCKET}` };
-        }
+    const result = await tryAsyncResult(() => commitViaIbusUnchecked(text));
+    if (!isErr(result)) return result.value;
+    const response = normalizeIbusResponse(`ERR ${result.error.message}`);
+    debugCommit(`result ${response}`);
+    return { ok: false, response };
+};
 
-        let output = "";
-        for (let attempt = 0; attempt < 20; attempt++) {
-            output = await new Promise<string>((resolve) => {
-                const socket = net.createConnection(DEFAULT_IBUS_SOCKET);
-                let response = "";
-                const timer = setTimeout(() => {
-                    socket.destroy();
-                    resolve("ERR timeout");
-                }, 1500);
+const commitViaIbusUnchecked = async (text: string): Promise<{ ok: boolean; response: string }> => {
+    const retryPlan = getIbusCommitRetryPlan();
+    await debugIbusStatus(retryPlan.timeoutMs);
+    const ready = await ensureIbusReadyForCommit(retryPlan.timeoutMs);
+    if (isErr(ready)) return { ok: false, response: normalizeIbusResponse(`ERR ${ready.error.message}`) };
+    const output = await runIbusCommitAttempts(text, retryPlan);
+    const finalOutput = normalizeIbusResponse(output);
+    debugCommit(`result ${finalOutput || "ERR empty_response"}`);
+    return { ok: output.startsWith("OK "), response: finalOutput };
+};
 
-                socket.on("readable", () => {
-                    let chunk: Buffer | null;
-                    while ((chunk = socket.read()) !== null) {
-                        response += chunk.toString("utf8");
-                        const trimmed = response.trim();
-                        if (trimmed.startsWith("OK ") || trimmed.startsWith("ERR ")) {
-                            clearTimeout(timer);
-                            socket.destroy();
-                            resolve(trimmed);
-                            return;
-                        }
-                    }
-                });
-                socket.on("error", (error) => {
-                    clearTimeout(timer);
-                    if (
-                        error &&
-                        typeof error === "object" &&
-                        "code" in error &&
-                        (error as { code?: string }).code === "ENOENT"
-                    ) {
-                        resolve(`ERR connect ENOENT ${DEFAULT_IBUS_SOCKET}`);
-                        return;
-                    }
-                    resolve(`ERR ${error instanceof Error ? error.message : String(error)}`);
-                });
-                socket.on("close", () => {
-                    clearTimeout(timer);
-                    if (!response.trim()) resolve("ERR empty_response");
-                });
-                socket.write(`${text}\n`);
-            });
+const debugIbusStatus = async (timeoutMs: number): Promise<void> => {
+    if (!isCommitDebugEnabled()) return;
+    const statusResult = await readIbusStatusInWorker(timeoutMs);
+    debugCommit(formatIbusStatusResult(statusResult));
+};
 
-            if (!isRetryableIbusResponse(output)) {
-                break;
-            }
+const formatIbusStatusResult = (statusResult: Result<string>): string => {
+    if (isErr(statusResult)) return `status err: ${statusResult.error.message}`;
+    return `status ${statusResult.value}`;
+};
 
-            await sleep(250);
-        }
-
-        return { ok: output.startsWith("OK "), response: output.trim() };
-    } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return { ok: false, response: `ERR ${message}` };
+const ensureIbusReadyForCommit = async (timeoutMs: number): Promise<Result<void>> => {
+    debugCommit("waitForReady start");
+    const readyResult = await waitForIbusRuntimeReadyInWorker(timeoutMs);
+    if (!isErr(readyResult)) {
+        debugCommit("waitForReady ok");
+        return ok(undefined);
     }
+    debugCommit(`waitForReady err ${readyResult.error.message}`);
+    return err(readyResult.error);
+};
+
+const runIbusCommitAttempts = async (
+    text: string,
+    retryPlan: typeof IBUS_COMMIT_RETRY_PLAN,
+    attempt = 0,
+    lastOutput = "",
+): Promise<string> => {
+    if (attempt >= retryPlan.maxAttempts) return lastOutput;
+    const output = await runIbusCommitAttempt(text, retryPlan.timeoutMs, attempt);
+    if (!isRetryableIbusResponse(output)) return output;
+    await sleep(retryPlan.delayMs);
+    return runIbusCommitAttempts(text, retryPlan, attempt + 1, output);
+};
+
+const runIbusCommitAttempt = async (text: string, timeoutMs: number, attempt: number): Promise<string> => {
+    debugCommit(`commit rpc start attempt=${attempt + 1}`);
+    const commitResult = await commitIbusTextInWorker(text, timeoutMs);
+    const output = normalizeIbusResponse(isErr(commitResult) ? "ERR service_unavailable" : commitResult.value);
+    debugCommit(`commit rpc end attempt=${attempt + 1} ${output}`);
+    return output;
 };
 
 export const commitText = async (text: string): Promise<CommitResult> => {

@@ -1,25 +1,44 @@
 import { expect, mock, test } from "bun:test";
-import { err } from "../../util.ts";
+import { err, isErr, ok, type Result } from "../../util.ts";
 
-test("doubao session does not retry the live stream on retryable startup errors", async () => {
+test("doubao session starts the live stream before events are consumed", async () => {
     let calls = 0;
 
-    mock.module("./client.ts", () => ({
-        transcribeRealtime: mock(async function* () {
+    const { createDoubaoSession } = await import("./session.ts");
+    const sessionResult = createDoubaoSession({} as never, {
+        transcribeRealtime: async function* () {
             calls++;
             yield err(new Error("ERR timeout"));
-        }),
-    }));
+        },
+    });
 
-    const { createDoubaoSession } = await import("./session.ts");
-    const [session, sessionError] = createDoubaoSession({} as never);
-
-    expect(sessionError).toBeNull();
-
-    const iterator = session.events[Symbol.asyncIterator]();
-    const first = await iterator.next();
+    expect(isErr(sessionResult)).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(calls).toBe(1);
-    expect(first.done).toBe(false);
-    expect(first.value?.[1]?.message).toBe("ERR timeout");
+});
+
+test("doubao session rejects audio after the bounded queue is full", async () => {
+    const { createDoubaoSession } = await import("./session.ts");
+    const sessionResult = createDoubaoSession({} as never, {
+        transcribeRealtime: async function* () {
+            await new Promise(() => {});
+        },
+    });
+
+    expect(isErr(sessionResult)).toBe(false);
+    if (isErr(sessionResult)) return;
+    const session = sessionResult.value;
+
+    const chunk = new Uint8Array([1]);
+    let pushResult: Result<void> = err(new Error("not called"));
+    for (let i = 0; i < 512; i++) {
+        pushResult = await session.pushAudio(chunk);
+        expect(isErr(pushResult)).toBe(false);
+    }
+
+    pushResult = await session.pushAudio(chunk);
+    expect(isErr(pushResult)).toBe(true);
+    if (isErr(pushResult)) expect(pushResult.error.message).toBe("Audio queue is full or closed");
+    await session.close();
 });

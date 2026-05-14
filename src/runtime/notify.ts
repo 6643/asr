@@ -8,5 +8,5 @@ export const playMicReadyNotification = async (): Promise<void> => {
         stdout: "ignore",
         stderr: "ignore",
     });
-    await proc.exited.catch(() => {});
+    await proc.exited.catch(() => {}); // optional notification, failure is acceptable
 };

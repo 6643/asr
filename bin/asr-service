@@ -2,5 +2,28 @@
 
 import { startIbusService } from "../src/runtime/ibus.ts";
 
-await startIbusService();
-await new Promise(() => {});
+const stopIbusService = await startIbusService();
+const stopController = new AbortController();
+const stopSignal = stopController.signal;
+const shutdown = async (): Promise<void> => {
+    stopController.abort();
+    await stopIbusService();
+};
+
+process.once("SIGINT", () => {
+    void shutdown().catch(() => {});
+});
+process.once("SIGTERM", () => {
+    void shutdown().catch(() => {});
+});
+
+await new Promise<void>((resolve) => {
+    if (stopSignal.aborted) {
+        resolve();
+        return;
+    }
+    stopSignal.addEventListener("abort", () => resolve(), { once: true });
+});
+
+await stopIbusService();
+process.exit(0);

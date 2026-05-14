@@ -1,6 +1,7 @@
 // SAMI 服务相关
 
 import { SAMI_CONFIG_URL, SAMI_APP_KEY, USER_AGENT, APP_CONFIG, DEFAULT_DEVICE_CONFIG } from "./constants.ts";
+import { err, ok, type Result } from "../../util.ts";
 
 // 计算 SHA-256 哈希
 const sha256 = async (data: Uint8Array): Promise<Uint8Array> => {
@@ -83,7 +84,7 @@ interface SamiConfigResponse {
 // 获取 SAMI 配置
 const FETCH_TIMEOUT_MS = 15000;
 
-const fetchWithTimeout = (url: string, init: RequestInit, timeoutMs = FETCH_TIMEOUT_MS): Promise<Response> => {
+const fetchWithTimeout = async (url: string, init: RequestInit, timeoutMs = FETCH_TIMEOUT_MS): Promise<Response> => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     return fetch(url, { ...init, signal: controller.signal }).finally(() => clearTimeout(timer));
@@ -118,15 +119,15 @@ const getSamiConfig = async (cdid: string): Promise<Response> => {
 };
 
 // 获取 SAMI token
-export const getSamiToken = async (cdid: string | null = null): Promise<string> => {
+export const getSamiToken = async (cdid: string | null = null): Promise<Result<string>> => {
     const cdidStr = cdid ?? crypto.randomUUID();
 
     const response = await getSamiConfig(cdidStr);
 
     if (!response.ok) {
-        throw new Error(`Get SAMI token failed: ${response.status}`);
+        return err(new Error(`Get SAMI token failed: ${response.status}`));
     }
 
     const data = (await response.json()) as SamiConfigResponse;
-    return data.data.sami_token;
+    return ok(data.data.sami_token);
 };

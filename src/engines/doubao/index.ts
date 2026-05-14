@@ -7,6 +7,6 @@ export const createDoubaoEngine = (): RecognitionEngine<ReturnType<typeof create
     name: "doubao",
     createClient: () => createClient(),
     prepare: async (client) => ensureCredentials(client.config),
-    describe: (client) => [`ASR engine: doubao(${client.config.deviceId})`],
-    startSession: async (client) => createDoubaoSession(client),
+    describe: (client) => [`[doubao] ${client.config.deviceId}`],
+    startSession: async (client, options) => createDoubaoSession(client, options),
 });

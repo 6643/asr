@@ -6,49 +6,55 @@ const writeTimedLine = (message: string): void => {
     console.log(`${formatTime()} ${message}`);
 };
 
-export const printStartupBanner = (): void => {
-    writeTimedLine("实时语音识别（按键触发模式）");
-    writeTimedLine("按下 右Alt 键开始说话, 松开结束");
-    console.log("");
+const writeTimedError = (message: string): void => {
+    console.error(`${formatTime()} ${message}`);
 };
 
-export const printInitError = (label: string, message: string): void => {
-    console.error(`${formatTime()} ❌ ${label}: ${message}`);
+export const printTimedDomain = (domain: string, message: string): void => {
+    writeTimedLine(`[${domain}] ${message}`);
+};
+
+export const printTimedDomainError = (domain: string, message: string): void => {
+    writeTimedError(`[${domain}] ${message}`);
 };
 
 export const printSessionStart = (): void => {
-    writeTimedLine("🎤");
+    printTimedDomain("doubao", "🎤");
 };
 
 export const printInterim = (text: string): void => {
-    writeTimedLine(`🎤 ${text || "…"}`);
+    printTimedDomain("doubao", `🎤 ${text || "…"}`);
 };
 
 export const printFinal = (text: string): void => {
-    writeTimedLine(`🚀 ${text || "…"}`);
+    printTimedDomain("doubao", `🚀 ${text || "…"}`);
 };
 
 export const printRecognitionError = (message: string): void => {
-    console.error(`${formatTime()} ❌ 识别错误: ${message}`);
+    printTimedDomainError("doubao", `❎ ${message}`);
 };
 
 export const printAsrError = (message: string): void => {
-    console.error(`${formatTime()} ❌ ${message}`);
-};
-
-export const printVadStart = (): void => {
-    return;
+    printTimedDomainError("doubao", `❎ ${message}`);
 };
 
 export const printIbusCommitSuccess = (): void => {
-    writeTimedLine("✅ ibus ok");
+    printTimedDomain("ibus", "✅");
 };
 
 export const printIbusCommitFailure = (message: string): void => {
-    writeTimedLine(`❎ ibus err: ${message}`);
+    printTimedDomain("ibus", `❎: ${message}`);
 };
 
 export const printKeyDevice = (device: string): void => {
-    writeTimedLine(`Keyboard device: ${device}`);
-    console.log("");
+    printTimedDomain("kbd", device);
+};
+
+export const printKeyboardWait = (event: "down" | "up", key: string): void => {
+    printTimedDomain("kbd", `wait ${event} ${key}`);
+};
+
+export const printKeyboardEvent = (event: "press" | "release"): void => {
+    const label = event === "press" ? "down" : "up";
+    printTimedDomain("kbd", `${label} RightAlt`);
 };

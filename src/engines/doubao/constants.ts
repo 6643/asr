@@ -1,3 +1,7 @@
+import { isProductionMode } from "./constants-mode.ts";
+import { resolveSamiAppKey } from "./sami-app-key.ts";
+import { isErr } from "../../util.ts";
+
 // 设备注册 API URL
 export const REGISTER_URL = "https://log.snssdk.com/service/2/device_register/";
 
@@ -20,7 +24,11 @@ export const NER_URL = "https://speech.bytedance.com/api/v3/context/ime/ner";
 export const AID = 401734;
 
 // SAMI 语音相关的服务 APP KEY (支持环境变量覆盖)
-export const SAMI_APP_KEY = process.env.ASR_SAMI_APP_KEY?.trim() || "SYlxZr6LnvBaIVmF";
+const _samiAppKeyResult = resolveSamiAppKey(process.env.ASR_SAMI_APP_KEY, isProductionMode());
+if (isErr(_samiAppKeyResult)) {
+    throw _samiAppKeyResult.error;
+}
+export const SAMI_APP_KEY: string = _samiAppKeyResult.value;
 
 // HKDF info 字符串 (支持环境变量覆盖, 格式为十六进制字符串)
 const _hkdfInfoRaw = process.env.ASR_HKDF_INFO?.trim() || "4e30514609050cd3";

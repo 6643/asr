@@ -1,18 +1,56 @@
 // 麦克风音频捕获
 
-import { tryResult } from "../util.ts";
+import { ignoreError, isErr, tryAsyncResult } from "../util.ts";
 
 const DEFAULT_SAMPLE_RATE = 16000;
 const DEFAULT_CHANNELS = 1;
-const FRAME_DURATION_MS = 20;
-const FRAME_BYTES = (DEFAULT_SAMPLE_RATE * FRAME_DURATION_MS) / 1000 * 2;
+const FRAME_DURATION_MS = 100;
+
+export const getMicFrameBytes = (sampleRate: number, channels: number): number => {
+    return Math.floor((sampleRate * FRAME_DURATION_MS) / 1000) * channels * 2;
+};
+
+const drainStderr = async (stream: ReadableStream<Uint8Array>, onStderr: (message: string) => void): Promise<void> => {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    try {
+        await drainStderrReader(reader, decoder, onStderr);
+    } finally {
+        releaseReadableReader(reader);
+    }
+};
+
+const drainStderrReader = async (
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    decoder: TextDecoder,
+    onStderr: (message: string) => void,
+): Promise<void> => {
+    const result = await tryAsyncResult(() => reader.read());
+    if (isErr(result) || result.value.done) return;
+    emitStderrChunk(result.value.value, decoder, onStderr);
+    await drainStderrReader(reader, decoder, onStderr);
+};
+
+const emitStderrChunk = (
+    value: Uint8Array | undefined,
+    decoder: TextDecoder,
+    onStderr: (message: string) => void,
+): void => {
+    if (!value) return;
+    onStderr(decoder.decode(value, { stream: true }));
+};
+
+const releaseReadableReader = (reader: ReadableStreamDefaultReader<Uint8Array>): void => {
+    ignoreError(() => reader.releaseLock());
+};
 
 // 从麦克风捕获音频流（Linux arecord）
 export const createMicStream = (
-    options: { sampleRate?: number; channels?: number; signal?: AbortSignal } = {},
+    options: { sampleRate?: number; channels?: number; signal?: AbortSignal; onStderr?: (message: string) => void } = {},
 ): AsyncGenerator<Uint8Array> & { stop: () => void } => {
     const sampleRate = options.sampleRate ?? DEFAULT_SAMPLE_RATE;
     const channels = options.channels ?? DEFAULT_CHANNELS;
+    const frameBytes = getMicFrameBytes(sampleRate, channels);
     let proc: ReturnType<typeof Bun.spawn> | null = null;
     let stopped = false;
 
@@ -31,55 +69,78 @@ export const createMicStream = (
     const generator = async function* (): AsyncGenerator<Uint8Array> {
         proc = Bun.spawn(["arecord", "-f", "S16_LE", "-r", String(sampleRate), "-c", String(channels), "-t", "raw"], {
             stdout: "pipe",
-            stderr: "ignore",
+            stderr: options.onStderr ? "pipe" : "ignore",
         });
 
+        if (options.onStderr && proc.stderr && typeof proc.stderr !== "number") {
+            void drainStderr(proc.stderr as ReadableStream<Uint8Array>, options.onStderr);
+        }
+
         if (!proc.stdout || typeof proc.stdout === "number") {
-            throw new Error("arecord stdout is null");
+            stop();
+            return;
         }
 
         const stream = proc.stdout as ReadableStream<Uint8Array>;
         const reader = stream.getReader();
 
-        let buffer = new Uint8Array(0);
+        const state = { buffer: new Uint8Array(0) };
 
         try {
-            for (;;) {
-                if (stopped) break;
-
-                const [result, readError] = await tryResult<{ done: boolean; value?: Uint8Array }>(reader.read());
-                if (readError !== null || result.done) break;
-
-                const value = result.value!;
-
-                const newBuffer = new Uint8Array(buffer.length + value.length);
-                newBuffer.set(buffer);
-                newBuffer.set(value, buffer.length);
-                buffer = newBuffer;
-
-                while (buffer.length >= FRAME_BYTES) {
-                    if (stopped) break;
-                    const frame = buffer.slice(0, FRAME_BYTES);
-                    buffer = buffer.slice(FRAME_BYTES);
-                    yield frame;
-                }
-            }
-
-            if (!stopped && buffer.length > 0) {
-                const padded = new Uint8Array(FRAME_BYTES);
-                padded.set(buffer);
-                yield padded;
-            }
+            yield* readMicFrames(reader, state, frameBytes, () => stopped);
         } finally {
-            try {
-                reader.releaseLock();
-            } catch {
-                // ignore
-            }
+            releaseReadableReader(reader);
             proc?.kill();
             proc = null;
         }
     };
 
     return Object.assign(generator(), { stop });
+};
+
+const readMicFrames = async function* (
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    state: { buffer: Uint8Array },
+    frameBytes: number,
+    isStopped: () => boolean,
+): AsyncGenerator<Uint8Array> {
+    if (isStopped()) return;
+    const result = await tryAsyncResult(() => reader.read());
+    if (isErr(result) || result.value.done) {
+        yield* createFinalMicFrame(state, frameBytes, isStopped);
+        return;
+    }
+    appendMicBuffer(state, result.value.value ?? new Uint8Array(0));
+    yield* takeBufferedMicFrames(state, frameBytes);
+    yield* readMicFrames(reader, state, frameBytes, isStopped);
+};
+
+const appendMicBuffer = (state: { buffer: Uint8Array }, value: Uint8Array): void => {
+    const newBuffer = new Uint8Array(state.buffer.length + value.length);
+    newBuffer.set(state.buffer);
+    newBuffer.set(value, state.buffer.length);
+    state.buffer = newBuffer;
+};
+
+const takeBufferedMicFrames = function* (
+    state: { buffer: Uint8Array },
+    frameBytes: number,
+): Generator<Uint8Array> {
+    while (state.buffer.length >= frameBytes) {
+        const frame = state.buffer.slice(0, frameBytes);
+        state.buffer = state.buffer.slice(frameBytes);
+        yield frame;
+    }
+};
+
+const createFinalMicFrame = function* (
+    state: { buffer: Uint8Array },
+    frameBytes: number,
+    isStopped: () => boolean,
+): Generator<Uint8Array> {
+    if (isStopped()) return;
+    if (state.buffer.length === 0) return;
+    const padded = new Uint8Array(frameBytes);
+    padded.set(state.buffer);
+    yield padded;
 };

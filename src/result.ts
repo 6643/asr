@@ -1,24 +1,46 @@
-// Go 风格 Result 元组: [data, error]
-// 成功时 error 为 null; 失败时 data 为 null, error 非 null.
-export type Result<T> = [T, Error | null];
+// Rust-style Result. The tag, not the value type, distinguishes success from failure.
 
-// 构造成功 Result
-export const ok = <T>(value: T): Result<T> => [value, null];
+export interface Ok<T> {
+    readonly ok: true;
+    readonly value: T;
+}
 
-export const err = (error: Error): Result<never> => [null as never, error];
+export interface Err {
+    readonly ok: false;
+    readonly error: Error;
+}
 
-export const isOk = (result: Result<unknown>): result is [unknown, null] => result[1] === null;
+export type Result<T> = Ok<T> | Err;
 
-export const isErr = (result: Result<unknown>): result is [null, Error] => result[1] !== null;
+type LooseThenable<T> = {
+    then: (resolve: (value: T) => unknown, reject?: (reason: unknown) => unknown) => unknown;
+};
 
-export const tryResult = async <T>(input: () => T | Promise<T>): Promise<Result<T>> => {
+const toError = (error: unknown): Error => {
+    if (error instanceof Error) return error;
+    return new Error(typeof error === "string" ? error : String(error));
+};
+
+export const ok = <T>(value: T): Ok<T> => ({ ok: true, value });
+
+export const err = (error: unknown): Err => ({ ok: false, error: toError(error) });
+
+export const isOk = <T>(result: Result<T>): result is Ok<T> => result.ok;
+
+export const isErr = <T>(result: Result<T>): result is Err => !result.ok;
+
+export const trySyncResult = <T>(fn: () => T): Result<T> => {
     try {
-        const result = input();
-        if (result instanceof Promise) {
-            return result.then(ok).catch((e) => err(e instanceof Error ? e : new Error(String(e))));
-        }
-        return ok(result as T);
-    } catch (e) {
-        return err(e instanceof Error ? e : new Error(String(e)));
+        return ok(fn());
+    } catch (error) {
+        return err(error);
+    }
+};
+
+export const tryAsyncResult = async <T>(fn: () => LooseThenable<T>): Promise<Result<T>> => {
+    try {
+        return ok(await Promise.resolve(fn()));
+    } catch (error) {
+        return err(error);
     }
 };

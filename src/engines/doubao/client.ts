@@ -3,8 +3,25 @@
 import { readWavPcm, createAudioEncoder, splitPcmFrames } from "./audio.ts";
 import { type Config, createConfig, getWsUrl, getHeaders, getSessionConfig, getToken, ensureCredentials } from "./config.ts";
 import { ResponseType, FrameState, type ASRResponse } from "./types.ts";
-import { ok, err, tryResult, type Result } from "../../util.ts";
-import { buildStartTask, buildStartSession, buildFinishSession, buildAsrRequest, parseResponse } from "./proto.ts";
+import { ok, err, tryAsyncResult, isErr, ignoreError, type Result } from "../../util.ts";
+import { buildStartTask, buildStartSession, buildFinishTask, buildFinishSession, buildAsrRequest, parseResponse } from "./proto.ts";
+import { printTimedDomain } from "../../runtime/output.ts";
+import {
+    consumeReadableResponses,
+    buildWebSocketInit,
+    createSessionRetryDelayMs,
+    isWsUrlSecure,
+    normalizeWsError,
+    shouldRetrySessionInit,
+    sliceOrPad,
+    waitForResponse,
+    type ReadableResponseEvent,
+} from "./client-helpers.ts";
+
+const logDoubaoError = (enabled: boolean | undefined, message: string): void => {
+    if (!enabled) return;
+    printTimedDomain("doubao", `error ${message}`);
+};
 
 // =============
 // 会话状态接口
@@ -44,15 +61,17 @@ export const createWebSocketStreams = (ws: WebSocket): WebSocketStreams => {
             const onMessage = (event: MessageEvent) => {
                 const data = event.data as ArrayBuffer;
                 const result = parseResponse(new Uint8Array(data));
-                controller!.enqueue(result);
+                if (controller !== null) {
+                    controller.enqueue(result);
+                }
             };
-            const onError = (e: Event) => {
+            const onError = (_e: Event) => {
                 cleanup();
-                tryResult(() => controller!.error(new Error(`WebSocket error: ${JSON.stringify(e)}`)));
+                errorReadableController(controller, new Error("WebSocket error"));
             };
             const onClose = () => {
                 cleanup();
-                tryResult(() => controller!.close());
+                closeReadableController(controller);
             };
 
             const cleanup = () => {
@@ -79,12 +98,21 @@ export const createWebSocketStreams = (ws: WebSocket): WebSocketStreams => {
     return { ws, readable, writable };
 };
 
+const errorReadableController = (
+    controller: ReadableStreamDefaultController<Result<ASRResponse>> | null,
+    error: Error,
+): void => {
+    if (controller === null) return;
+    ignoreError(() => controller.error(error));
+};
+
+const closeReadableController = (controller: ReadableStreamDefaultController<Result<ASRResponse>> | null): void => {
+    if (controller === null) return;
+    ignoreError(() => controller.close());
+};
+
 export const wsCloseStreams = (streams: WebSocketStreams): void => {
-    try {
-        streams.ws.close();
-    } catch {
-        /* ignore */
-    }
+    ignoreError(() => streams.ws.close());
 };
 
 // =============
@@ -117,34 +145,43 @@ const WEBSOCKET_CONNECT_TIMEOUT_MS = 30000;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-const isRetryableSessionInitError = (message: string): boolean => {
-    return /WebSocket connection failed|WebSocket error|StartTask 失败|StartSession 失败|ECONNREFUSED|ECONNRESET|ENOENT|ERR timeout/.test(
-        message,
-    );
-};
+export const createSessionStateForAttempt = (): SessionState => createSessionState();
 
 // 将任意音频源转换为 PCM 帧流
 const toPcmStream = async function* (
     source: AudioSource,
     encoder: ReturnType<typeof createAudioEncoder>,
 ): AsyncGenerator<Uint8Array> {
-    if (typeof source === "string") {
-        const [pcmData, pcmError] = await tryResult(readWavPcm(source).then((r) => r.pcmData));
-        if (pcmError !== null) return;
-        source = pcmData;
-    }
+    const resolvedSource = await resolveAudioSource(source);
+    if (isErr(resolvedSource)) return;
+    yield* pcmStreamFromResolvedSource(resolvedSource.value, encoder);
+};
 
-    if (source instanceof Uint8Array) {
-        const [frames, framesError] = await tryResult(splitPcmFrames(encoder, source));
-        if (framesError !== null) return;
-        for (const frame of frames) {
-            yield frame;
-        }
+const pcmStreamFromResolvedSource = async function* (
+    source: AudioSource,
+    encoder: ReturnType<typeof createAudioEncoder>,
+): AsyncGenerator<Uint8Array> {
+    if (!(source instanceof Uint8Array)) {
+        yield* source as AsyncIterable<Uint8Array>;
         return;
     }
+    yield* splitPcmFrameStream(source, encoder);
+};
 
-    // AsyncIterable: 直接透传
-    yield* source as AsyncIterable<Uint8Array>;
+const splitPcmFrameStream = async function* (
+    source: Uint8Array,
+    encoder: ReturnType<typeof createAudioEncoder>,
+): AsyncGenerator<Uint8Array> {
+    const framesResult = await tryAsyncResult(() => splitPcmFrames(encoder, source));
+    if (isErr(framesResult)) return;
+    yield* framesResult.value;
+};
+
+const resolveAudioSource = async (source: AudioSource): Promise<Result<AudioSource>> => {
+    if (typeof source !== "string") return ok(source);
+    const pcmResult = await readWavPcm(source);
+    if (isErr(pcmResult)) return err(pcmResult.error);
+    return ok(pcmResult.value.pcmData);
 };
 
 // =============
@@ -156,72 +193,182 @@ export const transcribeStream = async function* (
     audio: AudioSource,
     options?: {
         realtime?: boolean;
+        debugEnabled?: boolean;
     },
 ): AsyncGenerator<Result<ASRResponse>, void, unknown> {
-    const streams = await connectStreams(client);
-    const writer = streams.writable.getWriter();
+    const resources = {
+        streams: null as WebSocketStreams | null,
+        writer: null as WritableStreamDefaultWriter<Uint8Array> | null,
+    };
 
     try {
-        // 1. 初始化会话（失败时重试，避免冷启动竞态）
-        const [state, initError] = await initializeSessionWithRetry(client, streams.ws);
-        if (initError !== null) {
-            yield err(initError);
-            return;
-        }
-
-        // 2. 发送音频
-        const sendTask = runSender(client, writer, toPcmStream(audio, client.encoder), state, options?.realtime);
-
-        // 3. 读取响应
-        for await (const [response, responseError] of streams.readable) {
-            if (responseError !== null) {
-                yield err(responseError);
-                break;
-            }
-            if (response.type === ResponseType.HEARTBEAT) continue;
-            yield ok(response);
-            if (response.type === ResponseType.ERROR || response.type === ResponseType.SESSION_FINISHED) break;
-        }
-
-        await sendTask;
+        yield* transcribeStreamUnchecked(client, audio, options, resources);
     } finally {
-        wsCloseStreams(streams);
+        closeTranscribeStreamResources(resources);
     }
 };
 
-const initializeSessionWithRetry = async (
+const closeTranscribeStreamResources = (resources: {
+    streams: WebSocketStreams | null;
+    writer: WritableStreamDefaultWriter<Uint8Array> | null;
+}): void => {
+    if (resources.streams) wsCloseStreams(resources.streams);
+    resources.writer?.releaseLock();
+};
+
+const transcribeStreamUnchecked = async function* (
     client: Client,
-    ws: WebSocket,
-): Promise<Result<SessionState>> => {
-    let lastError: Error | null = null;
-
-    for (let attempt = 1; attempt <= INITIAL_SESSION_RETRY_LIMIT; attempt++) {
-        const state = createSessionState();
-        let shouldRetry = false;
-
-        for await (const [, initError] of initializeSession(client, ws, state)) {
-            if (initError !== null) {
-                lastError = initError;
-                if (attempt < INITIAL_SESSION_RETRY_LIMIT && isRetryableSessionInitError(initError.message)) {
-                    shouldRetry = true;
-                    break;
-                }
-                return err(initError);
-            }
-        }
-
-        if (shouldRetry) {
-            await sleep(INITIAL_SESSION_RETRY_DELAY_MS * attempt);
-            continue;
-        }
-
-        return ok<SessionState>(state);
+    audio: AudioSource,
+    options: { realtime?: boolean; debugEnabled?: boolean } | undefined,
+    resources: { streams: WebSocketStreams | null; writer: WritableStreamDefaultWriter<Uint8Array> | null },
+): AsyncGenerator<Result<ASRResponse>, void, unknown> {
+    const initResult = await initializeSessionWithRetry(client, options?.debugEnabled);
+    if (isErr(initResult)) {
+        yield err(initResult.error);
+        return;
     }
+    resources.streams = initResult.value.streams;
+    resources.writer = resources.streams.writable.getWriter();
+    const sendTask = runSender(
+        client,
+        resources.writer,
+        toPcmStream(audio, client.encoder),
+        initResult.value.state,
+        options?.realtime,
+        options?.debugEnabled,
+    );
 
-    return err(lastError !== null ? lastError : new Error("StartSession 失败"));
+    const responseState = { complete: false };
+    yield* consumeAsrResponses(resources.streams.readable, { stopOnSessionFinished: true }, responseState, options?.debugEnabled);
+
+    const sendResult = await sendTask;
+    if (isErr(sendResult)) yield err(sendResult.error);
+
+    if (responseState.complete) return;
+    yield* consumeAsrResponses(resources.streams.readable, { stopOnFinal: true }, responseState, options?.debugEnabled);
 };
 
-// 非流式识别，返回最终文本
+const consumeAsrResponses = async function* (
+    readable: ReadableStream<Result<ASRResponse>>,
+    options: { stopOnFinal?: boolean; stopOnSessionFinished?: boolean },
+    state: { complete: boolean },
+    debugEnabled: boolean | undefined,
+): AsyncGenerator<Result<ASRResponse>, void, unknown> {
+    const responses = consumeReadableResponses(readable, {
+        ...options,
+        onErrorResponse: (message) => logDoubaoError(debugEnabled, message),
+    });
+    yield* consumeAsrResponseIterator(responses[Symbol.asyncIterator](), state);
+};
+
+const consumeAsrResponseIterator = async function* (
+    iterator: AsyncIterator<Result<ReadableResponseEvent>>,
+    state: { complete: boolean },
+): AsyncGenerator<Result<ASRResponse>, void, unknown> {
+    const next = await iterator.next();
+    if (next.done) return;
+    if (isErr(next.value)) {
+        yield err(next.value.error);
+        return;
+    }
+    const { response, completed } = next.value.value;
+    yield ok(response);
+    state.complete = completed;
+    if (completed) return;
+    yield* consumeAsrResponseIterator(iterator, state);
+};
+
+export const initializeSessionWithRetry = async (
+    client: Client,
+    debugEnabled?: boolean,
+): Promise<Result<{ streams: WebSocketStreams; state: SessionState }>> => {
+    return initializeSessionAttempt(client, debugEnabled, 1, null);
+};
+
+const initializeSessionAttempt = async (
+    client: Client,
+    debugEnabled: boolean | undefined,
+    attempt: number,
+    lastError: Error | null,
+): Promise<Result<{ streams: WebSocketStreams; state: SessionState }>> => {
+    if (attempt > INITIAL_SESSION_RETRY_LIMIT) return err(lastError !== null ? lastError : new Error("StartSession 失败"));
+
+    const streamsResult = await connectStreams(client);
+    if (isErr(streamsResult)) return handleSessionConnectFailure(client, debugEnabled, attempt, streamsResult.error);
+
+    const initialized = await initializeSessionAttemptStreams(client, debugEnabled, attempt, streamsResult.value);
+    if (isRetrySessionAttemptResult(initialized)) {
+        await sleep(createSessionRetryDelayMs(attempt, INITIAL_SESSION_RETRY_DELAY_MS));
+        return initializeSessionAttempt(client, debugEnabled, attempt + 1, initialized.error);
+    }
+    return initialized.result;
+};
+
+const handleSessionConnectFailure = async (
+    client: Client,
+    debugEnabled: boolean | undefined,
+    attempt: number,
+    errorValue: Error,
+): Promise<Result<{ streams: WebSocketStreams; state: SessionState }>> => {
+    if (!shouldRetrySessionInit(attempt, INITIAL_SESSION_RETRY_LIMIT, errorValue.message)) return err(errorValue);
+    await sleep(createSessionRetryDelayMs(attempt, INITIAL_SESSION_RETRY_DELAY_MS));
+    return initializeSessionAttempt(client, debugEnabled, attempt + 1, errorValue);
+};
+
+type SessionAttemptResult =
+    | { retry: true; error: Error }
+    | { retry: false; result: Result<{ streams: WebSocketStreams; state: SessionState }> };
+
+const isRetrySessionAttemptResult = (result: SessionAttemptResult): result is { retry: true; error: Error } => result.retry;
+
+const initializeSessionAttemptStreams = async (
+    client: Client,
+    debugEnabled: boolean | undefined,
+    attempt: number,
+    streams: WebSocketStreams,
+): Promise<SessionAttemptResult> => {
+    const state = createSessionStateForAttempt();
+    const initResult = await consumeSessionInit(client, streams, state, debugEnabled);
+    if (!isErr(initResult)) return { retry: false, result: ok({ streams, state }) };
+
+    wsCloseStreams(streams);
+    if (shouldRetrySessionInit(attempt, INITIAL_SESSION_RETRY_LIMIT, initResult.error.message)) {
+        return { retry: true, error: initResult.error };
+    }
+    return { retry: false, result: err(initResult.error) };
+};
+
+const consumeSessionInit = async (
+    client: Client,
+    streams: WebSocketStreams,
+    state: SessionState,
+    debugEnabled: boolean | undefined,
+): Promise<Result<void>> => {
+    const iterator = initializeSession(client, streams.ws, state, debugEnabled)[Symbol.asyncIterator]();
+    return consumeSessionInitIterator(iterator);
+};
+
+const consumeSessionInitIterator = async (iterator: AsyncIterator<Result<ASRResponse>>): Promise<Result<void>> => {
+    const next = await iterator.next();
+    if (next.done) return ok(undefined);
+    if (isErr(next.value)) return err(next.value.error);
+    return consumeSessionInitIterator(iterator);
+};
+
+const readParsedResponse = async (
+    ws: WebSocket,
+    timeoutMs: number,
+): Promise<Result<ASRResponse>> => {
+    const responseResult = await tryAsyncResult(() => waitForResponse(ws, timeoutMs));
+    if (isErr(responseResult)) return err(responseResult.error);
+
+    const parsedResult = parseResponse(new Uint8Array(responseResult.value));
+    if (isErr(parsedResult)) return err(parsedResult.error);
+
+    return parsedResult;
+};
+
+// 文件识别，返回最终文本
 export const transcribe = async (
     client: Client,
     audio: AudioSource,
@@ -229,189 +376,263 @@ export const transcribe = async (
         onInterim?: (text: string) => void;
     },
 ): Promise<Result<string>> => {
-    let finalText = "";
-    for await (const [response, responseError] of transcribeStream(client, audio)) {
-        if (responseError !== null) return err(responseError);
+    return consumeTranscribeResponses(transcribeStream(client, audio), options?.onInterim, "");
+};
 
-        if (response.type === ResponseType.INTERIM_RESULT && options?.onInterim) {
-            options.onInterim(response.text || "");
-        } else if (response.type === ResponseType.FINAL_RESULT) {
-            finalText = response.text || "";
-        } else if (response.type === ResponseType.ERROR) {
-            return err(new Error(response.error_msg || "ASR Error"));
-        }
+const consumeTranscribeResponses = async (
+    responses: AsyncIterable<Result<ASRResponse>>,
+    onInterim: ((text: string) => void) | undefined,
+    finalText: string,
+): Promise<Result<string>> => {
+    const iterator = responses[Symbol.asyncIterator]();
+    return consumeTranscribeResponseIterator(iterator, onInterim, finalText);
+};
+
+const consumeTranscribeResponseIterator = async (
+    iterator: AsyncIterator<Result<ASRResponse>>,
+    onInterim: ((text: string) => void) | undefined,
+    finalText: string,
+): Promise<Result<string>> => {
+    const next = await iterator.next();
+    if (next.done) return ok<string>(finalText);
+    if (isErr(next.value)) return err(next.value.error);
+    const handled = handleTranscribeResponse(next.value.value, onInterim, finalText);
+    if (isErr(handled)) return err(handled.error);
+    return consumeTranscribeResponseIterator(iterator, onInterim, handled.value);
+};
+
+const handleTranscribeResponse = (
+    response: ASRResponse,
+    onInterim: ((text: string) => void) | undefined,
+    finalText: string,
+): Result<string> => {
+    if (response.type === ResponseType.INTERIM_RESULT) {
+        onInterim?.(response.text || "");
+        return ok(finalText);
     }
-    return ok<string>(finalText);
+    if (response.type === ResponseType.FINAL_RESULT) return ok(response.text || "");
+    if (response.type === ResponseType.ERROR) return err(new Error(response.error_msg || "ASR Error"));
+    return ok(finalText);
 };
 
 // 实时识别别名
-export const transcribeRealtime = (client: Client, audioSource: AsyncIterable<Uint8Array>) =>
-    transcribeStream(client, audioSource);
+export const transcribeRealtime = (
+    client: Client,
+    audioSource: AsyncIterable<Uint8Array>,
+    options?: { debugEnabled?: boolean },
+) => transcribeStream(client, audioSource, options);
+
+export const formatSenderSummary = (frameCount: number, byteCount: number): string => {
+    return `sender frames=${frameCount} bytes=${byteCount}`;
+};
 
 // 发送任务实现
-const runSender = async (
+export const runSender = async (
     client: Client,
     writer: WritableStreamDefaultWriter<Uint8Array>,
     audioStream: AsyncIterable<Uint8Array>,
     state: SessionState,
     realtime?: boolean,
+    debugEnabled?: boolean,
 ): Promise<Result<void>> => {
     const frameBytes = Math.floor((client.config.sampleRate * client.config.frameDurationMs) / 1000) * 2;
     const frameInterval = client.config.frameDurationMs;
-    let frameCount = 0;
-
-    for await (const chunk of audioStream) {
-        for (let i = 0; i < chunk.length; i += frameBytes) {
-            const frame = sliceOrPad(chunk, i, frameBytes);
-            const frameState = frameCount === 0 ? FrameState.FRAME_STATE_FIRST : FrameState.FRAME_STATE_MIDDLE;
-
-            await writer.ready;
-            const [, writeError] = await tryResult(writer.write(buildAsrRequest(frame, state.requestId, frameState, Date.now())));
-            if (writeError !== null) return err(writeError);
-            frameCount++;
-
-            if (realtime) {
-                await new Promise((resolve) => setTimeout(resolve, frameInterval));
-            }
-        }
-    }
+    const senderState = { frameCount: 0, byteCount: 0 };
+    const audioResult = await sendAudioStream(client, writer, audioStream[Symbol.asyncIterator](), state, senderState, frameBytes, frameInterval, realtime);
+    if (isErr(audioResult)) return err(audioResult.error);
 
     // 确保所有帧已刷新后再发送结束帧
     await writer.ready;
-    const [token, tokenError] = getToken(client.config);
-    if (tokenError !== null) return err(tokenError);
-    const [, finishError] = await tryResult(writer.write(buildFinishSession(state.requestId, token)));
-    if (finishError !== null) return err(finishError);
+    const tokenResult = getToken(client.config);
+    if (isErr(tokenResult)) return err(tokenResult.error);
+    const token = tokenResult.value;
+    const finishResult = await tryAsyncResult(() => writer.write(buildFinishSession(state.requestId, token)));
+    if (isErr(finishResult)) return err(finishResult.error);
 
-    return tryResult(writer.close());
+    if (debugEnabled) printTimedDomain("doubao", formatSenderSummary(senderState.frameCount, senderState.byteCount));
+    return await tryAsyncResult(() => writer.close());
+};
+
+const sendAudioStream = async (
+    client: Client,
+    writer: WritableStreamDefaultWriter<Uint8Array>,
+    iterator: AsyncIterator<Uint8Array>,
+    sessionState: SessionState,
+    senderState: { frameCount: number; byteCount: number },
+    frameBytes: number,
+    frameInterval: number,
+    realtime: boolean | undefined,
+): Promise<Result<void>> => {
+    const next = await iterator.next();
+    if (next.done) return ok(undefined);
+    const chunkResult = await sendAudioChunk(client, writer, next.value, sessionState, senderState, frameBytes, frameInterval, realtime);
+    if (isErr(chunkResult)) return err(chunkResult.error);
+    return sendAudioStream(client, writer, iterator, sessionState, senderState, frameBytes, frameInterval, realtime);
+};
+
+const sendAudioChunk = async (
+    _client: Client,
+    writer: WritableStreamDefaultWriter<Uint8Array>,
+    chunk: Uint8Array,
+    sessionState: SessionState,
+    senderState: { frameCount: number; byteCount: number },
+    frameBytes: number,
+    frameInterval: number,
+    realtime: boolean | undefined,
+): Promise<Result<void>> => {
+    senderState.byteCount += chunk.length;
+    const frames = createAudioFrames(chunk, frameBytes);
+    return sendAudioFrames(writer, frames, sessionState, senderState, frameInterval, realtime, 0);
+};
+
+const createAudioFrames = (chunk: Uint8Array, frameBytes: number): Uint8Array[] => {
+    const frameCount = Math.ceil(chunk.length / frameBytes);
+    return Array.from({ length: frameCount }, (_, index) => sliceOrPad(chunk, index * frameBytes, frameBytes));
+};
+
+const sendAudioFrames = async (
+    writer: WritableStreamDefaultWriter<Uint8Array>,
+    frames: Uint8Array[],
+    sessionState: SessionState,
+    senderState: { frameCount: number; byteCount: number },
+    frameInterval: number,
+    realtime: boolean | undefined,
+    index: number,
+): Promise<Result<void>> => {
+    if (index >= frames.length) return ok(undefined);
+    const frameResult = await sendAudioFrame(writer, frames[index]!, sessionState, senderState, frameInterval, realtime);
+    if (isErr(frameResult)) return err(frameResult.error);
+    return sendAudioFrames(writer, frames, sessionState, senderState, frameInterval, realtime, index + 1);
+};
+
+const sendAudioFrame = async (
+    writer: WritableStreamDefaultWriter<Uint8Array>,
+    frame: Uint8Array,
+    sessionState: SessionState,
+    senderState: { frameCount: number; byteCount: number },
+    frameInterval: number,
+    realtime: boolean | undefined,
+): Promise<Result<void>> => {
+    const frameState = senderState.frameCount === 0 ? FrameState.FRAME_STATE_FIRST : FrameState.FRAME_STATE_MIDDLE;
+    await writer.ready;
+    const writeResult = await tryAsyncResult(() => writer.write(buildAsrRequest(frame, sessionState.requestId, frameState, Date.now())));
+    if (isErr(writeResult)) return err(writeResult.error);
+    senderState.frameCount++;
+    if (realtime) await sleep(frameInterval);
+    return ok(undefined);
 };
 
 // 辅助：切片或补零
-const sliceOrPad = (source: Uint8Array, start: number, length: number): Uint8Array => {
-    const slice = source.slice(start, start + length);
-    if (slice.length < length) {
-        const padded = new Uint8Array(length);
-        padded.set(slice);
-        return padded;
-    }
-    return slice;
-};
-
-export const buildWebSocketInit = (headers: Record<string, string>): { headers: Record<string, string> } => ({ headers });
-
 // 建立 WebSocket 连接
-const connectStreams = async (client: Client): Promise<WebSocketStreams> => {
-    const [wsUrl, wsUrlError] = getWsUrl(client.config);
-    if (wsUrlError !== null) throw wsUrlError;
+export const connectStreams = async (client: Client): Promise<Result<WebSocketStreams>> => {
+    const wsUrlResult = getWsUrl(client.config);
+    if (isErr(wsUrlResult)) return err(wsUrlResult.error);
 
-    if (!wsUrl.startsWith("wss://")) {
-        throw new Error(`Insecure WebSocket URL rejected: ${wsUrl}`);
+    const wsUrl = wsUrlResult.value;
+
+    if (!isWsUrlSecure(wsUrl)) {
+        return err(new Error(`Insecure WebSocket URL rejected: ${wsUrl}`));
     }
-    const ws = new WebSocket(wsUrl, buildWebSocketInit(getHeaders(client.config)) as unknown as string[]);
+    const wsInit = buildWebSocketInit(getHeaders(client.config));
+    // Bun WebSocket constructor accepts headers via the second argument
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ws = new WebSocket(wsUrl, wsInit as any);
+    let connectTimer: ReturnType<typeof setTimeout> | null = null;
+    let cleaned = false;
+    let onError: ((event: Event) => void) | null = null;
+    const cleanup = (): void => {
+        if (cleaned) return;
+        cleaned = true;
+        if (connectTimer !== null) {
+            clearTimeout(connectTimer);
+            connectTimer = null;
+        }
+        ws.onopen = null;
+        if (onError) {
+            ws.removeEventListener("error", onError);
+            onError = null;
+        }
+    };
 
-    await new Promise<void>((resolve, reject) => {
-        const connectTimer = setTimeout(() => {
+    const connectResult = await tryAsyncResult(() => new Promise<void>((resolve, reject) => {
+        connectTimer = setTimeout(() => {
+            cleanup();
             reject(new Error(`WebSocket connection timeout after ${WEBSOCKET_CONNECT_TIMEOUT_MS}ms`));
         }, WEBSOCKET_CONNECT_TIMEOUT_MS);
 
-        const onError = (e: Event) => {
-            clearTimeout(connectTimer);
+        onError = (e: Event) => {
+            cleanup();
             const error = (e as Event & { error?: unknown }).error;
-            reject(error instanceof Error ? error : new Error(`WebSocket connection failed: ${JSON.stringify(error ?? e)}`));
+            reject(normalizeWsError(error));
         };
         ws.onopen = () => {
-            clearTimeout(connectTimer);
-            ws.removeEventListener("error", onError);
+            cleanup();
             resolve();
         };
         ws.addEventListener("error", onError);
-    });
+    }).finally(() => {
+        cleanup();
+    }));
+    if (isErr(connectResult)) {
+        ignoreError(() => ws.close());
+        return err(connectResult.error);
+    }
 
-    return createWebSocketStreams(ws);
+    return ok(createWebSocketStreams(ws));
 };
 
 // 初始化会话
-const initializeSession = async function* (
+export const initializeSession = async function* (
     client: Client,
     ws: WebSocket,
     state: SessionState,
+    debugEnabled?: boolean,
 ): AsyncGenerator<Result<ASRResponse>, void, unknown> {
-    const [token, tokenError] = getToken(client.config);
-    if (tokenError !== null) {
-        yield err(tokenError);
+    const tokenResult = getToken(client.config);
+    if (isErr(tokenResult)) {
+        yield err(tokenResult.error);
         return;
     }
+    const token = tokenResult.value;
 
     ws.send(buildStartTask(state.requestId, token));
-    const [resp, respError] = await tryResult(waitForResponse(ws, INITIAL_SESSION_RESPONSE_TIMEOUT_MS));
-    if (respError !== null) {
-        yield err(respError);
+    const startTaskResult = await readParsedResponse(ws, INITIAL_SESSION_RESPONSE_TIMEOUT_MS);
+    if (isErr(startTaskResult)) {
+        logDoubaoError(debugEnabled, startTaskResult.error.message);
+        yield err(startTaskResult.error);
         return;
     }
-    const [parsedResponse, parsedError] = parseResponse(new Uint8Array(resp));
-    if (parsedError !== null) {
-        yield err(parsedError);
+    if (startTaskResult.value.type === ResponseType.ERROR) {
+        logDoubaoError(debugEnabled, startTaskResult.value.error_msg || "Unknown error");
+        yield err(new Error(`StartTask 失败: ${startTaskResult.value.error_msg}`));
         return;
     }
-    if (parsedResponse.type === ResponseType.ERROR) {
-        yield err(new Error(`StartTask 失败: ${parsedResponse.error_msg}`));
-        return;
-    }
-    yield ok(parsedResponse);
+    yield ok(startTaskResult.value);
 
-    const [sessionConfig, sessionConfigError] = getSessionConfig(client.config);
-    if (sessionConfigError !== null) {
-        yield err(sessionConfigError);
+    const sessionConfigResult = getSessionConfig(client.config);
+    if (isErr(sessionConfigResult)) {
+        ws.send(buildFinishTask(state.requestId, token));
+        yield err(sessionConfigResult.error);
         return;
     }
+    const sessionConfig = sessionConfigResult.value;
     sessionConfig.audio_info.format = "pcm";
 
     ws.send(buildStartSession(state.requestId, token, sessionConfig));
-    const [resp2, resp2Error] = await tryResult(waitForResponse(ws, INITIAL_SESSION_RESPONSE_TIMEOUT_MS));
-    if (resp2Error !== null) {
-        yield err(resp2Error);
+    const startSessionResult = await readParsedResponse(ws, INITIAL_SESSION_RESPONSE_TIMEOUT_MS);
+    if (isErr(startSessionResult)) {
+        logDoubaoError(debugEnabled, startSessionResult.error.message);
+        ws.send(buildFinishTask(state.requestId, token));
+        yield err(startSessionResult.error);
         return;
     }
-    const [parsedResponse2, parsedError2] = parseResponse(new Uint8Array(resp2));
-    if (parsedError2 !== null) {
-        yield err(parsedError2);
+    if (startSessionResult.value.type === ResponseType.ERROR) {
+        logDoubaoError(debugEnabled, startSessionResult.value.error_msg || "Unknown error");
+        ws.send(buildFinishTask(state.requestId, token));
+        yield err(new Error(`StartSession 失败: ${startSessionResult.value.error_msg}`));
         return;
     }
-    if (parsedResponse2.type === ResponseType.ERROR) {
-        yield err(new Error(`StartSession 失败: ${parsedResponse2.error_msg}`));
-        return;
-    }
-    yield ok(parsedResponse2);
-};
-
-// 等待响应
-const waitForResponse = (ws: WebSocket, timeoutMs = 0): Promise<ArrayBuffer> => {
-    return new Promise((resolve, reject) => {
-        let timer: ReturnType<typeof setTimeout> | null = null;
-
-        const onMessage = (event: MessageEvent) => {
-            ws.removeEventListener("message", onMessage);
-            ws.removeEventListener("error", onError);
-            if (timer) clearTimeout(timer);
-            resolve(event.data as ArrayBuffer);
-        };
-        const onError = (e: Event) => {
-            ws.removeEventListener("error", onError);
-            ws.removeEventListener("message", onMessage);
-            if (timer) clearTimeout(timer);
-            reject(new Error(`WebSocket error: ${JSON.stringify(e)}`));
-        };
-        ws.addEventListener("message", onMessage);
-        ws.addEventListener("error", onError);
-
-        if (timeoutMs > 0) {
-            timer = setTimeout(() => {
-                ws.removeEventListener("message", onMessage);
-                ws.removeEventListener("error", onError);
-                reject(new Error("ERR timeout"));
-            }, timeoutMs);
-        }
-    });
+    yield ok(startSessionResult.value);
 };
 
 // =============
@@ -426,8 +647,8 @@ export const transcribeStandalone = async (
     },
 ): Promise<Result<string>> => {
     const client = createClient(options?.config);
-    const [, ensureError] = await ensureCredentials(client.config);
-    if (ensureError !== null) return err(ensureError);
+    const ensureResult = await ensureCredentials(client.config);
+    if (isErr(ensureResult)) return err(ensureResult.error);
 
     return transcribe(client, audio, {
         onInterim: options?.onInterim,
@@ -442,9 +663,9 @@ export const transcribeStreamStandalone = async function* (
     },
 ): AsyncGenerator<Result<ASRResponse>, void, unknown> {
     const client = createClient(options?.config);
-    const [, ensureError] = await ensureCredentials(client.config);
-    if (ensureError !== null) {
-        yield err(ensureError);
+    const ensureResult = await ensureCredentials(client.config);
+    if (isErr(ensureResult)) {
+        yield err(ensureResult.error);
         return;
     }
     yield* transcribeStream(client, audio, { realtime: options?.realtime });
@@ -457,12 +678,23 @@ export const transcribeRealtimeStandalone = async function* (
     },
 ): AsyncGenerator<Result<ASRResponse>, void, unknown> {
     const client = createClient(options?.config);
-    const [, ensureError] = await ensureCredentials(client.config);
-    if (ensureError !== null) {
-        yield err(ensureError);
+    const ensureResult = await ensureCredentials(client.config);
+    if (isErr(ensureResult)) {
+        yield err(ensureResult.error);
         return;
     }
     yield* transcribeStream(client, audioSource);
 };
+
+export {
+    buildWebSocketInit,
+    createSessionRetryDelayMs,
+    isRetryableSessionInitError,
+    isWsUrlSecure,
+    normalizeWsError,
+    shouldRetrySessionInit,
+    sliceOrPad,
+    waitForResponse,
+} from "./client-helpers.ts";
 
 export { ResponseType, FrameState };

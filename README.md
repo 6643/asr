@@ -48,7 +48,7 @@ bun run index.ts
 bun run index.ts
 ```
 
-识别成功后, 程序会通过 IBus engine 直接上屏. 如果 engine 未启动, 未聚焦或当前未切到 `ASR`, 提交会失败并返回错误信息。
+识别成功后, 程序会通过 IBus engine 直接上屏. 程序启动时会自动切换到 ASR 输入法并激活 engine.
 
 验证方式:
 
@@ -57,34 +57,57 @@ ibus engine
 test -S /tmp/asr_ibus.sock && echo socket-ok
 ```
 
+配置选项:
+
+- `ASR_AUTO_SWITCH`: 控制是否自动切换到 ASR 输入法 (默认: `true`). 设置为 `false` 或 `0` 可禁用自动切换.
+- `ASR_IBUS_RPC_TIMEOUT`: IBus RPC 调用超时时间，单位毫秒 (默认: `1500`). 在慢速系统上可以适当增加.
+- `ASR_DEBUG`: 启用调试日志输出 (默认: `false`). 设置为 `1` 或 `true` 启用.
+- `ASR_KEYBOARD_DEVICE`: 覆盖键盘设备路径 (默认: 自动检测). 例如 `/dev/input/event3`.
+- `ASR_IBUS_COMPONENT_PATH`: 覆盖 IBus 组件安装路径 (默认: `~/.local/share/ibus/component/asr.xml`).
+- `ASR_SAMI_APP_KEY`: SAMI 服务认证密钥 (生产环境必需).
+- `ASR_HKDF_INFO`: HKDF 密钥派生信息 (默认: `4e30514609050cd3`).
+
 已知约束:
 
-- 必须把当前输入法切到 `ASR`, 否则 engine 不会拿到焦点, 无法直接提交文本.
-- 这是 IBus 架构限制. 外部脚本不能直接对任意应用的当前 `InputContext` 发起方法调用完成上屏.
+- 程序启动时会自动切换到 `ASR` 输入法. 如果切换失败, 程序会终止启动.
+- 可以通过设置 `ASR_AUTO_SWITCH=false` 禁用自动切换, 但需要手动切换到 ASR 输入法.
+- 这是 IBus 架构限制: engine 必须被激活（收到 Enable 和 FocusIn 信号）才能提交文本.
 - 需要本机已安装 `bun` 和 D-Bus 可用的 `ibus`.
 
-### 非流式识别
+### 文件识别
 
 ```typescript
-import { transcribeStandalone } from "./src/doubao/client.ts";
-import { createConfig, ensureCredentials } from "./src/doubao/config.ts";
+import { transcribeStandalone } from "./src/engines/doubao/client.ts";
+import { createConfig, ensureCredentials } from "./src/engines/doubao/config.ts";
+import { isErr } from "./src/util.ts";
 
 const config = createConfig({ credentialPath: "./config/doubao.json" });
-await ensureCredentials(config);
+const ensureResult = await ensureCredentials(config);
+if (isErr(ensureResult)) throw ensureResult;
 
 const result = await transcribeStandalone("./audio.wav", { config });
-if (result.ok) console.log(result.value);
+if (isErr(result)) {
+    console.error(result.message);
+} else {
+    console.log(result);
+}
 ```
 
 ### 流式识别
 
 ```typescript
-import { transcribeStreamStandalone } from "./src/doubao/client.ts";
-import { ResponseType } from "./src/doubao/types.ts";
+import { transcribeStreamStandalone } from "./src/engines/doubao/client.ts";
+import { ResponseType } from "./src/engines/doubao/types.ts";
+import { createConfig, ensureCredentials } from "./src/engines/doubao/config.ts";
+import { isErr } from "./src/util.ts";
+
+const config = createConfig({ credentialPath: "./config/doubao.json" });
+const ensureResult = await ensureCredentials(config);
+if (isErr(ensureResult)) throw ensureResult;
 
 for await (const result of transcribeStreamStandalone("./audio.wav", { config })) {
-    if (!result.ok) break;
-    const resp = result.value;
+    if (isErr(result)) break;
+    const resp = result;
     if (resp.type === ResponseType.INTERIM_RESULT) {
         console.log("中间结果:", resp.text);
     } else if (resp.type === ResponseType.FINAL_RESULT) {
@@ -110,7 +133,7 @@ bun test
 ## 注意事项
 
 1. **音频格式**：支持 16-bit PCM WAV 文件（16kHz 单声道）。
-2. **凭据**：首次使用会自动注册设备，凭据保存到 `config/doubao.json`。
+2. **凭据**：首次使用会自动注册设备, 默认保存到 `config/doubao.json`。也可以通过 `credentialPath` 指定自定义路径。
 3. **实时识别**：依赖系统 `arecord` 命令捕获麦克风音频（Linux）。
 
 ## 项目结构
