@@ -1,20 +1,2 @@
-# dependencies
 node_modules
-
-# credentials and secrets
 config/doubao.json
-*.pem
-.env
-.env.*
-
-# logs
-*.log
-
-# caches
-.cache
-
-# IDE
-.vscode
-
-# OS
-.DS_Store
