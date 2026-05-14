@@ -4,8 +4,8 @@ import type { RecognitionSession } from "../../runtime/session.ts";
 import { ResponseType, type ASRResponse } from "./types.ts";
 import type { Client } from "./client.ts";
 
-const MAX_AUDIO_QUEUE_ITEMS = 512;
-const MAX_EVENT_QUEUE_ITEMS = 128;
+const MAX_AUDIO_QUEUE_ITEMS = 64;
+const MAX_EVENT_QUEUE_ITEMS = 32;
 
 
 export type TranscribeRealtimeSource = (

@@ -140,15 +140,9 @@ const createRunCommandError = (
 
 // Uint8Array <-> base64 helpers (Bun-compatible, avoids Node.js Buffer)
 export const uint8ArrayToBase64 = (arr: Uint8Array): string => {
-    const binary = Array.from(arr, (byte) => String.fromCharCode(byte)).join("");
-    return globalThis.btoa(binary);
+    return Buffer.from(arr).toString('base64');
 };
 
 export const base64ToUint8Array = (b64: string): Uint8Array => {
-    const binary = globalThis.atob(b64);
-    const arr = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-        arr[i] = binary.charCodeAt(i);
-    }
-    return arr;
+    return new Uint8Array(Buffer.from(b64, 'base64'));
 };

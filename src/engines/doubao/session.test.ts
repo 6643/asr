@@ -32,7 +32,7 @@ test("doubao session rejects audio after the bounded queue is full", async () =>
 
     const chunk = new Uint8Array([1]);
     let pushResult: Result<void> = err(new Error("not called"));
-    for (let i = 0; i < 512; i++) {
+    for (let i = 0; i < 64; i++) {
         pushResult = await session.pushAudio(chunk);
         expect(isErr(pushResult)).toBe(false);
     }

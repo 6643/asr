@@ -104,22 +104,53 @@ const readMicFrames = async function* (
     frameBytes: number,
     isStopped: () => boolean,
 ): AsyncGenerator<Uint8Array> {
-    if (isStopped()) return;
-    const result = await tryAsyncResult(() => reader.read());
-    if (isErr(result) || result.value.done) {
+    while (!isStopped()) {
+        yield* readNextMicFrameBatch(reader, state, frameBytes, isStopped);
+    }
+};
+
+const readNextMicFrameBatch = async function* (
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    state: { buffer: Uint8Array },
+    frameBytes: number,
+    isStopped: () => boolean,
+): AsyncGenerator<Uint8Array> {
+    const shouldStop = await processMicChunk(reader, state, frameBytes);
+    if (shouldStop) {
         yield* createFinalMicFrame(state, frameBytes, isStopped);
         return;
     }
-    appendMicBuffer(state, result.value.value ?? new Uint8Array(0));
     yield* takeBufferedMicFrames(state, frameBytes);
-    yield* readMicFrames(reader, state, frameBytes, isStopped);
 };
 
-const appendMicBuffer = (state: { buffer: Uint8Array }, value: Uint8Array): void => {
-    const newBuffer = new Uint8Array(state.buffer.length + value.length);
+const processMicChunk = async (
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    state: { buffer: Uint8Array },
+    frameBytes: number,
+): Promise<boolean> => {
+    const result = await tryAsyncResult(() => reader.read());
+    if (isErr(result) || result.value.done) return true;
+    appendMicBuffer(state, result.value.value ?? new Uint8Array(0), frameBytes);
+    return false;
+};
+
+const appendMicBuffer = (state: { buffer: Uint8Array }, value: Uint8Array, frameBytes: number): void => {
+    if (value.length === 0) return;
+    const totalLength = state.buffer.length + value.length;
+    const maxBufferSize = frameBytes * 4;
+    if (shouldReuseBuffer(state.buffer, totalLength, maxBufferSize)) {
+        state.buffer.set(value, state.buffer.length);
+        return;
+    }
+    const newCapacity = totalLength <= maxBufferSize ? maxBufferSize : totalLength;
+    const newBuffer = new Uint8Array(newCapacity);
     newBuffer.set(state.buffer);
     newBuffer.set(value, state.buffer.length);
     state.buffer = newBuffer;
+};
+
+const shouldReuseBuffer = (buffer: Uint8Array, totalLength: number, maxBufferSize: number): boolean => {
+    return totalLength <= buffer.length && buffer.length < maxBufferSize;
 };
 
 const takeBufferedMicFrames = function* (
