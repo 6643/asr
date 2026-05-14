@@ -85,16 +85,12 @@ test("session runner flushes final result after key release stop", async () => {
     expect(calls).toContain("commit:实时识别。");
 });
 
-test("session runner does not forward audio before ready notification finishes", async () => {
+test("session runner plays notification before starting microphone", async () => {
     const calls: string[] = [];
-    let pushCount = 0;
-    let resolveNotification: (() => void) | undefined;
-    const notificationDone = new Promise<void>((resolve) => {
-        resolveNotification = resolve;
-    });
 
     const deps = {
         createMicStream: mock(() => {
+            calls.push("mic:start");
             const stream = (async function* (): AsyncGenerator<Uint8Array> {
                 yield new Uint8Array([0, 0, 0, 0]);
                 yield new Uint8Array([0xff, 0x7f, 0xff, 0x7f]);
@@ -119,7 +115,6 @@ test("session runner does not forward audio before ready notification finishes",
         }),
         playMicReadyNotification: mock(async () => {
             calls.push("notify");
-            await notificationDone;
         }),
     };
 
@@ -130,10 +125,7 @@ test("session runner does not forward audio before ready notification finishes",
         describe: () => [],
         startSession: async () =>
             ok({
-                pushAudio: mock(async () => {
-                    pushCount++;
-                    return ok(undefined);
-                }),
+                pushAudio: mock(async () => ok(undefined)),
                 close: mock(async () => {}),
                 events: (async function* () {
                     yield ok({ type: "interim", text: "实时" } as const);
@@ -143,22 +135,14 @@ test("session runner does not forward audio before ready notification finishes",
             }),
     };
 
-    const runPromise = withMutedConsole(async () => {
+    await withMutedConsole(async () => {
         await runRecognitionSession(engine, {} as never, new AbortController().signal, { deps });
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(calls).toContain("notify");
-    expect(calls).not.toContain("mute");
-    expect(pushCount).toBe(0);
-
-    resolveNotification?.();
-    await runPromise;
-
-    expect(calls).toContain("mute");
-    expect(calls).toContain("notify");
-    expect(calls).toContain("commit:实时识别。");
-    expect(pushCount).toBeGreaterThan(0);
+    const notifyIndex = calls.indexOf("notify");
+    const micStartIndex = calls.indexOf("mic:start");
+    expect(notifyIndex).toBeGreaterThanOrEqual(0);
+    expect(micStartIndex).toBeGreaterThan(notifyIndex);
 });
 
 test("session runner releases speaker immediately when key is released while commit is pending", async () => {

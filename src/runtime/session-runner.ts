@@ -218,6 +218,9 @@ export const runRecognitionSession = async <TClient>(
         options.releaseSignal.addEventListener("abort", onRelease, { once: true });
     }
 
+    await deps.playMicReadyNotification();
+    if (stopSignal.aborted || options.releaseSignal?.aborted) return;
+
     const micLifecycle = startMicLifecycle(
         { createMicStream: deps.createMicStream },
         stopSignal,
@@ -229,7 +232,6 @@ export const runRecognitionSession = async <TClient>(
             onReady: async () => {
                 context.micState = markMicReady(context.micState);
                 if (debugEnabled) printTimedDomain("mic", "ready");
-                await deps.playMicReadyNotification().catch(() => {}); // optional notification, failure is non-fatal
                 if (options.releaseSignal?.aborted) return;
                 printSessionStart();
                 const transition = requestSpeakerMute(context.speakerState);
