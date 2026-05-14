@@ -1,5 +1,6 @@
 // Linux input_event 结构: timeval(16) + type(2) + code(2) + value(4) = 24 bytes
 import { ignoreError, isErr, tryAsyncResult } from "../util.ts";
+import { getKeyboardDevice } from "./config.ts";
 
 const INPUT_EVENT_SIZE = 24;
 
@@ -174,7 +175,7 @@ const releaseKeyReader = (reader: ReadableStreamDefaultReader<Uint8Array>): void
 
 // 自动查找键盘设备, 支持环境变量覆盖
 export const findKeyboardDevice = async (): Promise<string | null> => {
-    const envDevice = process.env.ASR_KEYBOARD_DEVICE?.trim();
+    const envDevice = getKeyboardDevice();
     if (envDevice) return envDevice;
 
     const devices = await tryAsyncResult(() => Bun.file("/proc/bus/input/devices").text());

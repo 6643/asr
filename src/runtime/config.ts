@@ -15,3 +15,19 @@ export const isDebugEnabled = (): boolean => {
     const env = process.env.ASR_DEBUG;
     return env === "1" || env === "true";
 };
+
+export const getKeyboardDevice = (): string | undefined => {
+    return process.env.ASR_KEYBOARD_DEVICE?.trim();
+};
+
+export const getIbusComponentPath = (): string | undefined => {
+    return process.env.ASR_IBUS_COMPONENT_PATH?.trim();
+};
+
+export const getSamiAppKey = (): string | undefined => {
+    return process.env.ASR_SAMI_APP_KEY?.trim();
+};
+
+export const getHkdfInfo = (): string | undefined => {
+    return process.env.ASR_HKDF_INFO?.trim();
+};

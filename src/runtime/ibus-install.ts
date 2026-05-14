@@ -3,6 +3,7 @@ import fs from "fs";
 import { err, ignoreError, isErr, ok, tryAsyncResult, trySyncResult, type Result, runCommand, withFinallyAsync } from "../util.ts";
 import { IBUS_COMPONENT_NAME } from "./ibus-meta.ts";
 import { getIbusSocketPath } from "./ibus-address.ts";
+import { getIbusComponentPath } from "./config.ts";
 
 // 优先使用用户本地路径, 无需 pkexec/sudo
 const IBUS_USER_COMPONENT_DIR = `${process.env.HOME || "/tmp"}/.local/share/ibus/component`;
@@ -103,7 +104,7 @@ const installWithPkexec = async (filePath: string, tempPath: string): Promise<Re
 };
 
 export const resolveIbusComponentPath = (): string => {
-    const overridePath = process.env.ASR_IBUS_COMPONENT_PATH?.trim();
+    const overridePath = getIbusComponentPath();
     if (overridePath) return overridePath;
     // 默认使用用户本地路径, 避免系统级安装需要 sudo
     return IBUS_USER_COMPONENT_PATH;
