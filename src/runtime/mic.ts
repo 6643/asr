@@ -137,20 +137,10 @@ const processMicChunk = async (
 const appendMicBuffer = (state: { buffer: Uint8Array }, value: Uint8Array, frameBytes: number): void => {
     if (value.length === 0) return;
     const totalLength = state.buffer.length + value.length;
-    const maxBufferSize = frameBytes * 4;
-    if (shouldReuseBuffer(state.buffer, totalLength, maxBufferSize)) {
-        state.buffer.set(value, state.buffer.length);
-        return;
-    }
-    const newCapacity = totalLength <= maxBufferSize ? maxBufferSize : totalLength;
-    const newBuffer = new Uint8Array(newCapacity);
+    const newBuffer = new Uint8Array(totalLength);
     newBuffer.set(state.buffer);
     newBuffer.set(value, state.buffer.length);
     state.buffer = newBuffer;
-};
-
-const shouldReuseBuffer = (buffer: Uint8Array, totalLength: number, maxBufferSize: number): boolean => {
-    return totalLength <= buffer.length && buffer.length < maxBufferSize;
 };
 
 const takeBufferedMicFrames = function* (
