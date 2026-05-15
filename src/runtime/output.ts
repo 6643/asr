@@ -41,25 +41,25 @@ const shouldLog = (level: LogLevel): boolean => {
 
 export const logError = (domain: string, message: string): void => {
     if (shouldLog(LogLevel.ERROR)) {
-        writeError(`[${domain}] ${message}`);
+        writeError(message);
     }
 };
 
 export const logWarn = (domain: string, message: string): void => {
     if (shouldLog(LogLevel.WARN)) {
-        writeWarn(`[${domain}] ${message}`);
+        writeWarn(message);
     }
 };
 
 export const logInfo = (domain: string, message: string): void => {
     if (shouldLog(LogLevel.INFO)) {
-        writeInfo(`[${domain}] ${message}`);
+        writeInfo(message);
     }
 };
 
 export const logDebug = (domain: string, message: string): void => {
     if (shouldLog(LogLevel.DEBUG)) {
-        writeDebug(`[${domain}] ${message}`);
+        writeDebug(message);
     }
 };
 
