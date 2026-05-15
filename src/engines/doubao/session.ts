@@ -78,6 +78,9 @@ export const createDoubaoSession = (
     const source = options?.transcribeRealtime ?? defaultTranscribeRealtimeSource;
 
     const pushRecognitionEvent = (resp: ASRResponse): void => {
+        if (options?.debugEnabled) {
+            console.log(`[doubao] response type=${resp.type} text="${resp.text || ""}" error="${resp.error_msg || ""}"`);
+        }
         switch (resp.type) {
             case ResponseType.INTERIM_RESULT:
                 eventQueue.push(ok(toRecognitionEvent("interim", resp.text || "")));

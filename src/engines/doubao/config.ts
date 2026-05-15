@@ -220,7 +220,7 @@ export const getSessionConfig = (config: Config): Result<SessionConfig> => {
     return ok({
         audio_info: {
             channel: config.channels,
-            format: "speech_opus",
+            format: "pcm",
             sample_rate: config.sampleRate,
         },
         enable_punctuation: config.enablePunctuation,
