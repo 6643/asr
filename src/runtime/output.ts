@@ -10,6 +10,9 @@ const writeTimedError = (message: string): void => {
     console.error(`${formatTime()} ${message}`);
 };
 
+export const printTimedLine = writeTimedLine;
+export const printTimedError = writeTimedError;
+
 export const printTimedDomain = (domain: string, message: string): void => {
     writeTimedLine(`[${domain}] ${message}`);
 };
