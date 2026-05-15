@@ -71,7 +71,7 @@ export const createConfig = (options?: {
 
     // 会话配置
     enablePunctuation: options?.enablePunctuation ?? true,
-    enableSpeechRejection: false,
+    enableSpeechRejection: true,
     enableAsrTwopass: true,
     enableAsrThreepass: true,
     appName: "com.android.chrome",
