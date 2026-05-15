@@ -19,12 +19,20 @@ const formatTime = (): string => {
     return new Date().toLocaleString("sv-SE", { hour12: false }).replace("T", " ");
 };
 
-const writeLog = (level: string, message: string): void => {
-    console.log(`${formatTime()} [${level}] ${message}`);
+const writeDebug = (message: string): void => {
+    console.debug(`${formatTime()} [DEBUG] ${message}`);
 };
 
-const writeError = (level: string, message: string): void => {
-    console.error(`${formatTime()} [${level}] ${message}`);
+const writeInfo = (message: string): void => {
+    console.log(`${formatTime()} [INFO] ${message}`);
+};
+
+const writeWarn = (message: string): void => {
+    console.warn(`${formatTime()} [WARN] ${message}`);
+};
+
+const writeError = (message: string): void => {
+    console.error(`${formatTime()} [ERROR] ${message}`);
 };
 
 const shouldLog = (level: LogLevel): boolean => {
@@ -33,25 +41,25 @@ const shouldLog = (level: LogLevel): boolean => {
 
 export const logError = (domain: string, message: string): void => {
     if (shouldLog(LogLevel.ERROR)) {
-        writeError("ERROR", `[${domain}] ${message}`);
+        writeError(`[${domain}] ${message}`);
     }
 };
 
 export const logWarn = (domain: string, message: string): void => {
     if (shouldLog(LogLevel.WARN)) {
-        writeLog("WARN", `[${domain}] ${message}`);
+        writeWarn(`[${domain}] ${message}`);
     }
 };
 
 export const logInfo = (domain: string, message: string): void => {
     if (shouldLog(LogLevel.INFO)) {
-        writeLog("INFO", `[${domain}] ${message}`);
+        writeInfo(`[${domain}] ${message}`);
     }
 };
 
 export const logDebug = (domain: string, message: string): void => {
     if (shouldLog(LogLevel.DEBUG)) {
-        writeLog("DEBUG", `[${domain}] ${message}`);
+        writeDebug(`[${domain}] ${message}`);
     }
 };
 
