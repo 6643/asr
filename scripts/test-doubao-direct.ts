@@ -26,14 +26,18 @@ if (isErr(sessionResult)) {
 
 const session = sessionResult.value;
 
-console.log("开始录音 5 秒...");
 const abort = new AbortController();
+const micStream = createMicStream({ signal: abort.signal });
+
+console.log("\n>>> 现在开始说话！录音 5 秒... <<<\n");
+
+// 等待 500ms 确保用户看到提示
+await new Promise(resolve => setTimeout(resolve, 500));
+
 setTimeout(() => {
     console.log("停止录音...");
     abort.abort();
 }, 5000);
-
-const micStream = await createMicStream({ signal: abort.signal });
 
 const pushTask = (async () => {
     for await (const chunk of micStream) {

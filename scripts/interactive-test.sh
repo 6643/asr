@@ -5,13 +5,15 @@ echo "豆包 ASR 语音识别测试"
 echo "=========================================="
 echo ""
 echo "准备开始录音测试..."
-echo "请在看到 '>>> 现在开始说话 <<<' 后，清晰地说一句话"
-echo "例如：'你好世界' 或 '今天天气真好'"
+echo "请准备好，等待提示后开始说话"
+echo "请清晰地说一句话，例如：'你好世界' 或 '今天天气真好'"
 echo ""
-read -p "按回车键开始录音..."
-
-echo ""
-echo ">>> 现在开始说话 <<<"
+echo "倒计时: 3..."
+sleep 1
+echo "倒计时: 2..."
+sleep 1
+echo "倒计时: 1..."
+sleep 1
 echo ""
 
 bun scripts/test-doubao-direct.ts 2>&1 | tee /tmp/asr-test-output.log
