@@ -155,17 +155,9 @@ const consumeKeyEvents = async (
     events: AsyncIterable<"press" | "release">,
     signal: (event: "start" | "stop" | "shutdown") => Promise<void>,
 ): Promise<void> => {
-    await consumeKeyEventIterator(events[Symbol.asyncIterator](), signal);
-};
-
-const consumeKeyEventIterator = async (
-    iterator: AsyncIterator<"press" | "release">,
-    signal: (event: "start" | "stop" | "shutdown") => Promise<void>,
-): Promise<void> => {
-    const next = await iterator.next();
-    if (next.done) return;
-    emitKeyControlSignal(next.value, signal);
-    await consumeKeyEventIterator(iterator, signal);
+    for await (const event of events) {
+        emitKeyControlSignal(event, signal);
+    }
 };
 
 const emitKeyControlSignal = (
