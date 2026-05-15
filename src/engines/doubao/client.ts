@@ -426,6 +426,26 @@ export const formatSenderSummary = (frameCount: number, byteCount: number): stri
     return `sender frames=${frameCount} bytes=${byteCount}`;
 };
 
+// =============
+// 调试音频保存
+// =============
+
+const DEBUG_AUDIO_PATH = "/tmp/asr-debug.pcm";
+
+const openDebugAudioFile = (): { file: any; path: string } => {
+    printTimedDomain("doubao", `debug audio -> ${DEBUG_AUDIO_PATH}`);
+    return { file: Bun.file(DEBUG_AUDIO_PATH).writer(), path: DEBUG_AUDIO_PATH };
+};
+
+const writeDebugAudio = (debugFile: { file: any; path: string }, chunk: Uint8Array): void => {
+    ignoreError(() => debugFile.file.write(chunk));
+};
+
+const closeDebugAudioFile = (debugFile: { file: any; path: string }): void => {
+    ignoreError(() => debugFile.file.end());
+    printTimedDomain("doubao", `debug audio saved (play: ffplay -f s16le -ar 16000 -ac 1 ${debugFile.path})`);
+};
+
 // 发送任务实现
 export const runSender = async (
     client: Client,
@@ -438,8 +458,11 @@ export const runSender = async (
     const frameBytes = Math.floor((client.config.sampleRate * client.config.frameDurationMs) / 1000) * 2;
     const frameInterval = client.config.frameDurationMs;
     const senderState = { frameCount: 0, byteCount: 0 };
-    const audioResult = await sendAudioStream(client, writer, audioStream[Symbol.asyncIterator](), state, senderState, frameBytes, frameInterval, realtime);
+    const debugFile = debugEnabled ? openDebugAudioFile() : null;
+    const audioResult = await sendAudioStream(client, writer, audioStream[Symbol.asyncIterator](), state, senderState, frameBytes, frameInterval, realtime, debugFile);
     if (isErr(audioResult)) return err(audioResult.error);
+
+    if (debugFile) closeDebugAudioFile(debugFile);
 
     // 确保所有帧已刷新后再发送结束帧
     await writer.ready;
@@ -462,12 +485,13 @@ const sendAudioStream = async (
     frameBytes: number,
     frameInterval: number,
     realtime: boolean | undefined,
+    debugFile: ReturnType<typeof openDebugAudioFile> | null,
 ): Promise<Result<void>> => {
     const next = await iterator.next();
     if (next.done) return ok(undefined);
-    const chunkResult = await sendAudioChunk(client, writer, next.value, sessionState, senderState, frameBytes, frameInterval, realtime);
+    const chunkResult = await sendAudioChunk(client, writer, next.value, sessionState, senderState, frameBytes, frameInterval, realtime, debugFile);
     if (isErr(chunkResult)) return err(chunkResult.error);
-    return sendAudioStream(client, writer, iterator, sessionState, senderState, frameBytes, frameInterval, realtime);
+    return sendAudioStream(client, writer, iterator, sessionState, senderState, frameBytes, frameInterval, realtime, debugFile);
 };
 
 const sendAudioChunk = async (
@@ -479,8 +503,10 @@ const sendAudioChunk = async (
     frameBytes: number,
     frameInterval: number,
     realtime: boolean | undefined,
+    debugFile: ReturnType<typeof openDebugAudioFile> | null,
 ): Promise<Result<void>> => {
     senderState.byteCount += chunk.length;
+    if (debugFile) writeDebugAudio(debugFile, chunk);
     const frames = createAudioFrames(chunk, frameBytes);
     return sendAudioFrames(writer, frames, sessionState, senderState, frameInterval, realtime, 0);
 };
