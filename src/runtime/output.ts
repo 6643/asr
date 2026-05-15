@@ -20,19 +20,19 @@ const formatTime = (): string => {
 };
 
 const writeDebug = (message: string): void => {
-    console.debug(`${formatTime()} [DEBUG] ${message}`);
+    console.debug(`${formatTime()} ${message}`);
 };
 
 const writeInfo = (message: string): void => {
-    console.log(`${formatTime()} [INFO] ${message}`);
+    console.log(`${formatTime()} ${message}`);
 };
 
 const writeWarn = (message: string): void => {
-    console.warn(`${formatTime()} [WARN] ${message}`);
+    console.warn(`${formatTime()} ${message}`);
 };
 
 const writeError = (message: string): void => {
-    console.error(`${formatTime()} [ERROR] ${message}`);
+    console.error(`${formatTime()} ${message}`);
 };
 
 const shouldLog = (level: LogLevel): boolean => {
@@ -41,25 +41,25 @@ const shouldLog = (level: LogLevel): boolean => {
 
 export const logError = (domain: string, message: string): void => {
     if (shouldLog(LogLevel.ERROR)) {
-        writeError(message);
+        writeError(`[${domain}] ${message}`);
     }
 };
 
 export const logWarn = (domain: string, message: string): void => {
     if (shouldLog(LogLevel.WARN)) {
-        writeWarn(message);
+        writeWarn(`[${domain}] ${message}`);
     }
 };
 
 export const logInfo = (domain: string, message: string): void => {
     if (shouldLog(LogLevel.INFO)) {
-        writeInfo(message);
+        writeInfo(`[${domain}] ${message}`);
     }
 };
 
 export const logDebug = (domain: string, message: string): void => {
     if (shouldLog(LogLevel.DEBUG)) {
-        writeDebug(message);
+        writeDebug(`[${domain}] ${message}`);
     }
 };
 
