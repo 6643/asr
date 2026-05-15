@@ -31,7 +31,9 @@ import {
     printRecognitionError,
     printInterim,
     printSessionStart,
-    printTimedDomain,
+    logDebug,
+    logInfo,
+    logError,
 } from "./output.ts";
 import type { RecognitionEngine } from "./recognition.ts";
 import { isErr, createAsyncQueue, tryAsyncResult, withFinallyAsync } from "../util.ts";
@@ -116,7 +118,7 @@ const commitRecognizedText = async (
 };
 
 const handleCommitFailure = (message: string, debugEnabled: boolean, sessionId: string): void => {
-    if (debugEnabled) printTimedDomain("ibus", `commit err session=${sessionId} ${message}`);
+    if (debugEnabled) logDebug("ibus", `commit err session=${sessionId} ${message}`);
     printIbusCommitFailure(message);
 };
 
@@ -185,7 +187,7 @@ const handleSessionFinishedEvent = (
 
 const debugDoubaoEvent = (debugEnabled: boolean, message: string): void => {
     if (!debugEnabled) return;
-    printTimedDomain("doubao", message);
+    logInfo("doubao", message);
 };
 
 export const runRecognitionSession = async <TClient>(
@@ -207,7 +209,7 @@ export const runRecognitionSession = async <TClient>(
         speakerState = transition.state;
         context.speakerState = speakerState;
         speakerReleaseCalled = true;
-        if (transition.shouldUnmute && debugEnabled) printTimedDomain("speaker", "unmute");
+        if (transition.shouldUnmute && debugEnabled) logDebug("speaker", "unmute");
         deps.unmuteSpeaker();
     };
     const onRelease = (): void => {
@@ -227,11 +229,11 @@ export const runRecognitionSession = async <TClient>(
         {
             onOpen: () => {
                 context.micState = markMicOpened(context.micState);
-                if (debugEnabled) printTimedDomain("mic", "open");
+                if (debugEnabled) logDebug("mic", "open");
             },
             onReady: async () => {
                 context.micState = markMicReady(context.micState);
-                if (debugEnabled) printTimedDomain("mic", "ready");
+                if (debugEnabled) logDebug("mic", "ready");
                 if (options.releaseSignal?.aborted) return;
                 printSessionStart();
                 const transition = requestSpeakerMute(context.speakerState);
@@ -245,7 +247,7 @@ export const runRecognitionSession = async <TClient>(
             },
             onClose: (summary) => {
                 context.micState = markMicClosed(context.micState);
-                if (debugEnabled) printTimedDomain("mic", `close chunks=${summary.chunkCount} bytes=${summary.byteCount} peak=${summary.peak}`);
+                if (debugEnabled) logDebug("mic", `close chunks=${summary.chunkCount} bytes=${summary.byteCount} peak=${summary.peak}`);
                 context.audioQueue.close();
             },
             onFailure: (error) => {
@@ -272,10 +274,10 @@ export const runRecognitionSession = async <TClient>(
             onSessionStart: () => {
                 doubaoState = markDoubaoStarting(doubaoState);
                 context.doubaoState = doubaoState;
-                if (debugEnabled) printTimedDomain("doubao", "session start");
+                if (debugEnabled) logInfo("doubao", "session start");
             },
             onSessionStartFailed: (message) => {
-                if (debugEnabled) printTimedDomain("doubao", `session start failed: ${message}`);
+                if (debugEnabled) logInfo("doubao", `session start failed: ${message}`);
                 printRecognitionError(message);
             },
             onSessionStarted: () => {
@@ -286,16 +288,16 @@ export const runRecognitionSession = async <TClient>(
                 speakerState = settled.state;
                 context.speakerState = speakerState;
                 muteSpeakerIfRequested(settled.shouldMute, debugEnabled, deps);
-                if (debugEnabled) printTimedDomain("doubao", "session started");
+                if (debugEnabled) logInfo("doubao", "session started");
             },
             onWriterOpen: () => {
-                if (debugEnabled) printTimedDomain("doubao", "writer open");
+                if (debugEnabled) logInfo("doubao", "writer open");
             },
             onWriterClose: () => {
-                if (debugEnabled) printTimedDomain("doubao", "writer close");
+                if (debugEnabled) logInfo("doubao", "writer close");
             },
             onPushFailed: (message) => {
-                if (debugEnabled) printTimedDomain("doubao", `push failed: ${message}`);
+                if (debugEnabled) logInfo("doubao", `push failed: ${message}`);
             },
             onEvent: async (resp) => {
                 await handleRecognitionEvent(
@@ -316,7 +318,7 @@ export const runRecognitionSession = async <TClient>(
 
 const muteSpeakerIfRequested = (shouldMute: boolean, debugEnabled: boolean, deps: SessionRunnerDeps): void => {
     if (!shouldMute) return;
-    if (debugEnabled) printTimedDomain("speaker", "mute");
+    if (debugEnabled) logDebug("speaker", "mute");
     deps.muteSpeaker();
 };
 

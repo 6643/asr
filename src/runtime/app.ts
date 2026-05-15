@@ -1,6 +1,6 @@
 import { createKeyStream, KEY_RIGHT_ALT, findKeyboardDevice } from "./key.ts";
 import { ensureIbusEngineSelected, ensureIbusServiceRunning, initIbusRuntime, startIbusService, waitForIbusRuntimeReady } from "./ibus.ts";
-import { printKeyDevice, printKeyboardEvent, printKeyboardWait, printTimedDomain, printTimedDomainError } from "./output.ts";
+import { printKeyDevice, printKeyboardEvent, printKeyboardWait, logInfo, logWarn, logError } from "./output.ts";
 import { runRecognitionSession } from "./session-runner.ts";
 import type { RecognitionEngine } from "./recognition.ts";
 import { createControlLoop } from "./control.ts";
@@ -25,7 +25,7 @@ const switchToAsrInputMethod = async (): Promise<Result<void>> => {
 
 const handleAutoSwitch = async (abortIbusStartup: (message: string) => void): Promise<boolean> => {
     if (!isAutoSwitchEnabled()) {
-        printTimedDomain("ibus", "Auto-switch disabled, please manually switch to ASR input method");
+        logInfo("ibus", "Auto-switch disabled, please manually switch to ASR input method");
         return true;
     }
 
@@ -34,18 +34,18 @@ const handleAutoSwitch = async (abortIbusStartup: (message: string) => void): Pr
         abortIbusStartup(`Initialization failed: failed to switch input method: ${switchResult.error.message}`);
         return false;
     }
-    printTimedDomain("ibus", "Switched to ASR input method");
+    logInfo("ibus", "Switched to ASR input method");
     return true;
 };
 
 const printEngineDescription = (line: string): void => {
     const match = line.match(/^\[([^\]]+)\]\s*(.*)$/);
     if (!match?.[1]) {
-        printTimedDomain("app", line);
+        logInfo("app", line);
         return;
     }
 
-    printTimedDomain(match[1], match[2] || "");
+    logInfo(match[1], match[2] || "");
 };
 
 export const runRuntime = async <TClient>(
@@ -55,7 +55,7 @@ export const runRuntime = async <TClient>(
     const client = engine.createClient();
     const prepareResult = await engine.prepare(client);
     if (isErr(prepareResult)) {
-        printTimedDomainError("app", `Initialization failed: ${prepareResult.error.message}`);
+        logError("app", `Initialization failed: ${prepareResult.error.message}`);
         return;
     }
 
@@ -65,20 +65,20 @@ export const runRuntime = async <TClient>(
 
     const keyboardDevice = await findKeyboardDevice();
     if (!keyboardDevice) {
-        printTimedDomainError("app", "Initialization failed: keyboard device not found");
+        logError("app", "Initialization failed: keyboard device not found");
         return;
     }
     printKeyDevice(keyboardDevice);
 
     const initIbusResult = await initIbusRuntime();
     if (isErr(initIbusResult)) {
-        printTimedDomainError("ibus", `Initialization failed: ${initIbusResult.error.message}`);
+        logError("ibus", `Initialization failed: ${initIbusResult.error.message}`);
         return;
     }
 
     const stopIbusServiceResult = await tryAsyncResult(() => startIbusService());
     if (isErr(stopIbusServiceResult)) {
-        printTimedDomainError("ibus", `Initialization failed: ${stopIbusServiceResult.error.message}`);
+        logError("ibus", `Initialization failed: ${stopIbusServiceResult.error.message}`);
         return;
     }
 
@@ -112,7 +112,7 @@ export const runRuntime = async <TClient>(
         printKeyboardWait("down", "RightAlt");
         const result = await tryAsyncResult(() => consumeKeyEvents(createKeyStream(keyboardDevice, KEY_RIGHT_ALT, stopSignal), control.signal));
         if (!isErr(result)) return;
-        printTimedDomainError("kbd", `stream failed: ${result.error.message}`);
+        logError("kbd", `stream failed: ${result.error.message}`);
         stopController.abort();
     };
     let keyLoop: Promise<void> | null = null;
@@ -135,7 +135,7 @@ export const runRuntime = async <TClient>(
 
         const runtimeReady = await waitForIbusRuntimeReady();
         if (isErr(runtimeReady)) {
-            printTimedDomain("ibus", `runtime not ready: ${runtimeReady.error.message}`);
+            logWarn("ibus", `runtime not ready: ${runtimeReady.error.message}`);
         }
 
         keyLoop = startKeyLoop();
@@ -143,7 +143,7 @@ export const runRuntime = async <TClient>(
         await control.signal("shutdown");
         await keyLoop;
         await stopIbusServiceResult.value();
-        printTimedDomain("app", "Shutting down...");
+        logInfo("app", "Shutting down...");
     }, async () => {
         await waitForKeyLoop(keyLoop);
         process.removeListener("SIGINT", onStop);
@@ -182,7 +182,7 @@ const emitKeyControlSignal = (
 };
 
 const abortIbusStartup = (message: string): boolean => {
-    printTimedDomainError("ibus", message);
+    logError("ibus", message);
     return false;
 };
 

@@ -5,7 +5,7 @@ import { type Config, createConfig, getWsUrl, getHeaders, getSessionConfig, getT
 import { ResponseType, FrameState, type ASRResponse } from "./types.ts";
 import { ok, err, tryAsyncResult, isErr, ignoreError, type Result } from "../../util.ts";
 import { buildStartTask, buildStartSession, buildFinishTask, buildFinishSession, buildAsrRequest, parseResponse } from "./proto.ts";
-import { printTimedDomain } from "../../runtime/output.ts";
+import { logDebug } from "../../runtime/output.ts";
 import {
     consumeReadableResponses,
     buildWebSocketInit,
@@ -20,7 +20,7 @@ import {
 
 const logDoubaoError = (enabled: boolean | undefined, message: string): void => {
     if (!enabled) return;
-    printTimedDomain("doubao", `error ${message}`);
+    logDebug("doubao", `error ${message}`);
 };
 
 // =============
@@ -433,7 +433,7 @@ export const formatSenderSummary = (frameCount: number, byteCount: number): stri
 const DEBUG_AUDIO_PATH = "/tmp/asr-debug.pcm";
 
 const openDebugAudioFile = (): { file: any; path: string } => {
-    printTimedDomain("doubao", `debug audio -> ${DEBUG_AUDIO_PATH}`);
+    logDebug("doubao", `debug audio -> ${DEBUG_AUDIO_PATH}`);
     return { file: Bun.file(DEBUG_AUDIO_PATH).writer(), path: DEBUG_AUDIO_PATH };
 };
 
@@ -443,7 +443,7 @@ const writeDebugAudio = (debugFile: { file: any; path: string }, chunk: Uint8Arr
 
 const closeDebugAudioFile = (debugFile: { file: any; path: string }): void => {
     ignoreError(() => debugFile.file.end());
-    printTimedDomain("doubao", `debug audio saved (play: ffplay -f s16le -ar 16000 -ac 1 ${debugFile.path})`);
+    logDebug("doubao", `debug audio saved (play: ffplay -f s16le -ar 16000 -ac 1 ${debugFile.path})`);
 };
 
 // 发送任务实现
@@ -472,7 +472,7 @@ export const runSender = async (
     const finishResult = await tryAsyncResult(() => writer.write(buildFinishSession(state.requestId, token)));
     if (isErr(finishResult)) return err(finishResult.error);
 
-    if (debugEnabled) printTimedDomain("doubao", formatSenderSummary(senderState.frameCount, senderState.byteCount));
+    if (debugEnabled) logDebug("doubao", formatSenderSummary(senderState.frameCount, senderState.byteCount));
     return await tryAsyncResult(() => writer.close());
 };
 

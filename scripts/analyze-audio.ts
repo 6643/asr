@@ -15,9 +15,12 @@ const data = await file.arrayBuffer();
 // 检查是否是 WAV 文件（RIFF 头）
 const view = new DataView(data);
 let offset = 0;
-if (data.byteLength >= 44 &&
+if (
+    data.byteLength >= 44 &&
     view.getUint32(0, false) === 0x52494646 && // "RIFF"
-    view.getUint32(8, false) === 0x57415645) { // "WAVE"
+    view.getUint32(8, false) === 0x57415645
+) {
+    // "WAVE"
     offset = 44; // 跳过 WAV 头
     console.log("检测到 WAV 格式，跳过文件头");
 }
@@ -49,9 +52,9 @@ console.log(`时长: ${durationSec.toFixed(2)} 秒`);
 console.log(`总样本数: ${total}`);
 console.log(`最大值: ${max}, 最小值: ${min}`);
 console.log(`RMS 音量: ${rms.toFixed(1)}`);
-console.log(`削波样本 (>32700): ${clippedHigh} (${(clippedHigh/total*100).toFixed(2)}%)`);
-console.log(`削波样本 (<-32700): ${clippedLow} (${(clippedLow/total*100).toFixed(2)}%)`);
-console.log(`接近静音 (<100): ${nearZero} (${(nearZero/total*100).toFixed(1)}%)`);
+console.log(`削波样本 (>32700): ${clippedHigh} (${((clippedHigh / total) * 100).toFixed(2)}%)`);
+console.log(`削波样本 (<-32700): ${clippedLow} (${((clippedLow / total) * 100).toFixed(2)}%)`);
+console.log(`接近静音 (<100): ${nearZero} (${((nearZero / total) * 100).toFixed(1)}%)`);
 
 console.log(`\n前 50 个样本:`);
 console.log(Array.from(samples.slice(0, 50)).join(", "));

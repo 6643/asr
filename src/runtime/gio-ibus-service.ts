@@ -39,7 +39,7 @@ import {
     IBUS_SERVICE_IFACE,
     IBUS_SERVICE_PATH,
 } from "./ibus-meta.ts";
-import { printTimedDomain, printTimedDomainError } from "./output.ts";
+import { logDebug, logError } from "./output.ts";
 
 interface GioIbusEngine {
     objectPath: string;
@@ -203,7 +203,7 @@ const emitGioIbusCommitTextWithParameters = (
     const flushed = libraries.gio.symbols.g_dbus_connection_flush_sync(connection, null, flushError.pointer);
     if (!flushed) return err(new Error(`CommitText flush failed: ${readGErrorMessage(libraries.glib, flushError)}`));
 
-    printTimedDomain("ibus", `CommitText emitted path=${objectPath}`);
+    logDebug("ibus", `CommitText emitted path=${objectPath}`);
     return ok(undefined);
 };
 
@@ -218,14 +218,14 @@ const commitThroughGioIbus = (
     const engine = state.activeEngine;
     if (!engine) return "ERR engine_not_created";
 
-    printTimedDomain(
+    logDebug(
         "ibus",
         `commit start path=${engine.objectPath} enabled=${engine.state.enabled} focused=${engine.state.hasFocus}`,
     );
     if (!engine.state.enabled && !engine.state.hasFocus) return "ERR engine_not_active";
     const committed = emitGioIbusCommitText(libraries, connection, engine.objectPath, text);
     if (isErr(committed)) {
-        printTimedDomainError("ibus", committed.error.message);
+        logError("ibus", committed.error.message);
         return "ERR service_unavailable";
     }
 
@@ -240,28 +240,28 @@ const createEngineMethodHandler = (
     return (method: string): Result<Pointer | null> => {
         if (method === "FocusIn") {
             engine.state.hasFocus = true;
-            printTimedDomain("ibus", "FocusIn");
+            logDebug("ibus", "FocusIn");
             return ok(null);
         }
         if (method === "FocusOut") {
             engine.state.hasFocus = false;
-            printTimedDomain("ibus", "FocusOut");
+            logDebug("ibus", "FocusOut");
             return ok(null);
         }
         if (method === "Destroy") {
             engine.state.hasFocus = false;
             engine.state.enabled = false;
-            printTimedDomain("ibus", "Destroy");
+            logDebug("ibus", "Destroy");
             return ok(null);
         }
         if (method === "Enable") {
             engine.state.enabled = true;
-            printTimedDomain("ibus", "Enable");
+            logDebug("ibus", "Enable");
             return ok(null);
         }
         if (method === "Disable") {
             engine.state.enabled = false;
-            printTimedDomain("ibus", "Disable");
+            logDebug("ibus", "Disable");
             return ok(null);
         }
         if (method === "ProcessKeyEvent") return createBooleanReturnTuple(libraries.glib, false);
@@ -295,7 +295,7 @@ const registerIbusObject = (
 };
 
 const logIbusMethodError = (method: string, error: Error): void => {
-    printTimedDomainError("ibus", `method=${method} err ${error.message}`);
+    logError("ibus", `method=${method} err ${error.message}`);
 };
 
 const withIbusMethodErrorLogging = (
@@ -315,12 +315,12 @@ const createFactoryMethodHandler = (context: GioIbusServiceContext) => {
         const engineName = extractFirstStringFromTuple(context.libraries.glib, parameters);
         if (isErr(engineName)) return err(engineName.error);
         if (engineName.value !== IBUS_ENGINE_NAME) {
-            printTimedDomainError("ibus", `unsupported engine: ${engineName.value}`);
+            logError("ibus", `unsupported engine: ${engineName.value}`);
             return createObjectPathReturnTuple(context.libraries.glib, "/");
         }
 
         const path = `${IBUS_ENGINE_PATH_PREFIX}/${context.state.engineId++}`;
-        printTimedDomain("ibus", `CreateEngine name=${engineName.value} path=${path}`);
+        logDebug("ibus", `CreateEngine name=${engineName.value} path=${path}`);
 
         const engine: GioIbusEngine = { objectPath: path, state: { hasFocus: false, enabled: false } };
         const registered = registerIbusObject(
@@ -392,15 +392,15 @@ const createGioIbusConnection = (resources: GioIbusResources, address: string): 
 
 const logRequestNameReply = (reply: number): void => {
     if (reply === 1) {
-        printTimedDomain("ibus", "requestName acquired primary ownership");
+        logDebug("ibus", "requestName acquired primary ownership");
         return;
     }
     if (reply === 2) {
-        printTimedDomain("ibus", "requestName returned IN_QUEUE (2)");
+        logDebug("ibus", "requestName returned IN_QUEUE (2)");
         return;
     }
 
-    printTimedDomain("ibus", `requestName returned ${reply}`);
+    logDebug("ibus", `requestName returned ${reply}`);
 };
 
 const assertIbusBusNameOwned = (reply: number): void => {
@@ -411,7 +411,7 @@ const assertIbusBusNameOwned = (reply: number): void => {
 export const startGioIbusService = async (): Promise<() => Promise<void>> => {
     const ibusAddressResult = await resolveIbusAddress();
     if (isErr(ibusAddressResult)) {
-        printTimedDomainError("ibus", ibusAddressResult.error.message);
+        logError("ibus", ibusAddressResult.error.message);
         throw new Error(`IBus address resolution failed: ${ibusAddressResult.error.message}`);
     }
 
@@ -461,7 +461,7 @@ const startGioIbusServiceResources = async (
 
     assertIbusBusNameOwned(requestNameReply.value);
     logRequestNameReply(requestNameReply.value);
-    printTimedDomain("ibus", `engine ready. name=${IBUS_ENGINE_NAME} address=${address}`);
+    logDebug("ibus", `engine ready. name=${IBUS_ENGINE_NAME} address=${address}`);
     return { dispatchLoop: startGioDispatchLoop(resources.libraries.glib, isStopped) };
 };
 

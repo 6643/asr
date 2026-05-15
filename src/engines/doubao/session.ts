@@ -3,6 +3,7 @@ import type { RecognitionEvent } from "../../runtime/recognition.ts";
 import type { RecognitionSession } from "../../runtime/session.ts";
 import { ResponseType, type ASRResponse } from "./types.ts";
 import type { Client } from "./client.ts";
+import { logDebug } from "../../runtime/output.ts";
 
 const MAX_AUDIO_QUEUE_ITEMS = 64;
 const MAX_EVENT_QUEUE_ITEMS = 32;
@@ -79,7 +80,7 @@ export const createDoubaoSession = (
 
     const pushRecognitionEvent = (resp: ASRResponse): void => {
         if (options?.debugEnabled) {
-            console.log(`[doubao] response type=${resp.type} text="${resp.text || ""}" error="${resp.error_msg || ""}"`);
+            logDebug("doubao", `response type=${resp.type} text="${resp.text || ""}" error="${resp.error_msg || ""}"`);
         }
         switch (resp.type) {
             case ResponseType.INTERIM_RESULT:

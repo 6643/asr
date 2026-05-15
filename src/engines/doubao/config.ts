@@ -9,7 +9,7 @@ import { createWaveClient } from "./wave.ts";
 import type { WaveSession, SessionConfig, DeviceCredentials } from "./types.ts";
 import { ok, err, tryAsyncResult, trySyncResult, isOk, isErr, type Result, uint8ArrayToBase64, base64ToUint8Array } from "../../util.ts";
 import { getDefaultCredentialPath, resolveCredentialPath } from "./config-path.ts";
-import { printTimedDomainError } from "../../runtime/output.ts";
+import { logError } from "../../runtime/output.ts";
 
 // 配置接口
 export interface Config {
@@ -264,7 +264,7 @@ const serializeWaveSession = (session: WaveSession): DeviceCredentials["wave_ses
 
 const logCredentialSaveFailure = (result: Result<void>): void => {
     if (!isErr(result)) return;
-    printTimedDomainError("doubao", `Failed to save credential file: ${result.error.message}`);
+    logError("doubao", `Failed to save credential file: ${result.error.message}`);
 };
 
 // 获取 WaveClient

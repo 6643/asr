@@ -5,7 +5,7 @@ import { createCipheriv, createHash } from "crypto";
 import { HANDSHAKE_URL, HKDF_INFO, USER_AGENT } from "./constants.ts";
 import type { WaveSession } from "./types.ts";
 import { err, isErr, ok, tryAsyncResult, type Result } from "../../util.ts";
-import { printTimedDomainError } from "../../runtime/output.ts";
+import { logError } from "../../runtime/output.ts";
 
 // 密钥交换信息
 export interface KeyShare {
@@ -113,7 +113,7 @@ const deriveKey = async (sharedKey: Uint8Array, salt: Uint8Array, info: Uint8Arr
 export const handshake = async (client: WaveClient): Promise<boolean> => {
     const result = await tryAsyncResult(() => handshakeUnchecked(client));
     if (!isErr(result)) return result.value;
-    printTimedDomainError("doubao", `Handshake failed: ${result.error.message}`);
+    logError("doubao", `Handshake failed: ${result.error.message}`);
     return false;
 };
 
@@ -193,7 +193,7 @@ const deriveSharedKey = async (privateKey: CryptoKey, serverPubkey: Uint8Array):
 };
 
 const fallbackSharedKey = (error: Error): Uint8Array => {
-    printTimedDomainError("doubao", `Failed to compute shared secret: ${error.message}`);
+    logError("doubao", `Failed to compute shared secret: ${error.message}`);
     return new Uint8Array(32);
 };
 

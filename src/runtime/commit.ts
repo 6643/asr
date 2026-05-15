@@ -5,7 +5,7 @@
 import { err, isErr, ok, tryAsyncResult, type Result } from "../util.ts";
 import { isIbusRuntimeStatusReady } from "./ibus.ts";
 import { callIbusServiceStringMethodInWorker } from "./ibus-rpc-worker-client.ts";
-import { printTimedDomain } from "./output.ts";
+import { logDebug } from "./output.ts";
 import { isDebugEnabled } from "./config.ts";
 
 export interface CommitResult {
@@ -45,7 +45,7 @@ const normalizeIbusResponse = (response: string): string => {
 
 const debugCommit = (message: string): void => {
     if (!isCommitDebugEnabled()) return;
-    printTimedDomain("ibus", message);
+    logDebug("ibus", message);
 };
 
 const readIbusStatusInWorker = (timeoutMs: number): Promise<Result<string>> => {
