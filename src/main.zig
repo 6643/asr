@@ -1,0 +1,57 @@
+const std = @import("std");
+const asr = @import("asr_zig");
+
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
+    const stdout = &stdout_file_writer.interface;
+    defer stdout.flush() catch {};
+
+    const args = try init.minimal.args.toSlice(allocator);
+    defer allocator.free(args);
+    switch (asr.cli.modeFromArgs(args)) {
+        .ibus_xml => {
+            try stdout.writeAll(asr.runtime.ibus.component_xml);
+            return;
+        },
+        .ibus_service => {
+            const service = try asr.runtime.ibus.startService(allocator, init.io, init.minimal.environ);
+            defer {
+                service.stop();
+                allocator.destroy(service);
+            }
+            while (true) {
+                service.iterate();
+                sleepMs(init.io, 100);
+            }
+            return;
+        },
+        .once_pcm => |pcm_path| {
+            var cfg: asr.config.Config = .{};
+            const creds = try asr.config.loadCredentials(allocator, init.io, cfg.credential_path);
+            defer creds.deinit(allocator);
+            cfg = asr.config.withCredentials(cfg, creds);
+            if (cfg.device_id.len == 0 or cfg.token.len == 0) return error.MissingCredentials;
+
+            const text = try asr.doubao.client.transcribePcmFile(allocator, init.io, cfg, .{
+                .pcm_path = pcm_path,
+                .debug = true,
+            });
+            if (text) |value| {
+                defer allocator.free(value);
+                try stdout.print("{s}\n", .{value});
+            }
+            return;
+        },
+        .app => {
+            try stdout.flush();
+            try asr.runtime.app.run(allocator, init.io, init.minimal.environ);
+            return;
+        },
+    }
+}
+
+fn sleepMs(io: std.Io, milliseconds: i64) void {
+    std.Io.sleep(io, .fromMilliseconds(milliseconds), .awake) catch {};
+}

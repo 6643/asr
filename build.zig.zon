@@ -1,0 +1,18 @@
+.{
+    .name = .asr_zig,
+    .version = "0.0.0",
+    .fingerprint = 0x13e8828896577709,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .websocket = .{
+            .url = "git+https://github.com/karlseguin/websocket.zig.git#d823a7d8cb3e43b3789208ae499bfe1d077de8ee",
+            .hash = "websocket-0.1.0-ZPISdUQ6BAAuDI1LbcOpeUAMHk5sIvvWmcSl1wFSFL62",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}
