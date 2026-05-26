@@ -103,49 +103,114 @@ fn runHotkeyLoop(
         const event = try key.readNextEvent(&reader.interface, &state, key.right_alt);
         if (event == .release) continue;
         output.keyEvent(logger, .press);
-        notify.playMicReadyNotification(allocator, io);
-        logger.info("doubao", "🎤", .{});
-        var speaker_guard = SpeakerMuteGuard.init(allocator, io, logger);
-        defer speaker_guard.release();
-        logger.debug("mic", "open", .{});
-        const pcm_path = mic.captureUntilKeyRelease(allocator, io, keyboard_device, key.right_alt, .{
-            .sample_rate = cfg.sample_rate,
-            .channels = cfg.channels,
-            .frame_duration_ms = cfg.frame_duration_ms,
+        var callback_ctx = DoubaoCallbacks{
+            .logger = logger,
+            .service = service,
+        };
+        var session = doubao.StreamingSession.init(allocator, io, cfg, .{
+            .debug = true,
+            .on_interim = onDoubaoInterim,
+            .interim_ctx = @ptrCast(&callback_ctx),
+            .on_final = onDoubaoFinal,
+            .final_ctx = @ptrCast(&callback_ctx),
         }) catch |err| {
-            logger.err("mic", "capture failed: {s}", .{@errorName(err)});
+            logger.err("doubao", "session failed: {s}", .{@errorName(err)});
             output.keyWait(logger);
             continue;
         };
-        defer allocator.free(pcm_path);
+        defer session.deinit();
+        session.start() catch |err| {
+            logger.err("doubao", "session failed: {s}", .{@errorName(err)});
+            output.keyWait(logger);
+            continue;
+        };
+        notify.playMicReadyNotification(allocator, io);
+        logger.info("doubao", "🎤", .{});
+        var captured_audio: std.ArrayList(u8) = .empty;
+        defer captured_audio.deinit(allocator);
+        var stream_state = StreamCaptureState{
+            .allocator = allocator,
+            .session = &session,
+            .captured_audio = &captured_audio,
+        };
+        var speaker_guard = SpeakerMuteGuard.init(allocator, io, logger);
+        defer speaker_guard.release();
+        logger.debug("mic", "open", .{});
+        const capture_summary = mic.captureStreamUntilKeyRelease(io, keyboard_device, key.right_alt, .{
+            .sample_rate = cfg.sample_rate,
+            .channels = cfg.channels,
+            .frame_duration_ms = cfg.frame_duration_ms,
+        }, .{
+            .on_chunk = onDoubaoAudioChunk,
+            .chunk_ctx = @ptrCast(&stream_state),
+        }) catch |err| {
+            logger.err("doubao", "capture failed: {s}", .{@errorName(err)});
+            output.keyWait(logger);
+            continue;
+        };
         output.keyEvent(logger, .release);
-        logger.debug("mic", "close", .{});
+        logger.debug("mic", "close chunks={d} bytes={d}", .{ capture_summary.chunk_count, capture_summary.byte_count });
         speaker_guard.release();
 
-        const text_opt = doubao.transcribePcmFile(allocator, io, cfg, .{
-            .pcm_path = pcm_path,
-            .debug = true,
-            .on_interim = onDoubaoInterim,
-            .interim_ctx = @ptrCast(&logger),
-        }) catch |err| {
+        if (stream_state.stream_error) |stream_err| {
+            logger.err("doubao", "stream failed: {s}", .{@errorName(stream_err)});
+            const finish = session.finishAfterStreamFailure();
+            if (!handleFinish(allocator, logger, service, finish) and !session.hasFinalEvent()) {
+                const fallback = doubao.transcribePcmBytes(allocator, io, cfg, captured_audio.items, .{
+                    .pcm_path = "",
+                    .debug = true,
+                }) catch |err| {
+                    logger.err("doubao", "fallback failed: {s}", .{@errorName(err)});
+                    output.keyWait(logger);
+                    continue;
+                };
+                if (fallback) |text| {
+                    _ = handleFinish(allocator, logger, service, .{ .text = text });
+                } else {
+                    logger.info("doubao", "session_finished", .{});
+                }
+            }
+            output.keyWait(logger);
+            continue;
+        }
+
+        const finish = session.finish() catch |err| {
             logger.err("doubao", "recognize failed: {s}", .{@errorName(err)});
             output.keyWait(logger);
             continue;
         };
-        if (text_opt) |text| {
+        _ = handleFinish(allocator, logger, service, finish);
+        output.keyWait(logger);
+    }
+}
+
+fn handleFinish(
+    allocator: std.mem.Allocator,
+    logger: output.Logger,
+    service: *ibus.gio_ibus.Service,
+    finish: doubao.StreamFinish,
+) bool {
+    switch (finish) {
+        .text => |text| {
             defer allocator.free(text);
             logger.info("doubao", "🚀 {s}", .{text});
             const commit_status = service.commitStatus(text);
             if (!std.mem.startsWith(u8, commit_status, "OK ")) {
                 logger.err("ibus", "❌ {s}", .{commit_status});
-                output.keyWait(logger);
-                continue;
+                return true;
             }
             logger.info("ibus", "✅", .{});
-        } else {
+            return true;
+        },
+        .err => |message| {
+            defer allocator.free(message);
+            logger.err("doubao", "recognize failed: {s}", .{message});
+            return false;
+        },
+        .none => {
             logger.info("doubao", "session_finished", .{});
-        }
-        output.keyWait(logger);
+            return false;
+        },
     }
 }
 
@@ -155,9 +220,42 @@ fn sleepMs(io: std.Io, milliseconds: i64) void {
 
 fn onDoubaoInterim(ctx: ?*const anyopaque, text: []const u8) void {
     if (text.len == 0) return;
-    const logger = @as(*const output.Logger, @ptrCast(@alignCast(ctx orelse return)));
-    logger.info("doubao", "🎤 {s}", .{text});
+    const callbacks = @as(*const DoubaoCallbacks, @ptrCast(@alignCast(ctx orelse return)));
+    callbacks.logger.info("doubao", "🎤 {s}", .{text});
 }
+
+fn onDoubaoFinal(ctx: ?*const anyopaque, text: []const u8) void {
+    if (text.len == 0) return;
+    const callbacks = @as(*const DoubaoCallbacks, @ptrCast(@alignCast(ctx orelse return)));
+    callbacks.logger.info("doubao", "🚀 {s}", .{text});
+    const commit_status = callbacks.service.commitStatus(text);
+    if (!std.mem.startsWith(u8, commit_status, "OK ")) {
+        callbacks.logger.err("ibus", "❌ {s}", .{commit_status});
+        return;
+    }
+    callbacks.logger.info("ibus", "✅", .{});
+}
+
+fn onDoubaoAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
+    const state = @as(*StreamCaptureState, @ptrCast(@alignCast(ctx orelse return error.MissingChunkSession)));
+    try state.captured_audio.appendSlice(state.allocator, chunk);
+    if (state.stream_error != null) return;
+    state.session.sendChunk(chunk) catch |err| {
+        state.stream_error = err;
+    };
+}
+
+const StreamCaptureState = struct {
+    allocator: std.mem.Allocator,
+    session: *doubao.StreamingSession,
+    captured_audio: *std.ArrayList(u8),
+    stream_error: ?anyerror = null,
+};
+
+const DoubaoCallbacks = struct {
+    logger: output.Logger,
+    service: *ibus.gio_ibus.Service,
+};
 
 const SpeakerMuteGuard = struct {
     allocator: std.mem.Allocator,

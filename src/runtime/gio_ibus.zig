@@ -22,18 +22,24 @@ pub const Service = struct {
     mutex: std.Io.Mutex = .init,
 
     pub fn stop(service: *Service) void {
+        service.unregisterRegistrations();
+        service.libs.symbols.g_object_unref(service.connection);
+        service.libs.close();
+    }
+
+    fn unregisterRegistrations(service: *Service) void {
         var i = service.registrations.items.len;
         while (i > 0) : (i -= 1) {
             const registration = &service.registrations.items[i - 1];
+            const handler_ctx = registration.state.handler_ctx;
+            if (handler_ctx != @as(*anyopaque, @ptrCast(service))) {
+                const engine_ctx = @as(*EngineContext, @ptrCast(@alignCast(handler_ctx)));
+                service.allocator.free(engine_ctx.object_path);
+                service.allocator.destroy(engine_ctx);
+            }
             gio.unregisterObject(service.allocator, &service.libs, service.connection, registration);
-            if (registration.state.handler_ctx == @as(*anyopaque, @ptrCast(service))) continue;
-            const engine_ctx = @as(*EngineContext, @ptrCast(@alignCast(registration.state.handler_ctx)));
-            service.allocator.free(engine_ctx.object_path);
-            service.allocator.destroy(engine_ctx);
         }
         service.registrations.deinit(service.allocator);
-        service.libs.symbols.g_object_unref(service.connection);
-        service.libs.close();
     }
 
     pub fn iterate(service: *Service) void {
@@ -96,7 +102,7 @@ pub fn start(
         .registrations = .empty,
         .state = .{},
     };
-    errdefer service.registrations.deinit(allocator);
+    errdefer service.unregisterRegistrations();
 
     try registerFactory(service);
     try registerService(service);
@@ -177,7 +183,7 @@ pub fn createEngineXml() []const u8 {
 }
 
 fn registerFactory(service: *Service) !void {
-    const registration = try gio.registerObject(
+    var registration = try gio.registerObject(
         service.allocator,
         &service.libs,
         service.connection,
@@ -187,11 +193,12 @@ fn registerFactory(service: *Service) !void {
         @ptrCast(service),
         onFactoryMethod,
     );
+    errdefer gio.unregisterObject(service.allocator, &service.libs, service.connection, &registration);
     try service.registrations.append(service.allocator, registration);
 }
 
 fn registerService(service: *Service) !void {
-    const registration = try gio.registerObject(
+    var registration = try gio.registerObject(
         service.allocator,
         &service.libs,
         service.connection,
@@ -201,6 +208,7 @@ fn registerService(service: *Service) !void {
         @ptrCast(service),
         onServiceMethod,
     );
+    errdefer gio.unregisterObject(service.allocator, &service.libs, service.connection, &registration);
     try service.registrations.append(service.allocator, registration);
 }
 
@@ -211,7 +219,7 @@ fn registerEngine(service: *Service, path: []const u8) !void {
         .service = service,
         .object_path = path,
     };
-    const registration = try gio.registerObject(
+    var registration = try gio.registerObject(
         service.allocator,
         &service.libs,
         service.connection,
@@ -221,6 +229,7 @@ fn registerEngine(service: *Service, path: []const u8) !void {
         @ptrCast(ctx),
         onEngineMethod,
     );
+    errdefer gio.unregisterObject(service.allocator, &service.libs, service.connection, &registration);
     try service.registrations.append(service.allocator, registration);
 }
 

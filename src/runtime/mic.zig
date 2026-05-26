@@ -7,6 +7,16 @@ pub const CaptureOptions = struct {
     device: ?[]const u8 = null,
 };
 
+pub const StreamOptions = struct {
+    on_chunk: *const fn (ctx: ?*anyopaque, chunk: []const u8) anyerror!void,
+    chunk_ctx: ?*anyopaque = null,
+};
+
+pub const StreamSummary = struct {
+    chunk_count: usize = 0,
+    byte_count: usize = 0,
+};
+
 pub fn captureUntilKeyRelease(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -16,16 +26,18 @@ pub fn captureUntilKeyRelease(
 ) ![]u8 {
     var child = try spawnArecord(io, options);
     errdefer child.kill(io);
+    var stop_requested = std.atomic.Value(bool).init(false);
 
     var out_file = try createTempPcmFile(allocator, io);
     defer allocator.free(out_file.path);
     defer out_file.file.close(io);
 
     var copy_result: CopyResult = .{};
-    const copy_thread = try std.Thread.spawn(.{}, copyAudioToFileThread, .{ &child, io, &out_file.file, &copy_result });
+    const copy_thread = try std.Thread.spawn(.{}, copyAudioToFileThread, .{ &child, io, &out_file.file, &copy_result, &stop_requested });
 
     waitForRelease(io, keyboard_device, key_code) catch {};
     // Zig 0.16: kill() already waits and reaps child.
+    stop_requested.store(true, .release);
     child.kill(io);
     copy_thread.join();
     if (copy_result.err) |e| return e;
@@ -45,6 +57,28 @@ pub fn waitForRelease(io: std.Io, keyboard_device: []const u8, key_code: u16) !v
         const event = try key.readNextEvent(&reader.interface, &state, key_code);
         if (event == .release) return;
     }
+}
+
+pub fn captureStreamUntilKeyRelease(
+    io: std.Io,
+    keyboard_device: []const u8,
+    key_code: u16,
+    options: CaptureOptions,
+    stream: StreamOptions,
+) !StreamSummary {
+    var child = try spawnArecord(io, options);
+    errdefer child.kill(io);
+    var stop_requested = std.atomic.Value(bool).init(false);
+
+    var stream_result: StreamResult = .{};
+    const stream_thread = try std.Thread.spawn(.{}, streamAudioThread, .{ &child, io, &stream_result, stream, &stop_requested });
+
+    waitForRelease(io, keyboard_device, key_code) catch {};
+    stop_requested.store(true, .release);
+    child.kill(io);
+    stream_thread.join();
+    if (stream_result.err) |err| return err;
+    return stream_result.summary;
 }
 
 fn spawnArecord(io: std.Io, options: CaptureOptions) !std.process.Child {
@@ -107,7 +141,18 @@ const CopyResult = struct {
     err: ?anyerror = null,
 };
 
-fn copyAudioToFileThread(child: *std.process.Child, io: std.Io, out: *std.Io.File, result: *CopyResult) void {
+const StreamResult = struct {
+    summary: StreamSummary = .{},
+    err: ?anyerror = null,
+};
+
+fn copyAudioToFileThread(
+    child: *std.process.Child,
+    io: std.Io,
+    out: *std.Io.File,
+    result: *CopyResult,
+    stop_requested: *std.atomic.Value(bool),
+) void {
     const source = child.stdout orelse {
         result.err = error.MissingChildStdout;
         return;
@@ -119,6 +164,7 @@ fn copyAudioToFileThread(child: *std.process.Child, io: std.Io, out: *std.Io.Fil
     while (true) {
         const read_len = reader.interface.readSliceShort(&chunk) catch |err| {
             if (err == error.EndOfStream) return;
+            if (stop_requested.load(.acquire) and isExpectedStopReadError(err)) return;
             result.err = err;
             return;
         };
@@ -128,6 +174,49 @@ fn copyAudioToFileThread(child: *std.process.Child, io: std.Io, out: *std.Io.Fil
             return;
         };
     }
+}
+
+fn streamAudioThread(
+    child: *std.process.Child,
+    io: std.Io,
+    result: *StreamResult,
+    stream: StreamOptions,
+    stop_requested: *std.atomic.Value(bool),
+) void {
+    const source = child.stdout orelse {
+        result.err = error.MissingChildStdout;
+        return;
+    };
+    var reader_buffer: [4096]u8 = undefined;
+    var reader = std.Io.File.Reader.initStreaming(source, io, &reader_buffer);
+    var chunk: [4096]u8 = undefined;
+
+    while (true) {
+        const read_len = reader.interface.readSliceShort(&chunk) catch |err| {
+            if (err == error.EndOfStream) return;
+            if (stop_requested.load(.acquire) and isExpectedStopReadError(err)) return;
+            result.err = err;
+            return;
+        };
+        if (read_len == 0) return;
+        stream.on_chunk(stream.chunk_ctx, chunk[0..read_len]) catch |err| {
+            result.err = err;
+            return;
+        };
+        result.summary.chunk_count += 1;
+        result.summary.byte_count += read_len;
+    }
+}
+
+fn isExpectedStopReadError(err: anyerror) bool {
+    return switch (err) {
+        error.ReadFailed,
+        error.BrokenPipe,
+        error.NotOpenForReading,
+        error.ConnectionResetByPeer,
+        => true,
+        else => false,
+    };
 }
 
 test "temp file path format" {

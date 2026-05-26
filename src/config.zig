@@ -2,7 +2,8 @@ const std = @import("std");
 
 pub const default_websocket_url = "wss://frontier-audio-ime-ws.doubao.com/ocean/api/v1/ws";
 pub const default_aid = "401734";
-pub const default_user_agent = "asr-zig/0.1";
+pub const default_user_agent =
+    "com.bytedance.android.doubaoime/100102018 (Linux; U; Android 16; en_US; Pixel 7 Pro; Build/BP2A.250605.031.A2; Cronet/TTNetVersion:94cf429a 2025-11-17 QuicVersion:1f89f732 2025-05-08)";
 pub const default_credential_path = "config/doubao.json";
 
 pub const Credentials = struct {
@@ -108,7 +109,7 @@ test "builds websocket headers" {
     const allocator = std.testing.allocator;
     const h = try headers(allocator, .{});
     defer allocator.free(h);
-    try std.testing.expect(std.mem.indexOf(u8, h, "User-Agent: asr-zig/0.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h, "User-Agent: com.bytedance.android.doubaoime/100102018") != null);
     try std.testing.expect(std.mem.indexOf(u8, h, "proto-version: v2") != null);
 }
 

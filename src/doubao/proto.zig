@@ -209,7 +209,7 @@ pub const SessionConfig = struct {
     sample_rate: u32 = 16000,
     channels: u16 = 1,
     device_id: []const u8,
-    app_name: []const u8 = "asr-zig",
+    app_name: []const u8 = "com.android.chrome",
     enable_punctuation: bool = true,
 };
 

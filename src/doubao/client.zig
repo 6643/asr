@@ -29,6 +29,437 @@ pub const OnceOptions = struct {
     interim_ctx: ?*const anyopaque = null,
 };
 
+pub const StreamOptions = struct {
+    debug: bool = false,
+    on_interim: ?*const fn (ctx: ?*const anyopaque, text: []const u8) void = null,
+    interim_ctx: ?*const anyopaque = null,
+    on_final: ?*const fn (ctx: ?*const anyopaque, text: []const u8) void = null,
+    final_ctx: ?*const anyopaque = null,
+};
+
+pub const StreamFinish = union(enum) {
+    none,
+    text: []const u8,
+    err: []const u8,
+};
+
+const StreamingResolution = enum {
+    pending,
+    final,
+    session_finished,
+    err,
+};
+
+const StreamingResultState = struct {
+    final_text: ?[]const u8 = null,
+    final_seen: bool = false,
+    error_message: ?[]const u8 = null,
+    session_finished: bool = false,
+    reader_closed: bool = false,
+
+    fn deinit(state: *StreamingResultState, allocator: std.mem.Allocator) void {
+        if (state.final_text) |text| allocator.free(text);
+        if (state.error_message) |message| allocator.free(message);
+        state.* = initStreamingResultState();
+    }
+};
+
+fn initStreamingResultState() StreamingResultState {
+    return .{};
+}
+
+fn currentStreamingResolution(state: StreamingResultState) StreamingResolution {
+    if (state.error_message != null) return .err;
+    if (state.final_text != null) return .final;
+    if (state.session_finished or state.reader_closed) return .session_finished;
+    return .pending;
+}
+
+fn takeResolvedResultLocked(state: *StreamingResultState) StreamFinish {
+    return switch (currentStreamingResolution(state.*)) {
+        .final => blk: {
+            const text = state.final_text orelse break :blk .none;
+            state.final_text = null;
+            break :blk .{ .text = text };
+        },
+        .err => blk: {
+            const message = state.error_message orelse break :blk .none;
+            state.error_message = null;
+            break :blk .{ .err = message };
+        },
+        .pending, .session_finished => .none,
+    };
+}
+
+fn updateStreamingResultState(allocator: std.mem.Allocator, state: *StreamingResultState, event: Event) StreamingResolution {
+    switch (event.kind) {
+        .interim, .vad => return currentStreamingResolution(state.*),
+        .session_finished => {
+            state.session_finished = true;
+            return currentStreamingResolution(state.*);
+        },
+        .final => {
+            state.final_seen = true;
+            if (state.final_text) |text| allocator.free(text);
+            state.final_text = event.text;
+            return currentStreamingResolution(state.*);
+        },
+        .err => {
+            if (state.error_message) |message| allocator.free(message);
+            state.error_message = event.message;
+            return .err;
+        },
+    }
+}
+
+pub const StreamingSession = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: config.Config,
+    options: StreamOptions,
+    client: websocket.Client,
+    request_id: []const u8,
+    frame_bytes: usize,
+    sent_frame_count: usize = 0,
+    pending_audio: std.ArrayList(u8),
+    state_mutex: std.Io.Mutex = .init,
+    state_cond: std.Io.Condition = .init,
+    state: StreamingResultState = initStreamingResultState(),
+    read_thread: ?std.Thread = null,
+    stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    finish_sent: bool = false,
+    last_frame_sent_at_ms: ?i64 = null,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        cfg: config.Config,
+        options: StreamOptions,
+    ) !StreamingSession {
+        const frame_bytes_u32 = config.frameBytes(cfg);
+        if (frame_bytes_u32 == 0) return error.InvalidFrameBytes;
+        const frame_bytes: usize = @intCast(frame_bytes_u32);
+
+        var client = try connect(allocator, io, cfg);
+        errdefer client.deinit();
+
+        const request_id = try requestId(allocator, io);
+        errdefer allocator.free(request_id);
+
+        try initializeSession(allocator, &client, cfg, request_id, options.debug);
+
+        var pending_audio = try std.ArrayList(u8).initCapacity(allocator, @max(frame_bytes * 3, @as(usize, 8192)));
+        errdefer pending_audio.deinit(allocator);
+
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .cfg = cfg,
+            .options = options,
+            .client = client,
+            .request_id = request_id,
+            .frame_bytes = frame_bytes,
+            .pending_audio = pending_audio,
+        };
+    }
+
+    pub fn start(session: *StreamingSession) !void {
+        if (session.read_thread != null) return error.SessionAlreadyStarted;
+        session.read_thread = try std.Thread.spawn(.{}, readLoopThread, .{session});
+    }
+
+    pub fn deinit(session: *StreamingSession) void {
+        session.stopReadLoop();
+        session.joinReadThread();
+        session.state.deinit(session.allocator);
+        session.pending_audio.deinit(session.allocator);
+        session.allocator.free(session.request_id);
+        session.client.deinit();
+    }
+
+    pub fn sendChunk(session: *StreamingSession, chunk: []const u8) !void {
+        if (session.finish_sent) return error.SessionAlreadyFinished;
+        try session.pending_audio.appendSlice(session.allocator, chunk);
+        try session.flushReadyFrames();
+    }
+
+    pub fn finish(session: *StreamingSession) !StreamFinish {
+        if (!session.finish_sent) {
+            try session.flushTrailingFrame();
+            try session.sendFinishRequest();
+            session.finish_sent = true;
+        }
+
+        return try session.waitForFinish();
+    }
+
+    pub fn finishAfterStreamFailure(session: *StreamingSession) StreamFinish {
+        session.finish_sent = true;
+        session.stopReadLoop();
+        session.joinReadThread();
+        return session.takeResolvedResult();
+    }
+
+    pub fn hasFinalEvent(session: *StreamingSession) bool {
+        session.state_mutex.lockUncancelable(session.io);
+        defer session.state_mutex.unlock(session.io);
+        return session.state.final_seen;
+    }
+
+    pub fn serverMessage(session: *StreamingSession, data: []u8, tpe: websocket.MessageTextType) !void {
+        if (tpe != .binary) return;
+        var response = try proto.parseResponse(session.allocator, data);
+        defer response.deinit(session.allocator);
+        session.handleResponse(&response);
+    }
+
+    pub fn serverClose(session: *StreamingSession, data: []u8) !void {
+        const close_info = parseServerClose(data);
+        session.recordServerClose(close_info);
+        if (!session.options.debug) return;
+        if (close_info.reason.len == 0) {
+            std.log.warn("doubao server close: code={d}", .{close_info.code});
+            return;
+        }
+        std.log.warn("doubao server close: code={d} reason={s}", .{ close_info.code, close_info.reason });
+    }
+
+    pub fn readLoopError(session: *StreamingSession, err: anyerror) void {
+        if (session.shouldIgnoreReadLoopError(err)) return;
+        if (session.options.debug) {
+            std.log.warn("doubao read loop failed: {s}", .{@errorName(err)});
+        }
+        session.recordReadLoopError(err);
+    }
+
+    pub fn close(session: *StreamingSession) void {
+        session.state_mutex.lockUncancelable(session.io);
+        defer session.state_mutex.unlock(session.io);
+        session.state.reader_closed = true;
+        session.state_cond.broadcast(session.io);
+    }
+
+    fn joinReadThread(session: *StreamingSession) void {
+        if (session.read_thread) |thread| {
+            thread.join();
+            session.read_thread = null;
+        }
+    }
+
+    fn stopReadLoop(session: *StreamingSession) void {
+        if (session.read_thread == null) return;
+        session.stop_requested.store(true, .release);
+        session.shutdownReadSocket();
+    }
+
+    fn shutdownReadSocket(session: *StreamingSession) void {
+        const fd = session.client.stream.stream.socket.handle;
+        _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+    }
+
+    fn shouldIgnoreReadLoopError(session: *StreamingSession, err: anyerror) bool {
+        if (session.stop_requested.load(.acquire)) return true;
+        if (err != error.ReadFailed) return false;
+        session.state_mutex.lockUncancelable(session.io);
+        defer session.state_mutex.unlock(session.io);
+        return session.state.final_seen;
+    }
+
+    fn readLoopThread(session: *StreamingSession) void {
+        while (true) {
+            const message = session.client.read() catch |err| switch (err) {
+                error.Closed => {
+                    session.close();
+                    return;
+                },
+                else => {
+                    session.readLoopError(err);
+                    session.close();
+                    return;
+                },
+            } orelse continue;
+            defer session.client.done(message);
+
+            switch (message.type) {
+                .text, .binary => session.serverMessage(message.data, if (message.type == .text) .text else .binary) catch |err| {
+                    session.readLoopError(err);
+                    session.close();
+                    return;
+                },
+                .close => {
+                    session.serverClose(message.data) catch |err| {
+                        session.readLoopError(err);
+                    };
+                    session.close();
+                    return;
+                },
+                .ping => session.client.writeFrame(.pong, @constCast(message.data)) catch |err| {
+                    session.readLoopError(err);
+                    session.close();
+                    return;
+                },
+                .pong => {},
+            }
+        }
+    }
+
+    fn handleResponse(session: *StreamingSession, response: *proto.Response) void {
+        switch (response.kind) {
+            .interim => {
+                if (response.text.len == 0) return;
+                if (session.options.on_interim) |on_interim| {
+                    on_interim(session.options.interim_ctx, response.text);
+                    return;
+                }
+                if (session.options.debug) std.log.info("interim: {s}", .{response.text});
+            },
+            .final => {
+                const text = response.text;
+                response.text = "";
+                if (session.options.on_final) |on_final| {
+                    session.noteFinalSeen();
+                    on_final(session.options.final_ctx, text);
+                    session.allocator.free(text);
+                    return;
+                }
+                session.recordEvent(.{ .kind = .final, .text = text });
+            },
+            .session_finished => session.recordEvent(.{ .kind = .session_finished }),
+            .err => {
+                const message = response.error_message;
+                response.error_message = "";
+                session.recordEvent(.{ .kind = .err, .message = message });
+            },
+            .vad, .unknown, .task_started, .session_started => {},
+        }
+    }
+
+    fn recordEvent(session: *StreamingSession, event: Event) void {
+        session.state_mutex.lockUncancelable(session.io);
+        defer {
+            session.state_cond.broadcast(session.io);
+            session.state_mutex.unlock(session.io);
+        }
+        _ = updateStreamingResultState(session.allocator, &session.state, event);
+    }
+
+    fn recordServerClose(session: *StreamingSession, close_info: ServerClose) void {
+        session.state_mutex.lockUncancelable(session.io);
+        defer {
+            session.state_cond.broadcast(session.io);
+            session.state_mutex.unlock(session.io);
+        }
+        if (session.state.final_text != null) return;
+        if (session.state.error_message != null) return;
+        const message = std.fmt.allocPrint(session.allocator, "server closed: code={d}", .{close_info.code}) catch return;
+        session.state.error_message = message;
+    }
+
+    fn recordReadLoopError(session: *StreamingSession, err: anyerror) void {
+        session.state_mutex.lockUncancelable(session.io);
+        defer {
+            session.state_cond.broadcast(session.io);
+            session.state_mutex.unlock(session.io);
+        }
+        if (session.state.final_seen or session.state.final_text != null) return;
+        const message = session.allocator.dupe(u8, @errorName(err)) catch return;
+        if (session.state.error_message) |existing| session.allocator.free(existing);
+        session.state.error_message = message;
+    }
+
+    fn noteFinalSeen(session: *StreamingSession) void {
+        session.state_mutex.lockUncancelable(session.io);
+        defer {
+            session.state_cond.broadcast(session.io);
+            session.state_mutex.unlock(session.io);
+        }
+        session.state.final_seen = true;
+    }
+
+    fn waitForFinish(session: *StreamingSession) !StreamFinish {
+        session.state_mutex.lockUncancelable(session.io);
+        defer session.state_mutex.unlock(session.io);
+
+        while (true) {
+            if (session.state.error_message != null) return takeResolvedResultLocked(&session.state);
+            if (session.state.session_finished or session.state.reader_closed) {
+                return takeResolvedResultLocked(&session.state);
+            }
+            session.state_cond.waitUncancelable(session.io, &session.state_mutex);
+        }
+    }
+
+    fn takeResolvedResult(session: *StreamingSession) StreamFinish {
+        session.state_mutex.lockUncancelable(session.io);
+        defer session.state_mutex.unlock(session.io);
+        return takeResolvedResultLocked(&session.state);
+    }
+
+    fn flushReadyFrames(session: *StreamingSession) !void {
+        while (session.pending_audio.items.len >= session.frame_bytes) {
+            try session.writeFrame(session.pending_audio.items[0..session.frame_bytes]);
+            session.discardPendingPrefix(session.frame_bytes);
+        }
+    }
+
+    fn flushTrailingFrame(session: *StreamingSession) !void {
+        if (session.pending_audio.items.len == 0) return;
+        const frame = try paddedFrame(session.allocator, session.pending_audio.items, session.frame_bytes);
+        defer session.allocator.free(frame);
+        try session.writeFrame(frame);
+        session.pending_audio.items.len = 0;
+    }
+
+    fn writeFrame(session: *StreamingSession, frame: []const u8) !void {
+        const timestamp_ms = session.nextFrameTimestampMs();
+        try sendAudioFrame(
+            session.allocator,
+            &session.client,
+            session.request_id,
+            &session.sent_frame_count,
+            frame,
+            timestamp_ms,
+        );
+    }
+
+    fn discardPendingPrefix(session: *StreamingSession, prefix_len: usize) void {
+        const remaining = session.pending_audio.items.len - prefix_len;
+        std.mem.copyForwards(u8, session.pending_audio.items[0..remaining], session.pending_audio.items[prefix_len..]);
+        session.pending_audio.items.len = remaining;
+    }
+
+    fn sendFinishRequest(session: *StreamingSession) !void {
+        const finish_request = try proto.buildFinishSession(session.allocator, session.request_id, session.cfg.token);
+        defer session.allocator.free(finish_request);
+        try session.client.writeBin(@constCast(finish_request));
+    }
+
+    fn nextFrameTimestampMs(session: *StreamingSession) i64 {
+        const now_ms = std.Io.Timestamp.now(session.io, .real).toMilliseconds();
+        const delay_ms = nextFrameDelayMs(session.last_frame_sent_at_ms, now_ms, session.cfg.frame_duration_ms);
+        if (delay_ms > 0) {
+            std.Io.sleep(session.io, .fromMilliseconds(delay_ms), .awake) catch {};
+        }
+        const timestamp_ms = std.Io.Timestamp.now(session.io, .real).toMilliseconds();
+        session.last_frame_sent_at_ms = timestamp_ms;
+        return timestamp_ms;
+    }
+};
+
+const ServerClose = struct {
+    code: u16 = 1005,
+    reason: []const u8 = "",
+};
+
+fn parseServerClose(data: []const u8) ServerClose {
+    if (data.len < 2) return .{};
+    const code = (@as(u16, data[0]) << 8) | data[1];
+    return .{
+        .code = code,
+        .reason = data[2..],
+    };
+}
+
 pub fn transcribePcmFile(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -37,7 +468,21 @@ pub fn transcribePcmFile(
 ) !?[]u8 {
     const audio = try std.Io.Dir.cwd().readFileAlloc(io, options.pcm_path, allocator, .limited(64 * 1024 * 1024));
     defer allocator.free(audio);
+    return transcribePcmBytes(allocator, io, cfg, audio, .{
+        .pcm_path = options.pcm_path,
+        .debug = options.debug,
+        .on_interim = options.on_interim,
+        .interim_ctx = options.interim_ctx,
+    });
+}
 
+pub fn transcribePcmBytes(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: config.Config,
+    audio: []const u8,
+    options: OnceOptions,
+) !?[]u8 {
     var client = try connect(allocator, io, cfg);
     defer client.deinit();
 
@@ -99,7 +544,7 @@ fn initializeSession(allocator: std.mem.Allocator, client: *websocket.Client, cf
         .sample_rate = cfg.sample_rate,
         .channels = cfg.channels,
         .device_id = cfg.device_id,
-        .app_name = "asr-zig",
+        .app_name = "com.android.chrome",
         .enable_punctuation = true,
     });
     defer allocator.free(start_session);
@@ -132,20 +577,37 @@ fn sendAudio(
             owned_frame = padded;
         }
         defer if (owned_frame) |buf| allocator.free(buf);
-
-        const state: proto.FrameState = if (frame_count == 0) .first else .middle;
         const timestamp_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
-        const request = try proto.buildAudioRequest(allocator, request_id, frame, state, timestamp_ms);
-        defer allocator.free(request);
-        try client.writeBin(@constCast(request));
-
+        try sendAudioFrame(allocator, client, request_id, &frame_count, frame, timestamp_ms);
         offset += take;
-        frame_count += 1;
     }
 
     const finish = try proto.buildFinishSession(allocator, request_id, cfg.token);
     defer allocator.free(finish);
     try client.writeBin(@constCast(finish));
+}
+
+fn sendAudioFrame(
+    allocator: std.mem.Allocator,
+    client: *websocket.Client,
+    request_id: []const u8,
+    frame_count: *usize,
+    frame: []const u8,
+    timestamp_ms: i64,
+) !void {
+    const state: proto.FrameState = if (frame_count.* == 0) .first else .middle;
+    const request = try proto.buildAudioRequest(allocator, request_id, frame, state, timestamp_ms);
+    defer allocator.free(request);
+    try client.writeBin(@constCast(request));
+    frame_count.* += 1;
+}
+
+fn nextFrameDelayMs(last_frame_sent_at_ms: ?i64, now_ms: i64, frame_duration_ms: u16) i64 {
+    const interval_ms: i64 = if (frame_duration_ms == 0) 100 else frame_duration_ms;
+    const last_frame_sent = last_frame_sent_at_ms orelse return 0;
+    const next_allowed_ms = last_frame_sent + interval_ms;
+    if (next_allowed_ms <= now_ms) return 0;
+    return next_allowed_ms - now_ms;
 }
 
 fn paddedFrame(allocator: std.mem.Allocator, bytes: []const u8, len: usize) ![]u8 {
@@ -270,4 +732,117 @@ test "pads final pcm frame" {
     const frame = try paddedFrame(allocator, "abc", 6);
     defer allocator.free(frame);
     try std.testing.expectEqualSlices(u8, &.{ 'a', 'b', 'c', 0, 0, 0 }, frame);
+}
+
+test "server close without final records an error" {
+    const allocator = std.testing.allocator;
+    var session: StreamingSession = undefined;
+    session.allocator = allocator;
+    session.io = std.testing.io;
+    session.options = .{};
+    session.state_mutex = .init;
+    session.state_cond = .init;
+    session.state = initStreamingResultState();
+    defer session.state.deinit(allocator);
+
+    var close_bytes = [_]u8{ 0x03, 0xF3, 'b', 'y', 'e' };
+    try session.serverClose(close_bytes[0..]);
+    const finish = takeResolvedResultLocked(&session.state);
+    switch (finish) {
+        .err => |message| {
+            defer allocator.free(message);
+            try std.testing.expect(std.mem.indexOf(u8, message, "1011") != null);
+        },
+        else => return error.TestExpectedError,
+    }
+}
+
+test "streaming result state keeps final text after reader closed" {
+    const allocator = std.testing.allocator;
+    var state = initStreamingResultState();
+    defer state.deinit(allocator);
+
+    const final_text = try allocator.dupe(u8, "实时识别。");
+    const final_event = Event{ .kind = .final, .text = final_text };
+    try std.testing.expectEqual(
+        StreamingResolution.final,
+        updateStreamingResultState(allocator, &state, final_event),
+    );
+    state.reader_closed = true;
+    try std.testing.expectEqual(StreamingResolution.final, currentStreamingResolution(state));
+    try std.testing.expectEqualStrings("实时识别。", state.final_text.?);
+    try std.testing.expect(state.final_seen);
+}
+
+test "final text does not mask later error" {
+    const allocator = std.testing.allocator;
+    var state = initStreamingResultState();
+    defer state.deinit(allocator);
+
+    const text = try allocator.dupe(u8, "语音识别测试。");
+    _ = updateStreamingResultState(allocator, &state, .{ .kind = .final, .text = text });
+    const message = try allocator.dupe(u8, "SessionFailed");
+    try std.testing.expectEqual(
+        StreamingResolution.err,
+        updateStreamingResultState(allocator, &state, .{ .kind = .err, .message = message }),
+    );
+    const finish = takeResolvedResultLocked(&state);
+    switch (finish) {
+        .err => |actual| {
+            defer allocator.free(actual);
+            try std.testing.expectEqualStrings("SessionFailed", actual);
+        },
+        else => return error.TestExpectedError,
+    }
+}
+
+test "next frame delay uses configured frame interval" {
+    try std.testing.expectEqual(@as(i64, 0), nextFrameDelayMs(null, 1_000, 100));
+    try std.testing.expectEqual(@as(i64, 40), nextFrameDelayMs(1_000, 1_060, 100));
+    try std.testing.expectEqual(@as(i64, 0), nextFrameDelayMs(1_000, 1_100, 100));
+}
+
+test "parses server close code and reason" {
+    const close_info = parseServerClose(&.{ 0x03, 0xF3, 'b', 'y', 'e' });
+    try std.testing.expectEqual(@as(u16, 1011), close_info.code);
+    try std.testing.expectEqualStrings("bye", close_info.reason);
+}
+
+test "suppresses read loop warning after local stop request" {
+    var session: StreamingSession = undefined;
+    session.stop_requested = std.atomic.Value(bool).init(false);
+    session.io = std.testing.io;
+    session.state_mutex = .init;
+    session.state = initStreamingResultState();
+    defer session.state.deinit(std.testing.allocator);
+    try std.testing.expect(!session.shouldIgnoreReadLoopError(error.ReadFailed));
+    session.stop_requested.store(true, .release);
+    try std.testing.expect(session.shouldIgnoreReadLoopError(error.ReadFailed));
+}
+
+test "suppresses read failed warning after final seen" {
+    var session: StreamingSession = undefined;
+    session.stop_requested = std.atomic.Value(bool).init(false);
+    session.io = std.testing.io;
+    session.state_mutex = .init;
+    session.state = initStreamingResultState();
+    defer session.state.deinit(std.testing.allocator);
+    session.state.final_seen = true;
+
+    try std.testing.expect(session.shouldIgnoreReadLoopError(error.ReadFailed));
+    try std.testing.expect(!session.shouldIgnoreReadLoopError(error.UnexpectedResponse));
+}
+
+test "read loop error is ignored after final seen" {
+    var session: StreamingSession = undefined;
+    session.allocator = std.testing.allocator;
+    session.io = std.testing.io;
+    session.state_mutex = .init;
+    session.state_cond = .init;
+    session.state = initStreamingResultState();
+    defer session.state.deinit(std.testing.allocator);
+    session.state.final_seen = true;
+
+    session.recordReadLoopError(error.ReadFailed);
+    try std.testing.expect(session.state.error_message == null);
 }

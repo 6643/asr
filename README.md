@@ -33,7 +33,7 @@ zig build install-ibus
 ./zig-out/bin/asr
 ```
 
-默认会自动发现键盘设备。按住 `RightAlt` 开始录音, 松开触发识别并提交到当前 IBus 输入焦点。
+默认会自动发现键盘设备。按住 `RightAlt` 开始录音并实时识别, 松开后等待最终结果并提交到当前 IBus 输入焦点。
 
 若自动发现失败, 显式指定键盘设备:
 
