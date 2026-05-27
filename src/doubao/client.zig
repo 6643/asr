@@ -125,6 +125,7 @@ pub const StreamingSession = struct {
     state_mutex: std.Io.Mutex = .init,
     state_cond: std.Io.Condition = .init,
     state: StreamingResultState = initStreamingResultState(),
+    write_mutex: std.Io.Mutex = .init,
     read_thread: ?std.Thread = null,
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     finish_sent: bool = false,
@@ -179,11 +180,16 @@ pub const StreamingSession = struct {
 
     pub fn sendChunk(session: *StreamingSession, chunk: []const u8) !void {
         if (session.finish_sent) return error.SessionAlreadyFinished;
+        if (session.shouldAbortAudio()) return error.SessionStreamClosed;
         try session.pending_audio.appendSlice(session.allocator, chunk);
         try session.flushReadyFrames();
     }
 
     pub fn finish(session: *StreamingSession) !StreamFinish {
+        if (session.shouldAbortAudio()) {
+            session.finish_sent = true;
+            return session.takeResolvedResult();
+        }
         if (!session.finish_sent) {
             try session.flushTrailingFrame();
             try session.sendFinishRequest();
@@ -239,6 +245,18 @@ pub const StreamingSession = struct {
         session.state_cond.broadcast(session.io);
     }
 
+    fn writeClientFrame(session: *StreamingSession, op_code: websocket.OpCode, data: []u8) !void {
+        session.write_mutex.lockUncancelable(session.io);
+        defer session.write_mutex.unlock(session.io);
+        try session.client.writeFrame(op_code, data);
+    }
+
+    fn writeClientBin(session: *StreamingSession, data: []u8) !void {
+        session.write_mutex.lockUncancelable(session.io);
+        defer session.write_mutex.unlock(session.io);
+        try session.client.writeBin(data);
+    }
+
     fn joinReadThread(session: *StreamingSession) void {
         if (session.read_thread) |thread| {
             thread.join();
@@ -263,6 +281,14 @@ pub const StreamingSession = struct {
         session.state_mutex.lockUncancelable(session.io);
         defer session.state_mutex.unlock(session.io);
         return session.state.final_seen;
+    }
+
+    fn shouldAbortAudio(session: *StreamingSession) bool {
+        session.state_mutex.lockUncancelable(session.io);
+        defer session.state_mutex.unlock(session.io);
+        return session.state.error_message != null or
+            session.state.reader_closed or
+            session.state.session_finished;
     }
 
     fn readLoopThread(session: *StreamingSession) void {
@@ -293,7 +319,7 @@ pub const StreamingSession = struct {
                     session.close();
                     return;
                 },
-                .ping => session.client.writeFrame(.pong, @constCast(message.data)) catch |err| {
+                .ping => session.writeClientFrame(.pong, @constCast(message.data)) catch |err| {
                     session.readLoopError(err);
                     session.close();
                     return;
@@ -411,15 +437,11 @@ pub const StreamingSession = struct {
     }
 
     fn writeFrame(session: *StreamingSession, frame: []const u8) !void {
+        if (session.shouldAbortAudio()) return error.SessionStreamClosed;
         const timestamp_ms = session.nextFrameTimestampMs();
-        try sendAudioFrame(
-            session.allocator,
-            &session.client,
-            session.request_id,
-            &session.sent_frame_count,
-            frame,
-            timestamp_ms,
-        );
+        session.write_mutex.lockUncancelable(session.io);
+        defer session.write_mutex.unlock(session.io);
+        try sendAudioFrame(session.allocator, &session.client, session.request_id, &session.sent_frame_count, frame, timestamp_ms);
     }
 
     fn discardPendingPrefix(session: *StreamingSession, prefix_len: usize) void {
@@ -429,9 +451,10 @@ pub const StreamingSession = struct {
     }
 
     fn sendFinishRequest(session: *StreamingSession) !void {
+        if (session.shouldAbortAudio()) return error.SessionStreamClosed;
         const finish_request = try proto.buildFinishSession(session.allocator, session.request_id, session.cfg.token);
         defer session.allocator.free(finish_request);
-        try session.client.writeBin(@constCast(finish_request));
+        try session.writeClientBin(@constCast(finish_request));
     }
 
     fn nextFrameTimestampMs(session: *StreamingSession) i64 {
@@ -845,4 +868,46 @@ test "read loop error is ignored after final seen" {
 
     session.recordReadLoopError(error.ReadFailed);
     try std.testing.expect(session.state.error_message == null);
+}
+
+test "stream failure stops audio sending" {
+    const allocator = std.testing.allocator;
+    var session: StreamingSession = undefined;
+    session.allocator = allocator;
+    session.io = std.testing.io;
+    session.state_mutex = .init;
+    session.state_cond = .init;
+    session.state = initStreamingResultState();
+    defer session.state.deinit(allocator);
+
+    try std.testing.expect(!session.shouldAbortAudio());
+
+    const message = try allocator.dupe(u8, "ReadFailed");
+    session.state.error_message = message;
+    try std.testing.expect(session.shouldAbortAudio());
+}
+
+test "finish after stream failure returns recorded error without writing" {
+    const allocator = std.testing.allocator;
+    var session: StreamingSession = undefined;
+    session.allocator = allocator;
+    session.io = std.testing.io;
+    session.state_mutex = .init;
+    session.state_cond = .init;
+    session.state = initStreamingResultState();
+    session.finish_sent = false;
+    defer session.state.deinit(allocator);
+
+    const message = try allocator.dupe(u8, "ReadFailed");
+    session.state.error_message = message;
+
+    const finish = try session.finish();
+    try std.testing.expect(session.finish_sent);
+    switch (finish) {
+        .err => |actual| {
+            defer allocator.free(actual);
+            try std.testing.expectEqualStrings("ReadFailed", actual);
+        },
+        else => return error.TestExpectedError,
+    }
 }

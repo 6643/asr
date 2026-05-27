@@ -4,17 +4,24 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const websocket_dep = b.dependency("websocket", .{
+    const websocket_mod = b.addModule("websocket", .{
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
+        .root_source_file = b.path("vendor/websocket/src/websocket.zig"),
     });
+    {
+        const options = b.addOptions();
+        options.addOption(bool, "websocket_blocking", false);
+        websocket_mod.addOptions("build", options);
+    }
 
     const mod = b.addModule("asr_zig", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "websocket", .module = websocket_dep.module("websocket") },
+            .{ .name = "websocket", .module = websocket_mod },
         },
     });
 
@@ -26,7 +33,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "asr_zig", .module = mod },
-                .{ .name = "websocket", .module = websocket_dep.module("websocket") },
+                .{ .name = "websocket", .module = websocket_mod },
             },
         }),
     });
