@@ -25,6 +25,7 @@ test {
     _ = runtime.gio_dbus;
     _ = runtime.gio_ibus;
     _ = runtime.ibus;
+    _ = @import("runtime/mic.zig");
     _ = runtime.mute;
     _ = runtime.notify;
     _ = runtime.output;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const key = @import("../key.zig");
 
 pub const CaptureOptions = struct {
     sample_rate: u32 = 16000,
@@ -10,6 +11,8 @@ pub const CaptureOptions = struct {
 pub const StreamOptions = struct {
     on_chunk: *const fn (ctx: ?*anyopaque, chunk: []const u8) anyerror!void,
     chunk_ctx: ?*anyopaque = null,
+    on_stopped: ?*const fn (ctx: ?*anyopaque) void = null,
+    stopped_ctx: ?*anyopaque = null,
 };
 
 pub const StreamSummary = struct {
@@ -33,7 +36,7 @@ pub fn captureUntilKeyRelease(
     defer out_file.file.close(io);
 
     var copy_result: CopyResult = .{};
-    const copy_thread = try std.Thread.spawn(.{}, copyAudioToFileThread, .{ &child, io, &out_file.file, &copy_result, &stop_requested });
+    var copy_thread = try std.Thread.spawn(.{}, copyAudioToFileThread, .{ &child, io, &out_file.file, &copy_result, &stop_requested });
 
     waitForRelease(io, keyboard_device, key_code) catch {};
     // Zig 0.16: kill() already waits and reaps child.
@@ -46,22 +49,19 @@ pub fn captureUntilKeyRelease(
 }
 
 pub fn waitForRelease(io: std.Io, keyboard_device: []const u8, key_code: u16) !void {
-    const key = @import("../key.zig");
     const file = try std.Io.Dir.cwd().openFile(io, keyboard_device, .{});
     defer file.close(io);
 
     var read_buffer: [4096]u8 = undefined;
     var reader = std.Io.File.Reader.initStreaming(file, io, &read_buffer);
     var state: key.State = .{};
-    while (true) {
-        const event = try key.readNextEvent(&reader.interface, &state, key_code);
-        if (event == .release) return;
-    }
+    try key.waitForRelease(&reader.interface, &state, key_code);
 }
 
 pub fn captureStreamUntilKeyRelease(
     io: std.Io,
-    keyboard_device: []const u8,
+    key_reader: *std.Io.Reader,
+    key_state: *key.State,
     key_code: u16,
     options: CaptureOptions,
     stream: StreamOptions,
@@ -71,15 +71,21 @@ pub fn captureStreamUntilKeyRelease(
     var stop_requested = std.atomic.Value(bool).init(false);
 
     var stream_result: StreamResult = .{};
-    const stream_thread = try std.Thread.spawn(.{}, streamAudioThread, .{ &child, io, &stream_result, stream, &stop_requested });
+    var stream_thread = try std.Thread.spawn(.{}, streamAudioThread, .{ &child, io, &stream_result, stream, &stop_requested });
 
-    waitForRelease(io, keyboard_device, key_code) catch {};
-    stop_requested.store(true, .release);
-    child.kill(io);
-    stream_thread.join();
+    key.waitForRelease(key_reader, key_state, key_code) catch {};
+    stopCaptureAndJoin(io, &stop_requested, stopChild, @ptrCast(&child), joinThread, @ptrCast(&stream_thread), .{
+        .fn_ptr = stream.on_stopped,
+        .ctx = stream.stopped_ctx,
+    });
     if (stream_result.err) |err| return err;
     return stream_result.summary;
 }
+
+const StopCallback = struct {
+    fn_ptr: ?*const fn (ctx: ?*anyopaque) void = null,
+    ctx: ?*anyopaque = null,
+};
 
 fn spawnArecord(io: std.Io, options: CaptureOptions) !std.process.Child {
     var frame_rate_buf: [16]u8 = undefined;
@@ -208,6 +214,31 @@ fn streamAudioThread(
     }
 }
 
+fn stopCaptureAndJoin(
+    io: std.Io,
+    stop_requested: *std.atomic.Value(bool),
+    stop_fn: *const fn (ctx: ?*anyopaque, io: std.Io) void,
+    stop_ctx: ?*anyopaque,
+    join_fn: *const fn (ctx: ?*anyopaque) void,
+    join_ctx: ?*anyopaque,
+    callback: StopCallback,
+) void {
+    stop_requested.store(true, .release);
+    stop_fn(stop_ctx, io);
+    if (callback.fn_ptr) |fn_ptr| fn_ptr(callback.ctx);
+    join_fn(join_ctx);
+}
+
+fn stopChild(ctx: ?*anyopaque, io: std.Io) void {
+    const child = @as(*std.process.Child, @ptrCast(@alignCast(ctx orelse return)));
+    child.kill(io);
+}
+
+fn joinThread(ctx: ?*anyopaque) void {
+    const thread = @as(*std.Thread, @ptrCast(@alignCast(ctx orelse return)));
+    thread.join();
+}
+
 fn isExpectedStopReadError(err: anyerror) bool {
     return switch (err) {
         error.ReadFailed,
@@ -224,4 +255,52 @@ test "temp file path format" {
     const path = try std.fmt.allocPrint(allocator, "/tmp/asr-zig-{x:0>2}{x:0>2}.pcm", .{ 0x12, 0x34 });
     defer allocator.free(path);
     try std.testing.expect(std.mem.startsWith(u8, path, "/tmp/asr-zig-"));
+}
+
+test "stop capture notifies before join returns" {
+    const Step = enum {
+        stop,
+        notify,
+        join,
+    };
+    const Recorder = struct {
+        steps: [3]Step = undefined,
+        len: usize = 0,
+
+        fn push(recorder: *@This(), step: Step) void {
+            recorder.steps[recorder.len] = step;
+            recorder.len += 1;
+        }
+    };
+    const Hooks = struct {
+        fn stop(ctx: ?*anyopaque, io: std.Io) void {
+            _ = io;
+            const recorder = @as(*Recorder, @ptrCast(@alignCast(ctx orelse return)));
+            recorder.push(.stop);
+        }
+
+        fn notify(ctx: ?*anyopaque) void {
+            const recorder = @as(*Recorder, @ptrCast(@alignCast(ctx orelse return)));
+            recorder.push(.notify);
+        }
+
+        fn join(ctx: ?*anyopaque) void {
+            const recorder = @as(*Recorder, @ptrCast(@alignCast(ctx orelse return)));
+            recorder.push(.join);
+        }
+    };
+
+    var stop_requested = std.atomic.Value(bool).init(false);
+    var recorder = Recorder{};
+
+    stopCaptureAndJoin(std.testing.io, &stop_requested, Hooks.stop, @ptrCast(&recorder), Hooks.join, @ptrCast(&recorder), .{
+        .fn_ptr = Hooks.notify,
+        .ctx = @ptrCast(&recorder),
+    });
+
+    try std.testing.expect(stop_requested.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 3), recorder.len);
+    try std.testing.expectEqual(Step.stop, recorder.steps[0]);
+    try std.testing.expectEqual(Step.notify, recorder.steps[1]);
+    try std.testing.expectEqual(Step.join, recorder.steps[2]);
 }

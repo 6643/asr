@@ -135,22 +135,28 @@ fn runHotkeyLoop(
         };
         var speaker_guard = SpeakerMuteGuard.init(allocator, io, logger);
         defer speaker_guard.release();
+        var release_state = CaptureReleaseState{
+            .logger = logger,
+            .speaker_guard = &speaker_guard,
+        };
         logger.debug("mic", "open", .{});
-        const capture_summary = mic.captureStreamUntilKeyRelease(io, keyboard_device, key.right_alt, .{
+        const capture_summary = mic.captureStreamUntilKeyRelease(io, &reader.interface, &state, key.right_alt, .{
             .sample_rate = cfg.sample_rate,
             .channels = cfg.channels,
             .frame_duration_ms = cfg.frame_duration_ms,
         }, .{
             .on_chunk = onDoubaoAudioChunk,
             .chunk_ctx = @ptrCast(&stream_state),
+            .on_stopped = onCaptureStopped,
+            .stopped_ctx = @ptrCast(&release_state),
         }) catch |err| {
             logger.err("doubao", "capture failed: {s}", .{@errorName(err)});
             output.keyWait(logger);
             continue;
         };
-        output.keyEvent(logger, .release);
-        logger.debug("mic", "close chunks={d} bytes={d}", .{ capture_summary.chunk_count, capture_summary.byte_count });
-        speaker_guard.release();
+        var close_message_buf: [128]u8 = undefined;
+        const close_message = formatMicCloseMessage(&close_message_buf, capture_summary) catch "recording already stopped";
+        logger.debug("mic", "{s}", .{close_message});
 
         if (stream_state.stream_error) |stream_err| {
             logger.err("doubao", "stream failed: {s}", .{@errorName(stream_err)});
@@ -230,10 +236,10 @@ fn onDoubaoFinal(ctx: ?*const anyopaque, text: []const u8) void {
     callbacks.logger.info("doubao", "🚀 {s}", .{text});
     const commit_status = callbacks.service.commitStatus(text);
     if (!std.mem.startsWith(u8, commit_status, "OK ")) {
-        callbacks.logger.err("ibus", "❌ {s}", .{commit_status});
+        callbacks.logger.err("ibus", "🟥 {s}", .{commit_status});
         return;
     }
-    callbacks.logger.info("ibus", "✅", .{});
+    callbacks.logger.info("ibus", "🟩", .{});
 }
 
 fn onDoubaoAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
@@ -255,6 +261,11 @@ const StreamCaptureState = struct {
 const DoubaoCallbacks = struct {
     logger: output.Logger,
     service: *ibus.gio_ibus.Service,
+};
+
+const CaptureReleaseState = struct {
+    logger: output.Logger,
+    speaker_guard: *SpeakerMuteGuard,
 };
 
 const SpeakerMuteGuard = struct {
@@ -281,3 +292,29 @@ const SpeakerMuteGuard = struct {
         guard.active = false;
     }
 };
+
+fn onCaptureStopped(ctx: ?*anyopaque) void {
+    const state = @as(*CaptureReleaseState, @ptrCast(@alignCast(ctx orelse return)));
+    output.keyEvent(state.logger, .release);
+    state.speaker_guard.release();
+}
+
+fn formatMicCloseMessage(buf: []u8, summary: mic.StreamSummary) ![]const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "recording already stopped; final capture summary chunks={d} bytes={d}",
+        .{ summary.chunk_count, summary.byte_count },
+    );
+}
+
+test "formats mic close log as final capture summary after stop" {
+    var buf: [128]u8 = undefined;
+    const message = try formatMicCloseMessage(&buf, .{
+        .chunk_count = 13,
+        .byte_count = 53194,
+    });
+    try std.testing.expectEqualStrings(
+        "recording already stopped; final capture summary chunks=13 bytes=53194",
+        message,
+    );
+}

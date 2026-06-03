@@ -94,6 +94,13 @@ pub fn readNextEvent(reader: *std.Io.Reader, state: *State, key_code: u16) !Even
     }
 }
 
+pub fn waitForRelease(reader: *std.Io.Reader, state: *State, key_code: u16) !void {
+    while (true) {
+        const event = try readNextEvent(reader, state, key_code);
+        if (event == .release) return;
+    }
+}
+
 fn isKeyboardBlock(block: []const u8) bool {
     const name = inputName(block) orelse return false;
     var lower: [256]u8 = undefined;
@@ -238,6 +245,20 @@ test "emits pending state on syn report" {
     var state: State = .{ .key_state = 1, .emitted_state = 0 };
     const syn = inputEvent(ev_syn, syn_report, 0);
     try std.testing.expectEqual(Event.press, update(&state, &syn, right_alt).?);
+}
+
+test "waits for release on the same event reader" {
+    const down = inputEvent(ev_key, right_alt, 1);
+    const other = inputEvent(ev_key, right_alt + 1, 1);
+    const up = inputEvent(ev_key, right_alt, 0);
+    const bytes = down ++ other ++ up;
+
+    var reader: std.Io.Reader = .fixed(&bytes);
+    var state: State = .{};
+
+    try std.testing.expectEqual(Event.press, try readNextEvent(&reader, &state, right_alt));
+    try waitForRelease(&reader, &state, right_alt);
+    try std.testing.expectEqual(@as(u32, 0), state.key_state);
 }
 
 test "finds keyboard event path in proc input devices" {
