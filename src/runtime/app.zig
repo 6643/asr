@@ -25,7 +25,6 @@ pub fn run(
 
     const keyboard_device = try key.findKeyboardDevice(allocator, io, environ);
     defer allocator.free(keyboard_device);
-    logger.info("kbd", "{s}", .{keyboard_device});
 
     const component_path = try ibus.initRuntime(allocator, io, environ);
     defer allocator.free(component_path);
@@ -51,7 +50,7 @@ pub fn run(
     ibus.switchToAsrInputMethod(allocator, io) catch |err| {
         logger.err("ibus", "switch failed: {s}", .{@errorName(err)});
         logger.info("ibus", "Auto-switch unavailable; switch to ASR manually", .{});
-        try runHotkeyLoop(allocator, io, logger, cfg, keyboard_device, service);
+        try runHotkeyLoop(allocator, io, environ, logger, cfg, keyboard_device, service);
         return;
     };
     logger.info("ibus", "Switched to ASR input method", .{});
@@ -59,7 +58,7 @@ pub fn run(
         logger.debug("ibus", "service not ready yet", .{});
     }
 
-    try runHotkeyLoop(allocator, io, logger, cfg, keyboard_device, service);
+    try runHotkeyLoop(allocator, io, environ, logger, cfg, keyboard_device, service);
 }
 
 const ServiceLoop = struct {
@@ -87,20 +86,27 @@ fn waitForServiceReady(io: std.Io, service: *ibus.gio_ibus.Service, timeout_ms: 
 fn runHotkeyLoop(
     allocator: std.mem.Allocator,
     io: std.Io,
+    environ: std.process.Environ,
     logger: output.Logger,
     cfg: config.Config,
-    keyboard_device: []const u8,
+    initial_keyboard_device: []const u8,
     service: *ibus.gio_ibus.Service,
 ) !void {
-    const file = try std.Io.Dir.cwd().openFile(io, keyboard_device, .{});
-    defer file.close(io);
+    var keyboard = try KeyboardEventStream.open(allocator, io, environ, logger, initial_keyboard_device);
+    defer keyboard.deinit();
 
-    var read_buffer: [4096]u8 = undefined;
-    var reader = std.Io.File.Reader.initStreaming(file, io, &read_buffer);
-    var state: key.State = .{};
     output.keyWait(logger);
     while (true) {
-        const event = try key.readNextEvent(&reader.interface, &state, key.right_alt);
+        const event = keyboard.readNext(key.right_alt) catch |err| {
+            switch (classifyKeyboardReadFailure(err)) {
+                .reopen => {
+                    keyboard.reopenAfterReadFailure(err);
+                    output.keyWait(logger);
+                    continue;
+                },
+                .fail => return err,
+            }
+        };
         if (event == .release) continue;
         output.keyEvent(logger, .press);
         var callback_ctx = DoubaoCallbacks{
@@ -140,7 +146,7 @@ fn runHotkeyLoop(
             .speaker_guard = &speaker_guard,
         };
         logger.debug("mic", "open", .{});
-        const capture_summary = mic.captureStreamUntilKeyRelease(io, &reader.interface, &state, key.right_alt, .{
+        const capture_summary = mic.captureStreamUntilKeyRelease(io, keyboard.file, &keyboard.state, key.right_alt, .{
             .sample_rate = cfg.sample_rate,
             .channels = cfg.channels,
             .frame_duration_ms = cfg.frame_duration_ms,
@@ -188,6 +194,93 @@ fn runHotkeyLoop(
         _ = handleFinish(allocator, logger, service, finish);
         output.keyWait(logger);
     }
+}
+
+const KeyboardReadFailureAction = enum {
+    reopen,
+    fail,
+};
+
+fn classifyKeyboardReadFailure(err: anyerror) KeyboardReadFailureAction {
+    return switch (err) {
+        error.KeyboardDeviceDisconnected,
+        error.EndOfStream,
+        error.ReadFailed,
+        => .reopen,
+        else => .fail,
+    };
+}
+
+const KeyboardEventStream = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+    logger: output.Logger,
+    path: []u8,
+    file: std.Io.File,
+    state: key.State = .{},
+
+    fn open(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        environ: std.process.Environ,
+        logger: output.Logger,
+        initial_path: []const u8,
+    ) !KeyboardEventStream {
+        const owned_path = try allocator.dupe(u8, initial_path);
+        errdefer allocator.free(owned_path);
+
+        const file = try openKeyboardFile(io, owned_path);
+        logger.info("kbd", "{s}", .{owned_path});
+
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .environ = environ,
+            .logger = logger,
+            .path = owned_path,
+            .file = file,
+        };
+    }
+
+    fn deinit(stream: *KeyboardEventStream) void {
+        stream.file.close(stream.io);
+        stream.allocator.free(stream.path);
+    }
+
+    fn readNext(stream: *KeyboardEventStream, key_code: u16) key.DeviceReadError!key.Event {
+        return key.readNextDeviceEvent(stream.file, &stream.state, key_code);
+    }
+
+    fn reopenAfterReadFailure(stream: *KeyboardEventStream, read_err: anyerror) void {
+        stream.logger.err("kbd", "read failed: {s}; reopening keyboard device", .{@errorName(read_err)});
+        while (true) {
+            const next_path = key.findKeyboardDevice(stream.allocator, stream.io, stream.environ) catch |err| {
+                stream.logger.err("kbd", "reopen failed: {s}", .{@errorName(err)});
+                sleepMs(stream.io, 500);
+                continue;
+            };
+
+            const next_file = openKeyboardFile(stream.io, next_path) catch |err| {
+                stream.logger.err("kbd", "open failed: {s}: {s}", .{ next_path, @errorName(err) });
+                stream.allocator.free(next_path);
+                sleepMs(stream.io, 500);
+                continue;
+            };
+
+            stream.file.close(stream.io);
+            stream.allocator.free(stream.path);
+            stream.path = next_path;
+            stream.file = next_file;
+            stream.state = .{};
+            stream.logger.info("kbd", "{s}", .{stream.path});
+            return;
+        }
+    }
+};
+
+fn openKeyboardFile(io: std.Io, path: []const u8) !std.Io.File {
+    return std.Io.Dir.cwd().openFile(io, path, .{});
 }
 
 fn handleFinish(
@@ -317,4 +410,10 @@ test "formats mic close log as final capture summary after stop" {
         "recording already stopped; final capture summary chunks=13 bytes=53194",
         message,
     );
+}
+
+test "keyboard read failed reopens event reader instead of exiting" {
+    try std.testing.expectEqual(KeyboardReadFailureAction.reopen, classifyKeyboardReadFailure(error.KeyboardDeviceDisconnected));
+    try std.testing.expectEqual(KeyboardReadFailureAction.reopen, classifyKeyboardReadFailure(error.ReadFailed));
+    try std.testing.expectEqual(KeyboardReadFailureAction.fail, classifyKeyboardReadFailure(error.AccessDenied));
 }

@@ -12,6 +12,12 @@ pub const Event = enum {
     release,
 };
 
+pub const DeviceReadError = error{
+    KeyboardDeviceDisconnected,
+    EndOfStream,
+    ReadFailed,
+};
+
 pub const State = struct {
     key_state: u32 = 0,
     emitted_state: u32 = 0,
@@ -98,6 +104,60 @@ pub fn waitForRelease(reader: *std.Io.Reader, state: *State, key_code: u16) !voi
     while (true) {
         const event = try readNextEvent(reader, state, key_code);
         if (event == .release) return;
+    }
+}
+
+pub fn readNextDeviceEvent(file: std.Io.File, state: *State, key_code: u16) DeviceReadError!Event {
+    var buf: [input_event_size]u8 = undefined;
+    while (true) {
+        try readInputEvent(file, &buf);
+        if (update(state, &buf, key_code)) |event| return event;
+    }
+}
+
+pub fn waitForDeviceRelease(file: std.Io.File, state: *State, key_code: u16) DeviceReadError!void {
+    while (true) {
+        const event = try readNextDeviceEvent(file, state, key_code);
+        if (event == .release) return;
+    }
+}
+
+fn readInputEvent(file: std.Io.File, buf: *[input_event_size]u8) DeviceReadError!void {
+    var offset: usize = 0;
+    while (offset < buf.len) {
+        const n = readDeviceBytes(file, buf[offset..]) catch |err| return err;
+        if (n == 0) return error.EndOfStream;
+        offset += n;
+    }
+}
+
+fn readDeviceBytes(file: std.Io.File, dest: []u8) DeviceReadError!usize {
+    if (dest.len == 0) return 0;
+    const max_count = switch (@import("builtin").os.tag) {
+        .linux => 0x7ffff000,
+        else => std.math.maxInt(isize),
+    };
+    while (true) {
+        const rc = std.posix.system.read(file.handle, dest.ptr, @min(dest.len, max_count));
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .NODEV => return error.KeyboardDeviceDisconnected,
+            .IO,
+            .AGAIN,
+            .BADF,
+            .ISDIR,
+            .NOBUFS,
+            .NOMEM,
+            .NOTCONN,
+            .CONNRESET,
+            .TIMEDOUT,
+            => return error.ReadFailed,
+            .INVAL,
+            .FAULT,
+            => unreachable,
+            else => return error.ReadFailed,
+        }
     }
 }
 

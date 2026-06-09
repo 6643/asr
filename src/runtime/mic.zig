@@ -52,15 +52,13 @@ pub fn waitForRelease(io: std.Io, keyboard_device: []const u8, key_code: u16) !v
     const file = try std.Io.Dir.cwd().openFile(io, keyboard_device, .{});
     defer file.close(io);
 
-    var read_buffer: [4096]u8 = undefined;
-    var reader = std.Io.File.Reader.initStreaming(file, io, &read_buffer);
     var state: key.State = .{};
-    try key.waitForRelease(&reader.interface, &state, key_code);
+    try key.waitForDeviceRelease(file, &state, key_code);
 }
 
 pub fn captureStreamUntilKeyRelease(
     io: std.Io,
-    key_reader: *std.Io.Reader,
+    key_file: std.Io.File,
     key_state: *key.State,
     key_code: u16,
     options: CaptureOptions,
@@ -73,7 +71,7 @@ pub fn captureStreamUntilKeyRelease(
     var stream_result: StreamResult = .{};
     var stream_thread = try std.Thread.spawn(.{}, streamAudioThread, .{ &child, io, &stream_result, stream, &stop_requested });
 
-    key.waitForRelease(key_reader, key_state, key_code) catch {};
+    key.waitForDeviceRelease(key_file, key_state, key_code) catch {};
     stopCaptureAndJoin(io, &stop_requested, stopChild, @ptrCast(&child), joinThread, @ptrCast(&stream_thread), .{
         .fn_ptr = stream.on_stopped,
         .ctx = stream.stopped_ctx,
