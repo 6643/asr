@@ -14,6 +14,7 @@ pub const runtime = struct {
 pub const doubao = struct {
     pub const proto = @import("doubao/proto.zig");
     pub const client = @import("doubao/client.zig");
+    pub const rectify = @import("doubao/rectify.zig");
 };
 
 test {

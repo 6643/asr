@@ -10,11 +10,13 @@ pub const Credentials = struct {
     device_id: []const u8 = "",
     token: []const u8 = "",
     cdid: []const u8 = "",
+    sami_token: []const u8 = "",
 
     pub fn deinit(creds: Credentials, allocator: std.mem.Allocator) void {
         if (creds.device_id.len > 0) allocator.free(creds.device_id);
         if (creds.token.len > 0) allocator.free(creds.token);
         if (creds.cdid.len > 0) allocator.free(creds.cdid);
+        if (creds.sami_token.len > 0) allocator.free(creds.sami_token);
     }
 };
 
@@ -28,12 +30,14 @@ pub const Config = struct {
     frame_duration_ms: u16 = 100,
     device_id: []const u8 = "",
     token: []const u8 = "",
+    sami_token: []const u8 = "",
 };
 
 pub fn withCredentials(base: Config, creds: Credentials) Config {
     var cfg = base;
     if (cfg.device_id.len == 0) cfg.device_id = creds.device_id;
     if (cfg.token.len == 0) cfg.token = creds.token;
+    if (cfg.sami_token.len == 0) cfg.sami_token = creds.sami_token;
     return cfg;
 }
 
@@ -66,6 +70,7 @@ pub fn parseCredentials(allocator: std.mem.Allocator, bytes: []const u8) !Creden
         .device_id = try dupeJsonString(allocator, obj.get("device_id")),
         .token = try dupeJsonString(allocator, obj.get("token")),
         .cdid = try dupeJsonString(allocator, obj.get("cdid")),
+        .sami_token = try dupeJsonString(allocator, obj.get("sami_token")),
     };
 }
 
@@ -97,7 +102,7 @@ test "uses default audio frame size" {
 
 test "parses credentials json" {
     const allocator = std.testing.allocator;
-    const creds = try parseCredentials(allocator, "{\"device_id\":\"dev\",\"token\":\"tok\",\"cdid\":\"cid\"}");
+    const creds = try parseCredentials(allocator, "{\"device_id\":\"dev\",\"token\":\"tok\",\"cdid\":\"cid\",\"sami_token\":\"sami\"}");
     defer creds.deinit(allocator);
 
     try std.testing.expectEqualStrings("dev", creds.device_id);

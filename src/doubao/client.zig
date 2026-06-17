@@ -267,6 +267,7 @@ pub const StreamingSession = struct {
     fn stopReadLoop(session: *StreamingSession) void {
         if (session.read_thread == null) return;
         session.stop_requested.store(true, .release);
+        session.client.writeFrame(.close, "") catch {};
         session.shutdownReadSocket();
     }
 

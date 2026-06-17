@@ -40,7 +40,13 @@ pub fn main(init: std.process.Init) !void {
             });
             if (text) |value| {
                 defer allocator.free(value);
-                try stdout.print("{s}\n", .{value});
+                const corrected = try asr.doubao.rectify.rectifyText(allocator, value, cfg.sami_token, cfg.device_id);
+                if (corrected) |c| {
+                    defer allocator.free(c);
+                    try stdout.print("rectified: {s}\n", .{c});
+                } else {
+                    try stdout.print("{s}\n", .{value});
+                }
             }
             return;
         },

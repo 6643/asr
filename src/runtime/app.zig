@@ -1,12 +1,14 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const doubao = @import("../doubao/client.zig");
+const rectify = @import("../doubao/rectify.zig");
 const key = @import("../key.zig");
 const ibus = @import("ibus.zig");
 const mic = @import("mic.zig");
 const mute = @import("mute.zig");
 const notify = @import("notify.zig");
 const output = @import("output.zig");
+const posix_system = std.posix.system;
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -110,16 +112,12 @@ fn runHotkeyLoop(
         if (event == .release) continue;
         output.keyEvent(logger, .press);
         var callback_ctx = DoubaoCallbacks{
+            .allocator = allocator,
             .logger = logger,
             .service = service,
+            .cfg = &cfg,
         };
-        var session = doubao.StreamingSession.init(allocator, io, cfg, .{
-            .debug = true,
-            .on_interim = onDoubaoInterim,
-            .interim_ctx = @ptrCast(&callback_ctx),
-            .on_final = onDoubaoFinal,
-            .final_ctx = @ptrCast(&callback_ctx),
-        }) catch |err| {
+        var session = initSessionWithRetry(allocator, io, cfg, &callback_ctx, logger) catch |err| {
             logger.err("doubao", "session failed: {s}", .{@errorName(err)});
             output.keyWait(logger);
             continue;
@@ -130,6 +128,7 @@ fn runHotkeyLoop(
             output.keyWait(logger);
             continue;
         };
+        defer drainKeyboardEvents(keyboard.file, &keyboard.state, key.right_alt, logger);
         notify.playMicReadyNotification(allocator, io);
         logger.info("doubao", "🎤", .{});
         var captured_audio: std.ArrayList(u8) = .empty;
@@ -193,6 +192,37 @@ fn runHotkeyLoop(
         };
         _ = handleFinish(allocator, logger, service, finish);
         output.keyWait(logger);
+    }
+}
+
+fn initSessionWithRetry(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: config.Config,
+    callback_ctx: *const DoubaoCallbacks,
+    logger: output.Logger,
+) !doubao.StreamingSession {
+    var delay_ms: i64 = 1000;
+    var attempt: usize = 0;
+    while (true) {
+        if (doubao.StreamingSession.init(allocator, io, cfg, .{
+            .debug = true,
+            .on_interim = onDoubaoInterim,
+            .interim_ctx = @ptrCast(callback_ctx),
+            .on_final = onDoubaoFinal,
+            .final_ctx = @ptrCast(callback_ctx),
+        })) |session| {
+            return session;
+        } else |err| {
+            attempt += 1;
+            if (err == error.RemoteAsrError and attempt < 3) {
+                logger.info("doubao", "quota exceeded, retry {d}/3 in {d}ms", .{ attempt, delay_ms });
+                std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake) catch {};
+                delay_ms *= 2;
+                continue;
+            }
+            return err;
+        }
     }
 }
 
@@ -283,6 +313,27 @@ fn openKeyboardFile(io: std.Io, path: []const u8) !std.Io.File {
     return std.Io.Dir.cwd().openFile(io, path, .{});
 }
 
+fn drainKeyboardEvents(file: std.Io.File, state: *key.State, key_code: u16, logger: output.Logger) void {
+    const fd = file.handle;
+    const system = std.posix.system;
+    const orig_flags = system.fcntl(fd, system.F.GETFL, @as(usize, 0));
+    if (orig_flags < 0) return;
+    const nonblock_flag = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
+    _ = system.fcntl(fd, system.F.SETFL, @as(usize, @intCast(orig_flags)) | nonblock_flag);
+    var buf: [key.input_event_size]u8 = undefined;
+    var drained: usize = 0;
+    while (true) {
+        const rc = system.read(fd, &buf, buf.len);
+        if (rc <= 0) break;
+        _ = key.update(state, buf[0..@as(usize, @intCast(rc))], key_code);
+        drained += 1;
+    }
+    _ = system.fcntl(fd, system.F.SETFL, @as(usize, @intCast(orig_flags)));
+    if (drained > 0) {
+        logger.debug("kbd", "drained {d} buffered events", .{drained});
+    }
+}
+
 fn handleFinish(
     allocator: std.mem.Allocator,
     logger: output.Logger,
@@ -326,13 +377,25 @@ fn onDoubaoInterim(ctx: ?*const anyopaque, text: []const u8) void {
 fn onDoubaoFinal(ctx: ?*const anyopaque, text: []const u8) void {
     if (text.len == 0) return;
     const callbacks = @as(*const DoubaoCallbacks, @ptrCast(@alignCast(ctx orelse return)));
-    callbacks.logger.info("doubao", "🚀 {s}", .{text});
-    const commit_status = callbacks.service.commitStatus(text);
-    if (!std.mem.startsWith(u8, commit_status, "OK ")) {
-        callbacks.logger.err("ibus", "🟥 {s}", .{commit_status});
-        return;
+    const corrected = rectify.rectifyText(callbacks.allocator, text, callbacks.cfg.sami_token, callbacks.cfg.device_id) catch null;
+    if (corrected) |c| {
+        defer callbacks.allocator.free(c);
+        callbacks.logger.info("doubao", "🚀 {s} → {s}", .{ text, c });
+        const commit_status = callbacks.service.commitStatus(c);
+        if (!std.mem.startsWith(u8, commit_status, "OK ")) {
+            callbacks.logger.err("ibus", "🟥 {s}", .{commit_status});
+            return;
+        }
+    } else {
+        callbacks.logger.info("doubao", "🚀 {s}", .{text});
+        callbacks.logger.info("rectify", "🔧 {s}", .{text});
+        const commit_status = callbacks.service.commitStatus(text);
+        if (!std.mem.startsWith(u8, commit_status, "OK ")) {
+            callbacks.logger.err("ibus", "🖍️ {s}", .{commit_status});
+            return;
+        }
     }
-    callbacks.logger.info("ibus", "🟩", .{});
+    callbacks.logger.info("ibus", "🖊️", .{});
 }
 
 fn onDoubaoAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
@@ -352,8 +415,10 @@ const StreamCaptureState = struct {
 };
 
 const DoubaoCallbacks = struct {
+    allocator: std.mem.Allocator,
     logger: output.Logger,
     service: *ibus.gio_ibus.Service,
+    cfg: *const config.Config,
 };
 
 const CaptureReleaseState = struct {
