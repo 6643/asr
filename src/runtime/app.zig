@@ -11,12 +11,33 @@ const notify = @import("notify.zig");
 const output = @import("output.zig");
 const posix_system = std.posix.system;
 
+const max_captured_audio_bytes: usize = 64 * 1024 * 1024;
+
+var shutdown_requested = std.atomic.Value(bool).init(false);
+
+fn handleShutdownSignal(sig: std.posix.SIG) callconv(.c) void {
+    _ = sig;
+    shutdown_requested.store(true, .release);
+}
+
+fn installSignalHandlers() void {
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = handleShutdownSignal },
+        .mask = std.mem.zeroes(std.posix.sigset_t),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+}
+
 pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
     environ: std.process.Environ,
+    debug: bool,
 ) !void {
-    const logger = output.Logger{ .io = io, .level = .debug };
+    installSignalHandlers();
+    const logger = output.Logger{ .io = io, .level = if (debug) .debug else .info };
     var cfg: config.Config = .{};
     const creds = try config.loadCredentials(allocator, io, cfg.credential_path);
     defer creds.deinit(allocator);
@@ -53,7 +74,7 @@ pub fn run(
     ibus.switchToAsrInputMethod(allocator, io) catch |err| {
         logger.err("ibus", "switch failed: {s}", .{@errorName(err)});
         logger.info("ibus", "Auto-switch unavailable; switch to ASR manually", .{});
-        try runHotkeyLoop(allocator, io, environ, logger, cfg, keyboard_device, service);
+        try runHotkeyLoop(allocator, io, environ, logger, cfg, keyboard_device, service, debug);
         return;
     };
     logger.info("ibus", "Switched to ASR input method", .{});
@@ -61,7 +82,7 @@ pub fn run(
         logger.debug("ibus", "service not ready yet", .{});
     }
 
-    try runHotkeyLoop(allocator, io, environ, logger, cfg, keyboard_device, service);
+    try runHotkeyLoop(allocator, io, environ, logger, cfg, keyboard_device, service, debug);
 }
 
 const ServiceLoop = struct {
@@ -94,12 +115,17 @@ fn runHotkeyLoop(
     cfg: config.Config,
     initial_keyboard_device: []const u8,
     service: *ibus.gio_ibus.Service,
+    debug: bool,
 ) !void {
     var keyboard = try KeyboardEventStream.open(allocator, io, environ, logger, initial_keyboard_device);
     defer keyboard.deinit();
 
     output.keyWait(logger);
     while (true) {
+        if (shutdown_requested.load(.acquire)) {
+            logger.info("app", "shutting down", .{});
+            return;
+        }
         const event = keyboard.readNext(key.right_alt) catch |err| {
             switch (classifyKeyboardReadFailure(err)) {
                 .reopen => {
@@ -119,7 +145,7 @@ fn runHotkeyLoop(
             .service = service,
             .cfg = &cfg,
         };
-        var session = initSessionWithRetry(allocator, io, cfg, &callback_ctx, logger) catch |err| {
+        var session = initSessionWithRetry(allocator, io, cfg, &callback_ctx, logger, debug) catch |err| {
             logger.err("doubao", "session failed: {s}", .{@errorName(err)});
             output.keyWait(logger);
             continue;
@@ -186,7 +212,7 @@ fn runHotkeyLoop(
             if (!handleFinish(allocator, logger, service, finish) and !session.hasFinalEvent()) {
                 const fallback = doubao.transcribePcmBytes(allocator, io, cfg, captured_audio.items, .{
                     .pcm_path = "",
-                    .debug = true,
+                    .debug = debug,
                 }) catch |err| {
                     logger.err("doubao", "fallback failed: {s}", .{@errorName(err)});
                     output.keyWait(logger);
@@ -218,12 +244,13 @@ fn initSessionWithRetry(
     cfg: config.Config,
     callback_ctx: *const DoubaoCallbacks,
     logger: output.Logger,
+    debug: bool,
 ) !doubao.StreamingSession {
     var delay_ms: i64 = 1000;
     var attempt: usize = 0;
     while (true) {
         if (doubao.StreamingSession.init(allocator, io, cfg, .{
-            .debug = true,
+            .debug = debug,
             .on_interim = onDoubaoInterim,
             .interim_ctx = @ptrCast(callback_ctx),
             .on_final = onDoubaoFinal,
@@ -233,9 +260,15 @@ fn initSessionWithRetry(
         } else |err| {
             attempt += 1;
             if (err == error.RemoteAsrError and attempt < 3) {
-                logger.info("doubao", "quota exceeded, retry {d}/3 in {d}ms", .{ attempt, delay_ms });
-                std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake) catch {};
-                delay_ms *= 2;
+                var rand_buf: [8]u8 = undefined;
+                io.random(&rand_buf);
+                const rand_val = std.mem.readInt(u64, &rand_buf, .little);
+                const half_delay = @divTrunc(delay_ms, 2);
+                const jitter: i64 = @as(i64, @intCast(rand_val % @as(u64, @intCast(@max(half_delay, 1)))));
+                const sleep_time = delay_ms + jitter;
+                logger.info("doubao", "quota exceeded, retry {d}/3 in {d}ms", .{ attempt, sleep_time });
+                std.Io.sleep(io, .fromMilliseconds(sleep_time), .awake) catch {};
+                delay_ms = @min(delay_ms * 2, 10_000);
                 continue;
             }
             return err;
@@ -351,6 +384,20 @@ fn drainKeyboardEvents(file: std.Io.File, state: *key.State, key_code: u16, logg
     }
 }
 
+/// Commit text to IBus and log the result.
+fn commitAndLog(
+    logger: output.Logger,
+    service: *ibus.gio_ibus.Service,
+    text: []const u8,
+) void {
+    const commit_status = service.commitStatus(text);
+    if (std.mem.startsWith(u8, commit_status, "OK ")) {
+        logger.info("ibus", "✅", .{});
+    } else {
+        logger.err("ibus", "❌ {s}", .{commit_status});
+    }
+}
+
 fn handleFinish(
     allocator: std.mem.Allocator,
     logger: output.Logger,
@@ -361,12 +408,7 @@ fn handleFinish(
         .text => |text| {
             defer allocator.free(text);
             logger.info("doubao", "🚀 {s}", .{text});
-            const commit_status = service.commitStatus(text);
-            if (!std.mem.startsWith(u8, commit_status, "OK ")) {
-                logger.err("ibus", "❌ {s}", .{commit_status});
-                return true;
-            }
-            logger.info("ibus", "✅", .{});
+            commitAndLog(logger, service, text);
             return true;
         },
         .err => |message| {
@@ -398,21 +440,11 @@ fn onDoubaoFinal(ctx: ?*const anyopaque, text: []const u8) void {
     if (corrected) |c| {
         defer callbacks.allocator.free(c);
         callbacks.logger.info("doubao", "🚀 {s} → {s}", .{ text, c });
-        const commit_status = callbacks.service.commitStatus(c);
-        if (!std.mem.startsWith(u8, commit_status, "OK ")) {
-            callbacks.logger.err("ibus", "🟥 {s}", .{commit_status});
-            return;
-        }
+        commitAndLog(callbacks.logger, callbacks.service, c);
     } else {
         callbacks.logger.info("doubao", "🚀 {s}", .{text});
-        callbacks.logger.info("rectify", "🔧 {s}", .{text});
-        const commit_status = callbacks.service.commitStatus(text);
-        if (!std.mem.startsWith(u8, commit_status, "OK ")) {
-            callbacks.logger.err("ibus", "🖍️ {s}", .{commit_status});
-            return;
-        }
+        commitAndLog(callbacks.logger, callbacks.service, text);
     }
-    callbacks.logger.info("ibus", "🖊️", .{});
 }
 
 fn onDoubaoAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
@@ -422,7 +454,9 @@ fn onDoubaoAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
 
 fn sendDoubaoAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
     const state = @as(*StreamCaptureState, @ptrCast(@alignCast(ctx orelse return error.MissingChunkSession)));
-    try state.captured_audio.appendSlice(state.allocator, chunk);
+    if (state.captured_audio.items.len < max_captured_audio_bytes) {
+        try state.captured_audio.appendSlice(state.allocator, chunk);
+    }
     if (state.stream_error != null) return;
     state.session.sendChunk(chunk) catch |err| {
         state.stream_error = err;

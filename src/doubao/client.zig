@@ -252,16 +252,18 @@ pub const StreamingSession = struct {
         session.state_cond.broadcast(session.io);
     }
 
+    /// Write binary data to the WebSocket. The vendored library's writeBin
+    /// takes []u8 but does not mutate the payload — it only reads from it.
+    fn writeBinSafe(session: *StreamingSession, data: []const u8) !void {
+        session.write_mutex.lockUncancelable(session.io);
+        defer session.write_mutex.unlock(session.io);
+        try session.client.writeBin(@constCast(data));
+    }
+
     fn writeClientFrame(session: *StreamingSession, op_code: websocket.OpCode, data: []u8) !void {
         session.write_mutex.lockUncancelable(session.io);
         defer session.write_mutex.unlock(session.io);
         try session.client.writeFrame(op_code, data);
-    }
-
-    fn writeClientBin(session: *StreamingSession, data: []u8) !void {
-        session.write_mutex.lockUncancelable(session.io);
-        defer session.write_mutex.unlock(session.io);
-        try session.client.writeBin(data);
     }
 
     fn joinReadThread(session: *StreamingSession) void {
@@ -466,13 +468,13 @@ pub const StreamingSession = struct {
         if (session.shouldAbortAudio()) return error.SessionStreamClosed;
         const finish_request = try proto.buildFinishSession(session.allocator, session.request_id, session.cfg.token);
         defer session.allocator.free(finish_request);
-        try session.writeClientBin(@constCast(finish_request));
+        try session.writeBinSafe(finish_request);
     }
 
     fn sendFinishRequestQuiet(session: *StreamingSession) void {
         const finish_request = proto.buildFinishSession(session.allocator, session.request_id, session.cfg.token) catch return;
         defer session.allocator.free(finish_request);
-        session.writeClientBin(@constCast(finish_request)) catch {};
+        session.writeBinSafe(finish_request) catch {};
     }
 
     fn nextFrameTimestampMs(session: *StreamingSession) i64 {
@@ -738,22 +740,10 @@ fn requestId(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
         allocator,
         "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}",
         .{
-            bytes[0],
-            bytes[1],
-            bytes[2],
-            bytes[3],
-            bytes[4],
-            bytes[5],
-            bytes[6],
-            bytes[7],
-            bytes[8],
-            bytes[9],
-            bytes[10],
-            bytes[11],
-            bytes[12],
-            bytes[13],
-            bytes[14],
-            bytes[15],
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15],
         },
     );
 }

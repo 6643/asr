@@ -10,7 +10,8 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(allocator);
     defer allocator.free(args);
-    switch (asr.cli.modeFromArgs(args)) {
+    const opts = asr.cli.optionsFromArgs(args);
+    switch (opts.mode) {
         .ibus_xml => {
             try stdout.writeAll(asr.runtime.ibus.component_xml);
             return;
@@ -36,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
 
             const text = try asr.doubao.client.transcribePcmFile(allocator, init.io, cfg, .{
                 .pcm_path = pcm_path,
-                .debug = true,
+                .debug = opts.debug,
             });
             if (text) |value| {
                 defer allocator.free(value);
@@ -52,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .app => {
             try stdout.flush();
-            try asr.runtime.app.run(allocator, init.io, init.minimal.environ);
+            try asr.runtime.app.run(allocator, init.io, init.minimal.environ, opts.debug);
             return;
         },
     }
