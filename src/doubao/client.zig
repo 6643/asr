@@ -170,6 +170,10 @@ pub const StreamingSession = struct {
     }
 
     pub fn deinit(session: *StreamingSession) void {
+        if (!session.finish_sent) {
+            session.sendFinishRequestQuiet();
+            session.finish_sent = true;
+        }
         session.stopReadLoop();
         session.joinReadThread();
         session.state.deinit(session.allocator);
@@ -200,7 +204,10 @@ pub const StreamingSession = struct {
     }
 
     pub fn finishAfterStreamFailure(session: *StreamingSession) StreamFinish {
-        session.finish_sent = true;
+        if (!session.finish_sent) {
+            session.sendFinishRequestQuiet();
+            session.finish_sent = true;
+        }
         session.stopReadLoop();
         session.joinReadThread();
         return session.takeResolvedResult();
@@ -433,7 +440,11 @@ pub const StreamingSession = struct {
         if (session.pending_audio.items.len == 0) return;
         const frame = try paddedFrame(session.allocator, session.pending_audio.items, session.frame_bytes);
         defer session.allocator.free(frame);
-        try session.writeFrame(frame);
+        if (session.shouldAbortAudio()) return error.SessionStreamClosed;
+        const timestamp_ms = std.Io.Timestamp.now(session.io, .real).toMilliseconds();
+        session.write_mutex.lockUncancelable(session.io);
+        defer session.write_mutex.unlock(session.io);
+        try sendAudioFrame(session.allocator, &session.client, session.request_id, &session.sent_frame_count, frame, timestamp_ms);
         session.pending_audio.items.len = 0;
     }
 
@@ -456,6 +467,12 @@ pub const StreamingSession = struct {
         const finish_request = try proto.buildFinishSession(session.allocator, session.request_id, session.cfg.token);
         defer session.allocator.free(finish_request);
         try session.writeClientBin(@constCast(finish_request));
+    }
+
+    fn sendFinishRequestQuiet(session: *StreamingSession) void {
+        const finish_request = proto.buildFinishSession(session.allocator, session.request_id, session.cfg.token) catch return;
+        defer session.allocator.free(finish_request);
+        session.writeClientBin(@constCast(finish_request)) catch {};
     }
 
     fn nextFrameTimestampMs(session: *StreamingSession) i64 {

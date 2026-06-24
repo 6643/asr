@@ -3,6 +3,7 @@ const config = @import("../config.zig");
 const doubao = @import("../doubao/client.zig");
 const rectify = @import("../doubao/rectify.zig");
 const key = @import("../key.zig");
+const audio_gate = @import("audio_gate.zig");
 const ibus = @import("ibus.zig");
 const mic = @import("mic.zig");
 const mute = @import("mute.zig");
@@ -129,17 +130,30 @@ fn runHotkeyLoop(
             continue;
         };
         defer drainKeyboardEvents(keyboard.file, &keyboard.state, key.right_alt, logger);
-        notify.playMicReadyNotification(allocator, io);
-        logger.info("doubao", "🎤", .{});
         var captured_audio: std.ArrayList(u8) = .empty;
         defer captured_audio.deinit(allocator);
+        var gate = audio_gate.AudioGate.init(allocator, io);
+        defer gate.deinit();
         var stream_state = StreamCaptureState{
             .allocator = allocator,
             .session = &session,
             .captured_audio = &captured_audio,
+            .gate = &gate,
         };
-        var speaker_guard = SpeakerMuteGuard.init(allocator, io, logger);
+        var speaker_guard = SpeakerMuteGuard{
+            .allocator = allocator,
+            .io = io,
+            .logger = logger,
+        };
         defer speaker_guard.release();
+        var started_state = CaptureStartedState{
+            .allocator = allocator,
+            .io = io,
+            .logger = logger,
+            .gate = &gate,
+            .speaker_guard = &speaker_guard,
+            .stream_state = &stream_state,
+        };
         var release_state = CaptureReleaseState{
             .logger = logger,
             .speaker_guard = &speaker_guard,
@@ -152,6 +166,8 @@ fn runHotkeyLoop(
         }, .{
             .on_chunk = onDoubaoAudioChunk,
             .chunk_ctx = @ptrCast(&stream_state),
+            .on_started = onCaptureStarted,
+            .started_ctx = @ptrCast(&started_state),
             .on_stopped = onCaptureStopped,
             .stopped_ctx = @ptrCast(&release_state),
         }) catch |err| {
@@ -400,6 +416,11 @@ fn onDoubaoFinal(ctx: ?*const anyopaque, text: []const u8) void {
 
 fn onDoubaoAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
     const state = @as(*StreamCaptureState, @ptrCast(@alignCast(ctx orelse return error.MissingChunkSession)));
+    try state.gate.handleChunk(chunk, @ptrCast(state), sendDoubaoAudioChunk);
+}
+
+fn sendDoubaoAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
+    const state = @as(*StreamCaptureState, @ptrCast(@alignCast(ctx orelse return error.MissingChunkSession)));
     try state.captured_audio.appendSlice(state.allocator, chunk);
     if (state.stream_error != null) return;
     state.session.sendChunk(chunk) catch |err| {
@@ -411,6 +432,7 @@ const StreamCaptureState = struct {
     allocator: std.mem.Allocator,
     session: *doubao.StreamingSession,
     captured_audio: *std.ArrayList(u8),
+    gate: *audio_gate.AudioGate,
     stream_error: ?anyerror = null,
 };
 
@@ -419,6 +441,15 @@ const DoubaoCallbacks = struct {
     logger: output.Logger,
     service: *ibus.gio_ibus.Service,
     cfg: *const config.Config,
+};
+
+const CaptureStartedState = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    logger: output.Logger,
+    gate: *audio_gate.AudioGate,
+    speaker_guard: *SpeakerMuteGuard,
+    stream_state: *StreamCaptureState,
 };
 
 const CaptureReleaseState = struct {
@@ -432,15 +463,10 @@ const SpeakerMuteGuard = struct {
     logger: output.Logger,
     active: bool = false,
 
-    fn init(allocator: std.mem.Allocator, io: std.Io, logger: output.Logger) SpeakerMuteGuard {
-        logger.debug("speaker", "mute", .{});
-        mute.muteSpeaker(allocator, io);
-        return .{
-            .allocator = allocator,
-            .io = io,
-            .logger = logger,
-            .active = true,
-        };
+    fn muteAfterPrompt(guard: *SpeakerMuteGuard) void {
+        guard.logger.debug("speaker", "mute", .{});
+        mute.muteSpeaker(guard.allocator, guard.io);
+        guard.active = true;
     }
 
     fn release(guard: *SpeakerMuteGuard) void {
@@ -450,6 +476,15 @@ const SpeakerMuteGuard = struct {
         guard.active = false;
     }
 };
+
+fn onCaptureStarted(ctx: ?*anyopaque) !void {
+    const state = @as(*CaptureStartedState, @ptrCast(@alignCast(ctx orelse return error.MissingCaptureStartedState)));
+    notify.playMicReadyNotification(state.allocator, state.io);
+    state.gate.beginBuffering();
+    state.speaker_guard.muteAfterPrompt();
+    try state.gate.openAndFlush(@ptrCast(state.stream_state), sendDoubaoAudioChunk);
+    state.logger.info("doubao", "🎤", .{});
+}
 
 fn onCaptureStopped(ctx: ?*anyopaque) void {
     const state = @as(*CaptureReleaseState, @ptrCast(@alignCast(ctx orelse return)));

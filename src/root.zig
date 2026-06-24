@@ -3,6 +3,7 @@ pub const cli = @import("cli.zig");
 pub const key = @import("key.zig");
 pub const runtime = struct {
     pub const app = @import("runtime/app.zig");
+    pub const audio_gate = @import("runtime/audio_gate.zig");
     pub const cmd = @import("runtime/cmd.zig");
     pub const gio_dbus = @import("runtime/gio_dbus.zig");
     pub const gio_ibus = @import("runtime/gio_ibus.zig");
@@ -22,6 +23,7 @@ test {
     _ = cli;
     _ = key;
     _ = runtime.app;
+    _ = runtime.audio_gate;
     _ = runtime.cmd;
     _ = runtime.gio_dbus;
     _ = runtime.gio_ibus;

@@ -11,6 +11,8 @@ pub const CaptureOptions = struct {
 pub const StreamOptions = struct {
     on_chunk: *const fn (ctx: ?*anyopaque, chunk: []const u8) anyerror!void,
     chunk_ctx: ?*anyopaque = null,
+    on_started: ?*const fn (ctx: ?*anyopaque) anyerror!void = null,
+    started_ctx: ?*anyopaque = null,
     on_stopped: ?*const fn (ctx: ?*anyopaque) void = null,
     stopped_ctx: ?*anyopaque = null,
 };
@@ -69,7 +71,19 @@ pub fn captureStreamUntilKeyRelease(
     var stop_requested = std.atomic.Value(bool).init(false);
 
     var stream_result: StreamResult = .{};
-    var stream_thread = try std.Thread.spawn(.{}, streamAudioThread, .{ &child, io, &stream_result, stream, &stop_requested });
+    var start_signal = StartSignal{};
+    var stream_thread = try std.Thread.spawn(.{}, streamAudioThread, .{ &child, io, &stream_result, stream, &stop_requested, &start_signal });
+
+    start_signal.wait(io) catch |err| {
+        stopCaptureAndJoin(io, &stop_requested, stopChild, @ptrCast(&child), joinThread, @ptrCast(&stream_thread), .{});
+        return err;
+    };
+    if (stream.on_started) |on_started| {
+        on_started(stream.started_ctx) catch |err| {
+            stopCaptureAndJoin(io, &stop_requested, stopChild, @ptrCast(&child), joinThread, @ptrCast(&stream_thread), .{});
+            return err;
+        };
+    }
 
     key.waitForDeviceRelease(key_file, key_state, key_code) catch {};
     stopCaptureAndJoin(io, &stop_requested, stopChild, @ptrCast(&child), joinThread, @ptrCast(&stream_thread), .{
@@ -150,6 +164,32 @@ const StreamResult = struct {
     err: ?anyerror = null,
 };
 
+const StartSignal = struct {
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    started: bool = false,
+    err: ?anyerror = null,
+
+    fn notify(signal: *StartSignal, io: std.Io, err: ?anyerror) void {
+        signal.mutex.lockUncancelable(io);
+        defer {
+            signal.cond.broadcast(io);
+            signal.mutex.unlock(io);
+        }
+        signal.started = true;
+        signal.err = err;
+    }
+
+    fn wait(signal: *StartSignal, io: std.Io) !void {
+        signal.mutex.lockUncancelable(io);
+        defer signal.mutex.unlock(io);
+        while (!signal.started) {
+            signal.cond.waitUncancelable(io, &signal.mutex);
+        }
+        if (signal.err) |err| return err;
+    }
+};
+
 fn copyAudioToFileThread(
     child: *std.process.Child,
     io: std.Io,
@@ -186,14 +226,17 @@ fn streamAudioThread(
     result: *StreamResult,
     stream: StreamOptions,
     stop_requested: *std.atomic.Value(bool),
+    start_signal: *StartSignal,
 ) void {
     const source = child.stdout orelse {
         result.err = error.MissingChildStdout;
+        start_signal.notify(io, error.MissingChildStdout);
         return;
     };
     var reader_buffer: [4096]u8 = undefined;
     var reader = std.Io.File.Reader.initStreaming(source, io, &reader_buffer);
     var chunk: [4096]u8 = undefined;
+    start_signal.notify(io, null);
 
     while (true) {
         const read_len = reader.interface.readSliceShort(&chunk) catch |err| {
@@ -301,4 +344,17 @@ test "stop capture notifies before join returns" {
     try std.testing.expectEqual(Step.stop, recorder.steps[0]);
     try std.testing.expectEqual(Step.notify, recorder.steps[1]);
     try std.testing.expectEqual(Step.join, recorder.steps[2]);
+}
+
+test "stream options default to no started callback" {
+    const options = StreamOptions{
+        .on_chunk = struct {
+            fn onChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
+                _ = ctx;
+                _ = chunk;
+            }
+        }.onChunk,
+    };
+    try std.testing.expect(options.on_started == null);
+    try std.testing.expect(options.started_ctx == null);
 }
