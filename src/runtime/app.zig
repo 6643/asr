@@ -114,6 +114,7 @@ fn runHotkeyLoop(
         output.keyEvent(logger, .press);
         var callback_ctx = DoubaoCallbacks{
             .allocator = allocator,
+            .io = io,
             .logger = logger,
             .service = service,
             .cfg = &cfg,
@@ -393,7 +394,7 @@ fn onDoubaoInterim(ctx: ?*const anyopaque, text: []const u8) void {
 fn onDoubaoFinal(ctx: ?*const anyopaque, text: []const u8) void {
     if (text.len == 0) return;
     const callbacks = @as(*const DoubaoCallbacks, @ptrCast(@alignCast(ctx orelse return)));
-    const corrected = rectify.rectifyText(callbacks.allocator, text, callbacks.cfg.sami_token, callbacks.cfg.device_id) catch null;
+    const corrected = rectify.rectifyText(callbacks.allocator, callbacks.io, text, callbacks.cfg.sami_token, callbacks.cfg.device_id) catch null;
     if (corrected) |c| {
         defer callbacks.allocator.free(c);
         callbacks.logger.info("doubao", "🚀 {s} → {s}", .{ text, c });
@@ -438,6 +439,7 @@ const StreamCaptureState = struct {
 
 const DoubaoCallbacks = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     logger: output.Logger,
     service: *ibus.gio_ibus.Service,
     cfg: *const config.Config,

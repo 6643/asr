@@ -1,9 +1,4 @@
 const std = @import("std");
-const capi = @cImport({
-    @cDefine("_POSIX_C_SOURCE", "200809L");
-    @cInclude("stdlib.h");
-    @cInclude("stdio.h");
-});
 
 pub const CorrectWordInfo = struct {
     source_word: []const u8,
@@ -12,13 +7,13 @@ pub const CorrectWordInfo = struct {
     confidence: f64,
 };
 
-pub fn rectifyText(allocator: std.mem.Allocator, text: []const u8, sami_token: []const u8, device_id: []const u8) !?[]u8 {
+pub fn rectifyText(allocator: std.mem.Allocator, io: std.Io, text: []const u8, sami_token: []const u8, device_id: []const u8) !?[]u8 {
     if (sami_token.len == 0) return null;
 
     const body = try buildJsonBody(allocator, text);
     defer allocator.free(body);
 
-    const response_body = try doHttpRequest(allocator, body, sami_token, device_id) orelse return null;
+    const response_body = try doHttpRequest(allocator, io, body, sami_token, device_id) orelse return null;
     defer allocator.free(response_body);
 
     return parseAndApply(allocator, text, response_body);
@@ -35,29 +30,57 @@ fn buildJsonBody(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     try buf.appendSlice(allocator, "\",\"rectify_type\":\"asr_correct\",\"scene\":\"asr\"}");
     return buf.toOwnedSlice(allocator);
 }
-fn doHttpRequest(allocator: std.mem.Allocator, body: []const u8, sami_token: []const u8, device_id: []const u8) !?[]u8 {
-    const shell_cmd = try std.fmt.allocPrint(allocator,
-        \\curl -s -X POST 'https://ime.oceancloudapi.com/api/v1/rectify_text' \
-        \\  -H 'content-type: application/json' \
-        \\  -H 'sami_token: {s}' \
-        \\  -H 'X-Device-Id: {s}' \
-        \\  -d '{s}'
-    , .{ sami_token, device_id, body });
-    defer allocator.free(shell_cmd);
 
-    const fp = capi.popen(shell_cmd.ptr, "r");
-    if (fp == null) return null;
-    defer _ = capi.pclose(fp);
+/// HTTP POST using std.process.spawn with curl as separate argv elements.
+/// No shell interpolation — eliminates the shell injection vulnerability
+/// of the previous popen(shell_cmd) approach.
+fn doHttpRequest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    body: []const u8,
+    sami_token: []const u8,
+    device_id: []const u8,
+) !?[]u8 {
+    const sami_hdr = try std.fmt.allocPrint(allocator, "sami_token: {s}", .{sami_token});
+    defer allocator.free(sami_hdr);
+    const device_hdr = try std.fmt.allocPrint(allocator, "X-Device-Id: {s}", .{device_id});
+    defer allocator.free(device_hdr);
 
+    var child = std.process.spawn(io, .{
+        .argv = &.{
+            "curl", "-s", "-X", "POST",
+            "https://ime.oceancloudapi.com/api/v1/rectify_text",
+            "-H", "content-type: application/json",
+            "-H", sami_hdr,
+            "-H", device_hdr,
+            "-d", body,
+        },
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .stdin = .ignore,
+    }) catch return null;
+    errdefer child.kill(io);
+
+    const stdout = child.stdout orelse return null;
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
-
+    var reader_buffer: [4096]u8 = undefined;
+    var reader = std.Io.File.Reader.initStreaming(stdout, io, &reader_buffer);
     var chunk: [4096]u8 = undefined;
-    while (capi.fgets(&chunk, @intCast(chunk.len), fp)) |got| {
-        try buf.appendSlice(allocator, got[0..std.mem.len(got)]);
+    while (true) {
+        const read_len = reader.interface.readSliceShort(&chunk) catch break;
+        if (read_len == 0) break;
+        try buf.appendSlice(allocator, chunk[0..read_len]);
     }
-    return @as(?[]u8, try buf.toOwnedSlice(allocator));
+    _ = child.wait(io) catch {};
+    const result = buf.toOwnedSlice(allocator) catch return null;
+    if (result.len == 0) {
+        allocator.free(result);
+        return null;
+    }
+    return result;
 }
+
 fn parseAndApply(allocator: std.mem.Allocator, text: []const u8, response_body: []const u8) !?[]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_body, .{});
     defer parsed.deinit();
