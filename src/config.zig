@@ -92,8 +92,14 @@ fn dupeJsonString(allocator: std.mem.Allocator, value: ?std.json.Value) ![]const
 fn hostFromUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
     const uri = try std.Uri.parse(url);
     const component = uri.host orelse return error.MissingHost;
-    const host = try component.toRawMaybeAlloc(allocator);
-    return allocator.dupe(u8, host);
+    const host_raw = try component.toRawMaybeAlloc(allocator);
+    // toRawMaybeAlloc may return a pointer into `url` (not allocated)
+    // or a newly heap-allocated string (percent-decoded). Only free if allocated.
+    const ptr = @intFromPtr(host_raw.ptr);
+    const url_start = @intFromPtr(url.ptr);
+    const is_into_url = ptr >= url_start and ptr < url_start + url.len;
+    defer if (!is_into_url) allocator.free(host_raw);
+    return allocator.dupe(u8, host_raw);
 }
 
 test "uses default audio frame size" {
