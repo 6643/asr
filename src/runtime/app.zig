@@ -1,10 +1,10 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const doubao = @import("../doubao/client.zig");
-const rectify = @import("../doubao/rectify.zig");
 const key = @import("../key.zig");
 const audio_gate = @import("audio_gate.zig");
 const ibus = @import("ibus.zig");
+const postprocess = @import("postprocess.zig");
 const mic = @import("mic.zig");
 const mute = @import("mute.zig");
 const notify = @import("notify.zig");
@@ -60,6 +60,9 @@ pub fn run(
         allocator.destroy(service);
     }
 
+    var pipeline = try postprocess.Pipeline.start(allocator, io, logger, service, &cfg);
+    defer pipeline.deinit();
+
     var service_loop = ServiceLoop{
         .service = service,
         .io = io,
@@ -74,7 +77,7 @@ pub fn run(
     ibus.switchToAsrInputMethod(allocator, io) catch |err| {
         logger.err("ibus", "switch failed: {s}", .{@errorName(err)});
         logger.info("ibus", "Auto-switch unavailable; switch to ASR manually", .{});
-        try runHotkeyLoop(allocator, io, environ, logger, cfg, keyboard_device, service, debug);
+        try runHotkeyLoop(allocator, io, environ, logger, cfg, keyboard_device, pipeline, debug);
         return;
     };
     logger.info("ibus", "Switched to ASR input method", .{});
@@ -82,7 +85,7 @@ pub fn run(
         logger.debug("ibus", "service not ready yet", .{});
     }
 
-    try runHotkeyLoop(allocator, io, environ, logger, cfg, keyboard_device, service, debug);
+    try runHotkeyLoop(allocator, io, environ, logger, cfg, keyboard_device, pipeline, debug);
 }
 
 const ServiceLoop = struct {
@@ -114,7 +117,7 @@ fn runHotkeyLoop(
     logger: output.Logger,
     cfg: config.Config,
     initial_keyboard_device: []const u8,
-    service: *ibus.gio_ibus.Service,
+    pipeline: *postprocess.Pipeline,
     debug: bool,
 ) !void {
     var keyboard = try KeyboardEventStream.open(allocator, io, environ, logger, initial_keyboard_device);
@@ -139,11 +142,7 @@ fn runHotkeyLoop(
         if (event == .release) continue;
         output.keyEvent(logger, .press);
         var callback_ctx = DoubaoCallbacks{
-            .allocator = allocator,
-            .io = io,
-            .logger = logger,
-            .service = service,
-            .cfg = &cfg,
+            .pipeline = pipeline,
         };
         var session = initSessionWithRetry(allocator, io, cfg, &callback_ctx, logger, debug) catch |err| {
             logger.err("doubao", "session failed: {s}", .{@errorName(err)});
@@ -209,7 +208,7 @@ fn runHotkeyLoop(
         if (stream_state.stream_error) |stream_err| {
             logger.err("doubao", "stream failed: {s}", .{@errorName(stream_err)});
             const finish = session.finishAfterStreamFailure();
-            if (!handleFinish(allocator, logger, service, finish) and !session.hasFinalEvent()) {
+            if (!handleFinish(allocator, pipeline, finish) and !session.hasFinalEvent()) {
                 const fallback = doubao.transcribePcmBytes(allocator, io, cfg, captured_audio.items, .{
                     .pcm_path = "",
                     .debug = debug,
@@ -219,7 +218,7 @@ fn runHotkeyLoop(
                     continue;
                 };
                 if (fallback) |text| {
-                    _ = handleFinish(allocator, logger, service, .{ .text = text });
+                    _ = handleFinish(allocator, pipeline, .{ .text = text });
                 } else {
                     logger.info("doubao", "session_finished", .{});
                 }
@@ -233,7 +232,7 @@ fn runHotkeyLoop(
             output.keyWait(logger);
             continue;
         };
-        _ = handleFinish(allocator, logger, service, finish);
+        _ = handleFinish(allocator, pipeline, finish);
         output.keyWait(logger);
     }
 }
@@ -400,24 +399,22 @@ fn commitAndLog(
 
 fn handleFinish(
     allocator: std.mem.Allocator,
-    logger: output.Logger,
-    service: *ibus.gio_ibus.Service,
+    pipeline: *postprocess.Pipeline,
     finish: doubao.StreamFinish,
 ) bool {
     switch (finish) {
         .text => |text| {
             defer allocator.free(text);
-            logger.info("doubao", "🚀 {s}", .{text});
-            commitAndLog(logger, service, text);
+            pipeline.submitFinal(text);
             return true;
         },
         .err => |message| {
             defer allocator.free(message);
-            logger.err("doubao", "recognize failed: {s}", .{message});
+            pipeline.logger.err("doubao", "recognize failed: {s}", .{message});
             return false;
         },
         .none => {
-            logger.info("doubao", "session_finished", .{});
+            pipeline.logger.info("doubao", "session_finished", .{});
             return false;
         },
     }
@@ -430,21 +427,13 @@ fn sleepMs(io: std.Io, milliseconds: i64) void {
 fn onDoubaoInterim(ctx: ?*const anyopaque, text: []const u8) void {
     if (text.len == 0) return;
     const callbacks = @as(*const DoubaoCallbacks, @ptrCast(@alignCast(ctx orelse return)));
-    callbacks.logger.info("doubao", "🎤 {s}", .{text});
+    callbacks.pipeline.logger.info("doubao", "🎤 {s}", .{text});
 }
 
 fn onDoubaoFinal(ctx: ?*const anyopaque, text: []const u8) void {
     if (text.len == 0) return;
     const callbacks = @as(*const DoubaoCallbacks, @ptrCast(@alignCast(ctx orelse return)));
-    const corrected = rectify.rectifyText(callbacks.allocator, callbacks.io, text, callbacks.cfg.sami_token, callbacks.cfg.device_id) catch null;
-    if (corrected) |c| {
-        defer callbacks.allocator.free(c);
-        callbacks.logger.info("doubao", "🚀 {s} → {s}", .{ text, c });
-        commitAndLog(callbacks.logger, callbacks.service, c);
-    } else {
-        callbacks.logger.info("doubao", "🚀 {s}", .{text});
-        commitAndLog(callbacks.logger, callbacks.service, text);
-    }
+    callbacks.pipeline.submitFinal(text);
 }
 
 fn onDoubaoAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
@@ -472,11 +461,7 @@ const StreamCaptureState = struct {
 };
 
 const DoubaoCallbacks = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    logger: output.Logger,
-    service: *ibus.gio_ibus.Service,
-    cfg: *const config.Config,
+    pipeline: *postprocess.Pipeline,
 };
 
 const CaptureStartedState = struct {

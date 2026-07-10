@@ -60,7 +60,11 @@ pub const Service = struct {
     }
 
     pub fn commitStatus(service: *Service, text: []const u8) []const u8 {
-        return commitTextStatus(service, text);
+        return commitTextStatus(service, text, true);
+    }
+
+    pub fn commitQueuedStatus(service: *Service, text: []const u8) []const u8 {
+        return commitTextStatus(service, text, false);
     }
 };
 
@@ -262,7 +266,7 @@ fn onServiceMethod(ctx: *anyopaque, method_name: []const u8, parameters: gio.Var
     }
     const text = try gio.extractFirstStringFromTuple(service.allocator, &service.libs, parameters);
     defer service.allocator.free(text);
-    return gio.createStringReturnTuple(&service.libs, commitTextStatus(service, text));
+    return gio.createStringReturnTuple(&service.libs, commitTextStatus(service, text, true));
 }
 
 fn onEngineMethod(ctx: *anyopaque, method_name: []const u8, _: gio.Variant) !?gio.Variant {
@@ -345,20 +349,32 @@ fn createIbusTextSignalParameters(libs: *const gio.Libraries, text: []const u8) 
     return gio.createTupleVariant(libs, &.{signal_arg});
 }
 
-fn commitTextStatus(service: *Service, text: []const u8) []const u8 {
-    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return "ERR empty_response";
+fn commitTextStatus(service: *Service, text: []const u8, flush: bool) []const u8 {
+    const eligibility = commitEligibilityStatus(service, text);
+    if (!std.mem.startsWith(u8, eligibility, "OK ")) return eligibility;
+
     service.mutex.lockUncancelable(service.io);
-    const active = service.state.active_engine;
+    const engine = service.state.active_engine.?;
     service.mutex.unlock(service.io);
-    const engine = active orelse return "ERR engine_not_created";
-    if (!engine.enabled and !engine.has_focus) return "ERR engine_not_active";
 
     const raw_parameters = createIbusTextSignalParameters(&service.libs, text) catch return "ERR service_unavailable";
     const parameters = gio.refSink(&service.libs, raw_parameters) catch return "ERR service_unavailable";
     defer gio.unrefVariant(&service.libs, parameters);
 
     gio.emitSignal(&service.libs, service.connection, engine.object_path, engine_iface, commit_text_signal, parameters) catch return "ERR service_unavailable";
-    gio.flushConnection(&service.libs, service.connection) catch return "ERR service_unavailable";
+    if (flush) {
+        gio.flushConnection(&service.libs, service.connection) catch return "ERR service_unavailable";
+        return "OK committed";
+    }
+    return "OK queued";
+}
+
+fn commitEligibilityStatus(service: *Service, text: []const u8) []const u8 {
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return "ERR empty_response";
+    service.mutex.lockUncancelable(service.io);
+    const active = service.state.active_engine;
+    service.mutex.unlock(service.io);
+    if (active == null) return "ERR engine_not_created";
     return "OK committed";
 }
 
@@ -373,7 +389,7 @@ test "gio ibus helpers are exposed" {
     try std.testing.expect(std.mem.indexOf(u8, createEngineXml(), "ProcessKeyEvent") != null);
 }
 
-test "commit text guards empty and inactive engine" {
+test "commit eligibility accepts created engine before focus and enable" {
     var service = Service{
         .allocator = std.testing.allocator,
         .io = std.testing.io,
@@ -383,10 +399,10 @@ test "commit text guards empty and inactive engine" {
         .state = .{},
         .mutex = .init,
     };
-    try std.testing.expectEqualStrings("ERR empty_response", commitTextStatus(&service, " "));
-    try std.testing.expectEqualStrings("ERR engine_not_created", commitTextStatus(&service, "hello"));
+    try std.testing.expectEqualStrings("ERR empty_response", commitEligibilityStatus(&service, " "));
+    try std.testing.expectEqualStrings("ERR engine_not_created", commitEligibilityStatus(&service, "hello"));
     service.state.active_engine = .{ .object_path = "/tmp/engine", .enabled = false, .has_focus = false };
-    try std.testing.expectEqualStrings("ERR engine_not_active", commitTextStatus(&service, "hello"));
+    try std.testing.expectEqualStrings("OK committed", commitEligibilityStatus(&service, "hello"));
 }
 
 test "retries only dbus call failures" {
