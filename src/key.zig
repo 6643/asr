@@ -16,6 +16,9 @@ pub const DeviceReadError = error{
     KeyboardDeviceDisconnected,
     EndOfStream,
     ReadFailed,
+    /// Blocking read was interrupted by a signal or Io cancelation.
+    /// Callers should check shutdown flags and either exit or retry.
+    Interrupted,
 };
 
 pub const State = struct {
@@ -107,58 +110,147 @@ pub fn waitForRelease(reader: *std.Io.Reader, state: *State, key_code: u16) !voi
     }
 }
 
-pub fn readNextDeviceEvent(file: std.Io.File, state: *State, key_code: u16) DeviceReadError!Event {
+/// Predicate polled by Select arms that race against keyboard I/O.
+pub const ShutdownCheck = *const fn () bool;
+
+/// Read the next press/release for `key_code` via cancelable `Io` streaming read.
+pub fn readNextDeviceEvent(
+    io: std.Io,
+    file: std.Io.File,
+    state: *State,
+    key_code: u16,
+) DeviceReadError!Event {
     var buf: [input_event_size]u8 = undefined;
     while (true) {
-        try readInputEvent(file, &buf);
+        try readInputEvent(io, file, &buf);
         if (update(state, &buf, key_code)) |event| return event;
     }
 }
 
-pub fn waitForDeviceRelease(file: std.Io.File, state: *State, key_code: u16) DeviceReadError!void {
+pub fn waitForDeviceRelease(
+    io: std.Io,
+    file: std.Io.File,
+    state: *State,
+    key_code: u16,
+) DeviceReadError!void {
     while (true) {
-        const event = try readNextDeviceEvent(file, state, key_code);
+        const event = try readNextDeviceEvent(io, file, state, key_code);
         if (event == .release) return;
     }
 }
 
-fn readInputEvent(file: std.Io.File, buf: *[input_event_size]u8) DeviceReadError!void {
+/// Wait for key release, or stop early when `is_shutdown` becomes true / read is canceled.
+pub fn waitForDeviceReleaseOrShutdown(
+    io: std.Io,
+    file: std.Io.File,
+    state: *State,
+    key_code: u16,
+    is_shutdown: ShutdownCheck,
+) DeviceReadError!void {
+    while (true) {
+        const event = try waitNextDeviceEventOrShutdown(io, file, state, key_code, is_shutdown);
+        if (event == null) return; // shutdown
+        if (event.? == .release) return;
+    }
+}
+
+/// Block until the next target-key event, or return `null` when shutdown is requested.
+/// Races a cancelable keyboard read against a shutdown poller via `Io.Select`.
+pub fn waitNextDeviceEventOrShutdown(
+    io: std.Io,
+    file: std.Io.File,
+    state: *State,
+    key_code: u16,
+    is_shutdown: ShutdownCheck,
+) DeviceReadError!?Event {
+    if (is_shutdown()) return null;
+
+    const SelectResult = union(enum) {
+        key: DeviceReadError!Event,
+        shutdown: void,
+    };
+    var slots: [2]SelectResult = undefined;
+    var select = std.Io.Select(SelectResult).init(io, &slots);
+
+    const key_args = ReadNextArgs{
+        .io = io,
+        .file = file,
+        .state = state,
+        .key_code = key_code,
+    };
+    select.concurrent(.key, readNextDeviceEventTask, .{key_args}) catch {
+        select.async(.key, readNextDeviceEventTask, .{key_args});
+    };
+    select.concurrent(.shutdown, pollShutdownTask, .{ io, is_shutdown }) catch {
+        select.async(.shutdown, pollShutdownTask, .{ io, is_shutdown });
+    };
+
+    const first = select.await() catch {
+        // Select itself canceled: treat as shutdown wake.
+        select.cancelDiscard();
+        return null;
+    };
+    // Cancel the loser; discard any late key result (no owned resources).
+    select.cancelDiscard();
+
+    return switch (first) {
+        .key => |result| try result,
+        .shutdown => null,
+    };
+}
+
+const ReadNextArgs = struct {
+    io: std.Io,
+    file: std.Io.File,
+    state: *State,
+    key_code: u16,
+};
+
+fn readNextDeviceEventTask(args: ReadNextArgs) DeviceReadError!Event {
+    return readNextDeviceEvent(args.io, args.file, args.state, args.key_code);
+}
+
+fn pollShutdownTask(io: std.Io, is_shutdown: ShutdownCheck) void {
+    while (!is_shutdown()) {
+        std.Io.sleep(io, .fromMilliseconds(50), .awake) catch return;
+    }
+}
+
+fn readInputEvent(io: std.Io, file: std.Io.File, buf: *[input_event_size]u8) DeviceReadError!void {
     var offset: usize = 0;
     while (offset < buf.len) {
-        const n = readDeviceBytes(file, buf[offset..]) catch |err| return err;
+        const n = readDeviceBytes(io, file, buf[offset..]) catch |err| return err;
         if (n == 0) return error.EndOfStream;
         offset += n;
     }
 }
 
-fn readDeviceBytes(file: std.Io.File, dest: []u8) DeviceReadError!usize {
+fn readDeviceBytes(io: std.Io, file: std.Io.File, dest: []u8) DeviceReadError!usize {
     if (dest.len == 0) return 0;
-    const max_count = switch (@import("builtin").os.tag) {
-        .linux => 0x7ffff000,
-        else => std.math.maxInt(isize),
+    // Prefer cancelable Io streaming read so Select cancel / task cancel wakes us.
+    const n = file.readStreaming(io, &.{dest}) catch |err| {
+        return mapReadStreamingError(err);
     };
-    while (true) {
-        const rc = std.posix.system.read(file.handle, dest.ptr, @min(dest.len, max_count));
-        switch (std.posix.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
-            .INTR => continue,
-            .NODEV => return error.KeyboardDeviceDisconnected,
-            .IO,
-            .AGAIN,
-            .BADF,
-            .ISDIR,
-            .NOBUFS,
-            .NOMEM,
-            .NOTCONN,
-            .CONNRESET,
-            .TIMEDOUT,
-            => return error.ReadFailed,
-            .INVAL,
-            .FAULT,
-            => unreachable,
-            else => return error.ReadFailed,
-        }
-    }
+    return n;
+}
+
+fn mapReadStreamingError(err: anyerror) DeviceReadError {
+    return switch (err) {
+        error.Canceled => error.Interrupted,
+        error.EndOfStream => error.EndOfStream,
+        error.IsDir,
+        error.NotOpenForReading,
+        error.WouldBlock,
+        error.InputOutput,
+        error.SystemResources,
+        error.SocketUnconnected,
+        error.ConnectionResetByPeer,
+        error.AccessDenied,
+        error.LockViolation,
+        error.Unexpected,
+        => error.ReadFailed,
+        else => error.ReadFailed,
+    };
 }
 
 fn isKeyboardBlock(block: []const u8) bool {
@@ -359,4 +451,15 @@ test "normalizes symlink target into event device path" {
     try std.testing.expectEqualStrings("event2", eventNameFromLinkTarget("../event2").?);
     try std.testing.expectEqualStrings("event3", eventNameFromLinkTarget("/dev/input/event3").?);
     try std.testing.expectEqualStrings("event4", eventNameFromLinkTarget("event4").?);
+}
+
+test "device read error set includes Interrupted for cancel/signal wakeups" {
+    const err: DeviceReadError = error.Interrupted;
+    try std.testing.expect(err == error.Interrupted);
+}
+
+test "maps Io cancelation to Interrupted" {
+    try std.testing.expectEqual(DeviceReadError.Interrupted, mapReadStreamingError(error.Canceled));
+    try std.testing.expectEqual(DeviceReadError.EndOfStream, mapReadStreamingError(error.EndOfStream));
+    try std.testing.expectEqual(DeviceReadError.ReadFailed, mapReadStreamingError(error.InputOutput));
 }

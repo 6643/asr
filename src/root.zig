@@ -12,6 +12,7 @@ pub const runtime = struct {
     pub const notify = @import("runtime/notify.zig");
     pub const postprocess = @import("runtime/postprocess.zig");
     pub const output = @import("runtime/output.zig");
+    pub const shutdown = @import("runtime/shutdown.zig");
 };
 pub const doubao = struct {
     pub const proto = @import("doubao/proto.zig");
@@ -34,6 +35,8 @@ test {
     _ = runtime.notify;
     _ = runtime.postprocess;
     _ = runtime.output;
+    _ = runtime.shutdown;
     _ = doubao.proto;
     _ = doubao.client;
+    _ = doubao.rectify;
 }

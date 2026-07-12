@@ -1,5 +1,6 @@
 const std = @import("std");
 const cmd = @import("cmd.zig");
+const shutdown = @import("shutdown.zig");
 
 pub const engine_name = "asr";
 pub const bus_name = "org.freedesktop.IBus.ASR";
@@ -70,7 +71,7 @@ pub fn switchToAsrInputMethod(allocator: std.mem.Allocator, io: std.Io) !void {
     while (attempts < retry_attempts) : (attempts += 1) {
         cmd.runDiscard(allocator, io, &.{ "ibus", "engine", engine_name }, engine_switch_timeout_ms) catch |err| {
             if (err != error.CommandFailed) return err;
-            sleepMs(io, retry_delay_ms);
+            shutdown.sleepMs(io, retry_delay_ms);
             continue;
         };
         return;
@@ -85,7 +86,7 @@ pub fn resolveAddress(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
             if (isValidAddress(address)) return address;
             allocator.free(address);
         } else |_| {}
-        sleepMs(io, retry_delay_ms);
+        shutdown.sleepMs(io, retry_delay_ms);
     }
     return error.IbusAddressNotFound;
 }
@@ -96,7 +97,7 @@ fn ensureDaemonRunning(allocator: std.mem.Allocator, io: std.Io) !void {
     var attempts: usize = 0;
     while (attempts < retry_attempts) : (attempts += 1) {
         if (isDaemonRunning(allocator, io)) return;
-        sleepMs(io, retry_delay_ms);
+        shutdown.sleepMs(io, retry_delay_ms);
     }
     return error.IbusDaemonNotRunning;
 }
@@ -139,10 +140,6 @@ fn isValidAddress(address: []const u8) bool {
     if (address.len == 0) return false;
     if (std.mem.eql(u8, address, "(null)")) return false;
     return std.mem.indexOfScalar(u8, address, ':') != null;
-}
-
-fn sleepMs(io: std.Io, milliseconds: i64) void {
-    std.Io.sleep(io, .fromMilliseconds(milliseconds), .awake) catch {};
 }
 
 pub fn startService(

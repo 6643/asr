@@ -66,12 +66,13 @@ pub fn parseCredentials(allocator: std.mem.Allocator, bytes: []const u8) !Creden
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    return .{
-        .device_id = try dupeJsonString(allocator, obj.get("device_id")),
-        .token = try dupeJsonString(allocator, obj.get("token")),
-        .cdid = try dupeJsonString(allocator, obj.get("cdid")),
-        .sami_token = try dupeJsonString(allocator, obj.get("sami_token")),
-    };
+    var creds: Credentials = .{};
+    errdefer creds.deinit(allocator);
+    creds.device_id = try dupeJsonString(allocator, obj.get("device_id"));
+    creds.token = try dupeJsonString(allocator, obj.get("token"));
+    creds.cdid = try dupeJsonString(allocator, obj.get("cdid"));
+    creds.sami_token = try dupeJsonString(allocator, obj.get("sami_token"));
+    return creds;
 }
 
 pub fn loadCredentials(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Credentials {
@@ -114,6 +115,17 @@ test "parses credentials json" {
     try std.testing.expectEqualStrings("dev", creds.device_id);
     try std.testing.expectEqualStrings("tok", creds.token);
     try std.testing.expectEqualStrings("cid", creds.cdid);
+}
+
+test "credentials deinit frees partial fields without double free on empty" {
+    const allocator = std.testing.allocator;
+    var creds: Credentials = .{};
+    creds.device_id = try allocator.dupe(u8, "dev");
+    creds.token = try allocator.dupe(u8, "tok");
+    // Simulate mid-parse failure: deinit must free only allocated fields.
+    try std.testing.expect(creds.cdid.len == 0);
+    try std.testing.expect(creds.sami_token.len == 0);
+    creds.deinit(allocator);
 }
 
 test "builds websocket headers" {

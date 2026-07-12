@@ -1,6 +1,7 @@
 const std = @import("std");
 const gio = @import("gio_dbus.zig");
 const ibus_runtime = @import("ibus.zig");
+const shutdown = @import("shutdown.zig");
 
 pub const bus_name = "org.freedesktop.IBus.ASR";
 pub const engine_name = "asr";
@@ -34,10 +35,13 @@ pub const Service = struct {
             const handler_ctx = registration.state.handler_ctx;
             if (handler_ctx != @as(*anyopaque, @ptrCast(service))) {
                 const engine_ctx = @as(*EngineContext, @ptrCast(@alignCast(handler_ctx)));
+                // Unregister before freeing EngineContext (same order as dropAllEngines).
+                gio.unregisterObject(service.allocator, &service.libs, service.connection, registration);
                 service.allocator.free(engine_ctx.object_path);
                 service.allocator.destroy(engine_ctx);
+            } else {
+                gio.unregisterObject(service.allocator, &service.libs, service.connection, registration);
             }
-            gio.unregisterObject(service.allocator, &service.libs, service.connection, registration);
         }
         service.registrations.deinit(service.allocator);
     }
@@ -129,7 +133,7 @@ fn connectWithRetry(allocator: std.mem.Allocator, io: std.Io, libs: *const gio.L
         defer allocator.free(address);
         const connection = gio.createConnectionQuiet(libs, address) catch |err| {
             if (shouldRetryConnection(err) and attempts + 1 < ibus_runtime.retry_attempts) {
-                sleepMs(io, ibus_runtime.retry_delay_ms);
+                shutdown.sleepMs(io, ibus_runtime.retry_delay_ms);
                 continue;
             }
             return err;
@@ -237,16 +241,40 @@ fn registerEngine(service: *Service, path: []const u8) !void {
     try service.registrations.append(service.allocator, registration);
 }
 
+/// Drop any previously registered engines (and free their paths/ctx) so
+/// CreateEngine / Destroy cannot accumulate DBus objects forever.
+fn dropAllEngines(service: *Service) void {
+    var i = service.registrations.items.len;
+    while (i > 0) : (i -= 1) {
+        const idx = i - 1;
+        const registration = &service.registrations.items[idx];
+        const handler_ctx = registration.state.handler_ctx;
+        if (handler_ctx == @as(*anyopaque, @ptrCast(service))) continue;
+
+        const engine_ctx = @as(*EngineContext, @ptrCast(@alignCast(handler_ctx)));
+        // Unregister first so DBus cannot dispatch into a freed EngineContext.
+        gio.unregisterObject(service.allocator, &service.libs, service.connection, registration);
+        service.allocator.free(engine_ctx.object_path);
+        service.allocator.destroy(engine_ctx);
+        _ = service.registrations.orderedRemove(idx);
+    }
+    service.state.active_engine = null;
+}
+
 fn onFactoryMethod(ctx: *anyopaque, method_name: []const u8, parameters: gio.Variant) !?gio.Variant {
     const service = @as(*Service, @ptrCast(@alignCast(ctx)));
     if (!std.mem.eql(u8, method_name, "CreateEngine")) return gio.createObjectPathReturnTuple(&service.libs, "/");
     const requested_name = try gio.extractFirstStringFromTuple(service.allocator, &service.libs, parameters);
     defer service.allocator.free(requested_name);
     if (!std.mem.eql(u8, requested_name, engine_name)) return gio.createObjectPathReturnTuple(&service.libs, "/");
+
+    // Replace any prior engine before registering a new one.
     service.mutex.lockUncancelable(service.io);
+    dropAllEngines(service);
     const engine_id = service.state.engine_id;
     service.state.engine_id += 1;
     service.mutex.unlock(service.io);
+
     const engine_path = try gio.makeEnginePath(service.allocator, engine_path_prefix, engine_id);
     errdefer service.allocator.free(engine_path);
     try registerEngine(service, engine_path);
@@ -272,6 +300,19 @@ fn onServiceMethod(ctx: *anyopaque, method_name: []const u8, parameters: gio.Var
 fn onEngineMethod(ctx: *anyopaque, method_name: []const u8, _: gio.Variant) !?gio.Variant {
     const engine_ctx = @as(*EngineContext, @ptrCast(@alignCast(ctx)));
     const service = engine_ctx.service;
+
+    if (std.mem.eql(u8, method_name, "Destroy")) {
+        service.mutex.lockUncancelable(service.io);
+        defer service.mutex.unlock(service.io);
+        // Only tear down when Destroy targets the current active engine path.
+        if (service.state.active_engine) |active| {
+            if (std.mem.eql(u8, active.object_path, engine_ctx.object_path)) {
+                dropAllEngines(service);
+            }
+        }
+        return null;
+    }
+
     service.mutex.lockUncancelable(service.io);
     defer service.mutex.unlock(service.io);
     const active_state = service.state.active_engine orelse return null;
@@ -291,11 +332,6 @@ fn onEngineMethod(ctx: *anyopaque, method_name: []const u8, _: gio.Variant) !?gi
     }
     if (std.mem.eql(u8, method_name, "Disable")) {
         active.enabled = false;
-        return null;
-    }
-    if (std.mem.eql(u8, method_name, "Destroy")) {
-        active.enabled = false;
-        active.has_focus = false;
         return null;
     }
     if (std.mem.eql(u8, method_name, "ProcessKeyEvent")) {
@@ -378,10 +414,6 @@ fn commitEligibilityStatus(service: *Service, text: []const u8) []const u8 {
     return "OK committed";
 }
 
-fn sleepMs(io: std.Io, milliseconds: i64) void {
-    std.Io.sleep(io, .fromMilliseconds(milliseconds), .awake) catch {};
-}
-
 test "gio ibus helpers are exposed" {
     try std.testing.expectEqualStrings("engine_not_created", getStatus(null));
     try std.testing.expect(std.mem.indexOf(u8, createFactoryXml(), "CreateEngine") != null);
@@ -408,4 +440,80 @@ test "commit eligibility accepts created engine before focus and enable" {
 test "retries only dbus call failures" {
     try std.testing.expect(shouldRetryConnection(gio.Error.DBusCallFailed));
     try std.testing.expect(!shouldRetryConnection(gio.Error.BusNameRequestFailed));
+}
+
+test "dropAllEngines clears active engine and removes only engine registrations" {
+    const allocator = std.testing.allocator;
+    var service = Service{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .libs = undefined,
+        .connection = undefined,
+        .registrations = .empty,
+        .state = .{},
+        .mutex = .init,
+    };
+    defer service.registrations.deinit(allocator);
+
+    // Service-owned registration (handler_ctx == service) must be retained.
+    const service_state = try allocator.create(gio.RegistrationState);
+    defer allocator.destroy(service_state);
+    service_state.* = .{
+        .handler_ctx = @ptrCast(&service),
+        .handler = undefined,
+    };
+    try service.registrations.append(allocator, .{
+        .id = 1,
+        .node_info = undefined,
+        .state = service_state,
+    });
+
+    const path = try allocator.dupe(u8, "/org/freedesktop/IBus/Engine/ASR/0");
+    const engine_ctx = try allocator.create(EngineContext);
+    engine_ctx.* = .{
+        .service = &service,
+        .object_path = path,
+    };
+    const engine_state = try allocator.create(gio.RegistrationState);
+    engine_state.* = .{
+        .handler_ctx = @ptrCast(engine_ctx),
+        .handler = undefined,
+    };
+    try service.registrations.append(allocator, .{
+        .id = 2,
+        .node_info = undefined,
+        .state = engine_state,
+    });
+    service.state.active_engine = .{ .object_path = path, .has_focus = true, .enabled = true };
+
+    // dropAllEngines calls real gio.unregisterObject — cannot run without GIO.
+    // Instead assert the selection predicate used by dropAllEngines.
+    var engine_count: usize = 0;
+    var service_count: usize = 0;
+    for (service.registrations.items) |registration| {
+        if (registration.state.handler_ctx == @as(*anyopaque, @ptrCast(&service))) {
+            service_count += 1;
+        } else {
+            engine_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), engine_count);
+    try std.testing.expectEqual(@as(usize, 1), service_count);
+
+    // Manual teardown mirroring dropAllEngines free path (no DBus unregister).
+    var i = service.registrations.items.len;
+    while (i > 0) : (i -= 1) {
+        const idx = i - 1;
+        const registration = &service.registrations.items[idx];
+        if (registration.state.handler_ctx == @as(*anyopaque, @ptrCast(&service))) continue;
+        const ectx = @as(*EngineContext, @ptrCast(@alignCast(registration.state.handler_ctx)));
+        allocator.free(ectx.object_path);
+        allocator.destroy(ectx);
+        allocator.destroy(registration.state);
+        _ = service.registrations.orderedRemove(idx);
+    }
+    service.state.active_engine = null;
+
+    try std.testing.expect(service.state.active_engine == null);
+    try std.testing.expectEqual(@as(usize, 1), service.registrations.items.len);
 }

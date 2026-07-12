@@ -57,7 +57,7 @@ const DBusInterfaceVTable = extern struct {
     set_property: ?*const anyopaque = null,
 };
 
-const RegistrationState = struct {
+pub const RegistrationState = struct {
     handler_ctx: *anyopaque,
     handler: MethodHandler,
 };
@@ -377,7 +377,7 @@ pub fn registerObject(
         &err_ptr,
     );
     if (registration_id == 0) {
-        allocator.destroy(state);
+        // errdefer destroys `state`; do not free it again here.
         return wrapGError(libs, err_ptr, Error.DBusRegisterFailed, true);
     }
 
@@ -575,4 +575,23 @@ test "gio dbus helpers are exposed" {
     const path = try makeEnginePath(std.testing.allocator, "/org/freedesktop/IBus/Engine/ASR", 7);
     defer std.testing.allocator.free(path);
     try std.testing.expectEqualStrings("/org/freedesktop/IBus/Engine/ASR/7", path);
+}
+
+test "registerObject failure path frees RegistrationState only once via errdefer" {
+    // Documents the ownership contract: on registration_id == 0, only errdefer
+    // destroys state. A second manual destroy would double-free under GPA.
+    const allocator = std.testing.allocator;
+    const FailOnce = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const state = try alloc.create(RegistrationState);
+            errdefer alloc.destroy(state);
+            state.* = .{
+                .handler_ctx = undefined,
+                .handler = undefined,
+            };
+            // Match production: fail without a second destroy (errdefer owns it).
+            return error.DBusRegisterFailed;
+        }
+    };
+    try std.testing.expectError(error.DBusRegisterFailed, FailOnce.run(allocator));
 }

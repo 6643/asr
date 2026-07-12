@@ -2,12 +2,16 @@ const std = @import("std");
 
 pub const SendFn = *const fn (ctx: ?*anyopaque, chunk: []const u8) anyerror!void;
 
+/// Hard cap for pre-session speech buffer (matches capture fallback budget).
+pub const max_buffered_audio_bytes: usize = 64 * 1024 * 1024;
+
 pub const AudioGate = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     mutex: std.Io.Mutex = .init,
     mode: Mode = .drop,
     buffered_audio: std.ArrayList(u8) = .empty,
+    max_buffered_bytes: usize = max_buffered_audio_bytes,
 
     const Mode = enum {
         drop,
@@ -47,9 +51,19 @@ pub const AudioGate = struct {
         defer gate.mutex.unlock(gate.io);
         switch (gate.mode) {
             .drop => return,
-            .buffer => try gate.buffered_audio.appendSlice(gate.allocator, chunk),
+            .buffer => try appendBuffered(gate, chunk),
             .open => try send_fn(ctx, chunk),
         }
+    }
+
+    fn appendBuffered(gate: *AudioGate, chunk: []const u8) !void {
+        const room = if (gate.buffered_audio.items.len >= gate.max_buffered_bytes)
+            @as(usize, 0)
+        else
+            gate.max_buffered_bytes - gate.buffered_audio.items.len;
+        if (room == 0) return;
+        const take = @min(chunk.len, room);
+        try gate.buffered_audio.appendSlice(gate.allocator, chunk[0..take]);
     }
 };
 
@@ -69,6 +83,41 @@ test "drops prompt audio then flushes buffered speech before live chunks" {
     try gate.handleChunk("!", @ptrCast(&recorder), Recorder.send);
 
     try std.testing.expectEqualStrings("nihao!", recorder.bytes.items);
+}
+
+test "buffers speech from the start when open is delayed by session boot" {
+    const allocator = std.testing.allocator;
+    var recorder = Recorder.init(allocator);
+    defer recorder.deinit();
+
+    var gate = AudioGate.init(allocator, std.testing.io);
+    defer gate.deinit();
+
+    // Hot path: buffer immediately so session handshake never drops speech.
+    gate.beginBuffering();
+    try gate.handleChunk("early", @ptrCast(&recorder), Recorder.send);
+    try gate.handleChunk("speech", @ptrCast(&recorder), Recorder.send);
+    try gate.openAndFlush(@ptrCast(&recorder), Recorder.send);
+    try gate.handleChunk("!", @ptrCast(&recorder), Recorder.send);
+
+    try std.testing.expectEqualStrings("earlyspeech!", recorder.bytes.items);
+}
+
+test "buffer mode drops bytes once max_buffered_bytes is reached" {
+    const allocator = std.testing.allocator;
+    var recorder = Recorder.init(allocator);
+    defer recorder.deinit();
+
+    var gate = AudioGate.init(allocator, std.testing.io);
+    defer gate.deinit();
+    gate.max_buffered_bytes = 4;
+
+    gate.beginBuffering();
+    try gate.handleChunk("abc", @ptrCast(&recorder), Recorder.send);
+    try gate.handleChunk("def", @ptrCast(&recorder), Recorder.send);
+    try gate.openAndFlush(@ptrCast(&recorder), Recorder.send);
+
+    try std.testing.expectEqualStrings("abcd", recorder.bytes.items);
 }
 
 const Recorder = struct {

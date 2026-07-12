@@ -1,5 +1,7 @@
 .zig-cache/
+.zig-global-cache/
 zig-out/
 zig-pkg/
+.playwright-cli/
 ai-proxy.log
 *.pcm

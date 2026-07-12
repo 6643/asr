@@ -7,6 +7,9 @@ pub const CorrectWordInfo = struct {
     confidence: f64,
 };
 
+/// Hard timeout for rectify HTTP so commit path never hangs on a slow network.
+pub const request_timeout_ms: i64 = 1_500;
+
 pub fn rectifyText(allocator: std.mem.Allocator, io: std.Io, text: []const u8, sami_token: []const u8, device_id: []const u8) !?[]u8 {
     if (sami_token.len == 0) return null;
 
@@ -31,9 +34,8 @@ fn buildJsonBody(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return buf.toOwnedSlice(allocator);
 }
 
-/// HTTP POST using std.process.spawn with curl as separate argv elements.
-/// No shell interpolation — eliminates the shell injection vulnerability
-/// of the previous popen(shell_cmd) approach.
+/// HTTP POST via curl argv (no shell). Race the request against a timeout using
+/// Zig 0.16 `Io.Select` so a hung rectify never blocks IBus commit forever.
 fn doHttpRequest(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -41,15 +43,77 @@ fn doHttpRequest(
     sami_token: []const u8,
     device_id: []const u8,
 ) !?[]u8 {
-    const sami_hdr = try std.fmt.allocPrint(allocator, "sami_token: {s}", .{sami_token});
+    const SelectResult = union(enum) {
+        response: ?[]u8,
+        timeout: void,
+    };
+    var slots: [2]SelectResult = undefined;
+    var select = std.Io.Select(SelectResult).init(io, &slots);
+
+    const curl_args = CurlArgs{
+        .allocator = allocator,
+        .io = io,
+        .body = body,
+        .sami_token = sami_token,
+        .device_id = device_id,
+    };
+
+    // Prefer concurrent so curl and timeout race on real workers.
+    select.concurrent(.response, curlRequest, .{curl_args}) catch {
+        select.async(.response, curlRequest, .{curl_args});
+    };
+    select.concurrent(.timeout, sleepThenTimeout, .{ io, request_timeout_ms }) catch {
+        select.async(.timeout, sleepThenTimeout, .{ io, request_timeout_ms });
+    };
+
+    // First completed arm wins; cancel drains the rest.
+    const first = try select.await();
+    while (select.cancel()) |item| {
+        switch (item) {
+            .response => |body_opt| if (body_opt) |owned| allocator.free(owned),
+            .timeout => {},
+        }
+    }
+
+    return switch (first) {
+        .response => |body_opt| body_opt,
+        .timeout => null,
+    };
+}
+
+fn sleepThenTimeout(io: std.Io, timeout_ms: i64) void {
+    std.Io.sleep(io, .fromMilliseconds(timeout_ms), .awake) catch {};
+}
+
+const CurlArgs = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    body: []const u8,
+    sami_token: []const u8,
+    device_id: []const u8,
+};
+
+fn curlRequest(args: CurlArgs) ?[]u8 {
+    const allocator = args.allocator;
+    const io = args.io;
+    const body = args.body;
+    const sami_token = args.sami_token;
+    const device_id = args.device_id;
+
+    const sami_hdr = std.fmt.allocPrint(allocator, "sami_token: {s}", .{sami_token}) catch return null;
     defer allocator.free(sami_hdr);
-    const device_hdr = try std.fmt.allocPrint(allocator, "X-Device-Id: {s}", .{device_id});
+    const device_hdr = std.fmt.allocPrint(allocator, "X-Device-Id: {s}", .{device_id}) catch return null;
     defer allocator.free(device_hdr);
+
+    // --max-time is a second line of defense if cancel does not interrupt curl promptly.
+    var max_time_buf: [16]u8 = undefined;
+    const max_time = std.fmt.bufPrint(&max_time_buf, "{d}", .{@divTrunc(request_timeout_ms + 999, 1000)}) catch return null;
 
     var child = std.process.spawn(io, .{
         .argv = &.{
             "curl", "-s", "-X", "POST",
             "https://ime.oceancloudapi.com/api/v1/rectify_text",
+            "--max-time", max_time,
             "-H", "content-type: application/json",
             "-H", sami_hdr,
             "-H", device_hdr,
@@ -61,7 +125,10 @@ fn doHttpRequest(
     }) catch return null;
     errdefer child.kill(io);
 
-    const stdout = child.stdout orelse return null;
+    const stdout = child.stdout orelse {
+        child.kill(io);
+        return null;
+    };
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     var reader_buffer: [4096]u8 = undefined;
@@ -70,7 +137,11 @@ fn doHttpRequest(
     while (true) {
         const read_len = reader.interface.readSliceShort(&chunk) catch break;
         if (read_len == 0) break;
-        try buf.appendSlice(allocator, chunk[0..read_len]);
+        buf.appendSlice(allocator, chunk[0..read_len]) catch {
+            child.kill(io);
+            buf.deinit(allocator);
+            return null;
+        };
     }
     _ = child.wait(io) catch {};
     const result = buf.toOwnedSlice(allocator) catch return null;
@@ -153,4 +224,9 @@ fn codePointToByteOffset(text: []const u8, codepoint_index: usize) !usize {
         cp_count += 1;
     }
     return error.IndexOutOfBounds;
+}
+
+test "request timeout constant is short enough for commit path" {
+    try std.testing.expect(request_timeout_ms > 0);
+    try std.testing.expect(request_timeout_ms <= 3_000);
 }

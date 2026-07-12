@@ -189,6 +189,9 @@ pub const StreamingSession = struct {
         try session.flushReadyFrames();
     }
 
+    /// Max time to wait for server final/session_finished after FinishSession.
+    pub const finish_timeout_ms: i64 = 5_000;
+
     pub fn finish(session: *StreamingSession) !StreamFinish {
         if (session.shouldAbortAudio()) {
             session.finish_sent = true;
@@ -200,7 +203,7 @@ pub const StreamingSession = struct {
             session.finish_sent = true;
         }
 
-        return try session.waitForFinish();
+        return try session.waitForFinish(finish_timeout_ms);
     }
 
     pub fn finishAfterStreamFailure(session: *StreamingSession) StreamFinish {
@@ -412,17 +415,44 @@ pub const StreamingSession = struct {
         session.state.final_seen = true;
     }
 
-    fn waitForFinish(session: *StreamingSession) !StreamFinish {
+    fn waitForFinish(session: *StreamingSession, timeout_ms: i64) !StreamFinish {
+        // Race condition wait vs timeout via Io.Select — first arm wins.
+        // Both arms return void so cancel cannot leak StreamFinish allocations.
+        const SelectResult = union(enum) {
+            done: void,
+            timeout: void,
+        };
+        var slots: [2]SelectResult = undefined;
+        var select = std.Io.Select(SelectResult).init(session.io, &slots);
+
+        select.concurrent(.done, waitFinishUntilResolved, .{session}) catch {
+            select.async(.done, waitFinishUntilResolved, .{session});
+        };
+        select.concurrent(.timeout, finishTimeoutSleep, .{ session.io, timeout_ms }) catch {
+            select.async(.timeout, finishTimeoutSleep, .{ session.io, timeout_ms });
+        };
+
+        _ = select.await() catch {};
+        select.cancelDiscard();
+        return session.takeResolvedResult();
+    }
+
+    /// Block until final/error/close is observed (cancelable).
+    fn waitFinishUntilResolved(session: *StreamingSession) void {
         session.state_mutex.lockUncancelable(session.io);
         defer session.state_mutex.unlock(session.io);
 
         while (true) {
-            if (session.state.error_message != null) return takeResolvedResultLocked(&session.state);
-            if (session.state.session_finished or session.state.reader_closed) {
-                return takeResolvedResultLocked(&session.state);
-            }
-            session.state_cond.waitUncancelable(session.io, &session.state_mutex);
+            if (session.state.error_message != null) return;
+            if (session.state.final_seen) return;
+            if (session.state.final_text != null) return;
+            if (session.state.session_finished or session.state.reader_closed) return;
+            session.state_cond.wait(session.io, &session.state_mutex) catch return;
         }
+    }
+
+    fn finishTimeoutSleep(io: std.Io, timeout_ms: i64) void {
+        std.Io.sleep(io, .fromMilliseconds(timeout_ms), .awake) catch {};
     }
 
     fn takeResolvedResult(session: *StreamingSession) StreamFinish {
@@ -477,12 +507,10 @@ pub const StreamingSession = struct {
         session.writeBinSafe(finish_request) catch {};
     }
 
+    /// Stamp frames with wall-clock time without real-time pacing sleep.
+    /// Live capture already produces ~frame_duration audio; sleeping here
+    /// blocked the mic thread and delayed finish when buffered frames flushed.
     fn nextFrameTimestampMs(session: *StreamingSession) i64 {
-        const now_ms = std.Io.Timestamp.now(session.io, .real).toMilliseconds();
-        const delay_ms = nextFrameDelayMs(session.last_frame_sent_at_ms, now_ms, session.cfg.frame_duration_ms);
-        if (delay_ms > 0) {
-            std.Io.sleep(session.io, .fromMilliseconds(delay_ms), .awake) catch {};
-        }
         const timestamp_ms = std.Io.Timestamp.now(session.io, .real).toMilliseconds();
         session.last_frame_sent_at_ms = timestamp_ms;
         return timestamp_ms;
@@ -837,6 +865,37 @@ test "next frame delay uses configured frame interval" {
     try std.testing.expectEqual(@as(i64, 0), nextFrameDelayMs(null, 1_000, 100));
     try std.testing.expectEqual(@as(i64, 40), nextFrameDelayMs(1_000, 1_060, 100));
     try std.testing.expectEqual(@as(i64, 0), nextFrameDelayMs(1_000, 1_100, 100));
+}
+
+test "wait for finish returns early when final already seen via callback" {
+    var session: StreamingSession = undefined;
+    session.allocator = std.testing.allocator;
+    session.io = std.testing.io;
+    session.state_mutex = .init;
+    session.state_cond = .init;
+    session.state = initStreamingResultState();
+    defer session.state.deinit(std.testing.allocator);
+    session.state.final_seen = true;
+
+    const finish = try session.waitForFinish(1_000);
+    try std.testing.expect(finish == .none);
+}
+
+test "wait for finish times out when server never resolves" {
+    var session: StreamingSession = undefined;
+    session.allocator = std.testing.allocator;
+    session.io = std.testing.io;
+    session.state_mutex = .init;
+    session.state_cond = .init;
+    session.state = initStreamingResultState();
+    defer session.state.deinit(std.testing.allocator);
+
+    const started = std.Io.Timestamp.now(session.io, .real).toMilliseconds();
+    const finish = try session.waitForFinish(80);
+    const elapsed = std.Io.Timestamp.now(session.io, .real).toMilliseconds() - started;
+    try std.testing.expect(finish == .none);
+    try std.testing.expect(elapsed >= 60);
+    try std.testing.expect(elapsed < 500);
 }
 
 test "parses server close code and reason" {

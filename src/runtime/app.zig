@@ -9,25 +9,17 @@ const mic = @import("mic.zig");
 const mute = @import("mute.zig");
 const notify = @import("notify.zig");
 const output = @import("output.zig");
+const shutdown = @import("shutdown.zig");
 const posix_system = std.posix.system;
 
 const max_captured_audio_bytes: usize = 64 * 1024 * 1024;
 
-var shutdown_requested = std.atomic.Value(bool).init(false);
-
-fn handleShutdownSignal(sig: std.posix.SIG) callconv(.c) void {
-    _ = sig;
-    shutdown_requested.store(true, .release);
+pub fn installSignalHandlers() void {
+    shutdown.installSignalHandlers();
 }
 
-fn installSignalHandlers() void {
-    const act = std.posix.Sigaction{
-        .handler = .{ .handler = handleShutdownSignal },
-        .mask = std.mem.zeroes(std.posix.sigset_t),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.INT, &act, null);
-    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+pub fn isShutdownRequested() bool {
+    return shutdown.isRequested();
 }
 
 pub fn run(
@@ -68,10 +60,18 @@ pub fn run(
         .io = io,
         .running = std.atomic.Value(bool).init(true),
     };
-    const service_thread = try std.Thread.spawn(.{}, runServiceLoop, .{&service_loop});
+    var service_future_opt = io.concurrent(runServiceLoop, .{&service_loop}) catch null;
+    var service_thread: ?std.Thread = null;
+    if (service_future_opt == null) {
+        service_thread = try std.Thread.spawn(.{}, runServiceLoop, .{&service_loop});
+    }
     defer {
         service_loop.running.store(false, .release);
-        service_thread.join();
+        if (service_future_opt) |*f| {
+            _ = f.cancel(io);
+        } else if (service_thread) |t| {
+            t.join();
+        }
     }
 
     ibus.switchToAsrInputMethod(allocator, io) catch |err| {
@@ -95,17 +95,17 @@ const ServiceLoop = struct {
 };
 
 fn runServiceLoop(loop: *ServiceLoop) void {
-    while (loop.running.load(.acquire)) {
+    while (loop.running.load(.acquire) and !isShutdownRequested()) {
         loop.service.iterate();
-        sleepMs(loop.io, 10);
+        shutdown.sleepUntilOr(loop.io, 10);
     }
 }
 
 fn waitForServiceReady(io: std.Io, service: *ibus.gio_ibus.Service, timeout_ms: i64) bool {
     var elapsed: i64 = 0;
-    while (elapsed <= timeout_ms) : (elapsed += 50) {
+    while (elapsed <= timeout_ms and !isShutdownRequested()) : (elapsed += 50) {
         if (std.mem.eql(u8, service.status(), "ready")) return true;
-        sleepMs(io, 50);
+        shutdown.sleepUntilOr(io, 50);
     }
     return false;
 }
@@ -125,44 +125,69 @@ fn runHotkeyLoop(
 
     output.keyWait(logger);
     while (true) {
-        if (shutdown_requested.load(.acquire)) {
+        if (isShutdownRequested()) {
             logger.info("app", "shutting down", .{});
             return;
         }
-        const event = keyboard.readNext(key.right_alt) catch |err| {
+        const event_opt = keyboard.readNextOrShutdown(key.right_alt) catch |err| {
+            if (err == error.Interrupted) continue;
             switch (classifyKeyboardReadFailure(err)) {
                 .reopen => {
                     keyboard.reopenAfterReadFailure(err);
+                    if (isShutdownRequested()) {
+                        logger.info("app", "shutting down", .{});
+                        return;
+                    }
                     output.keyWait(logger);
                     continue;
                 },
                 .fail => return err,
             }
         };
+        const event = event_opt orelse {
+            logger.info("app", "shutting down", .{});
+            return;
+        };
         if (event == .release) continue;
         output.keyEvent(logger, .press);
+
         var callback_ctx = DoubaoCallbacks{
             .pipeline = pipeline,
         };
-        var session = initSessionWithRetry(allocator, io, cfg, &callback_ctx, logger, debug) catch |err| {
-            logger.err("doubao", "session failed: {s}", .{@errorName(err)});
-            output.keyWait(logger);
-            continue;
+
+        // Parallel boot: WS handshake overlaps arecord + early speech buffer.
+        var session_future_opt = io.concurrent(initSessionWithRetry, .{
+            allocator,
+            io,
+            cfg,
+            &callback_ctx,
+            logger,
+            debug,
+        }) catch null;
+        var session_future_taken = false;
+        defer if (session_future_opt) |*f| {
+            if (!session_future_taken) {
+                if (f.cancel(io)) |owned| {
+                    var s = owned;
+                    s.deinit();
+                } else |_| {}
+            }
         };
-        defer session.deinit();
-        session.start() catch |err| {
-            logger.err("doubao", "session failed: {s}", .{@errorName(err)});
-            output.keyWait(logger);
-            continue;
-        };
+
         defer drainKeyboardEvents(keyboard.file, &keyboard.state, key.right_alt, logger);
         var captured_audio: std.ArrayList(u8) = .empty;
         defer captured_audio.deinit(allocator);
         var gate = audio_gate.AudioGate.init(allocator, io);
         defer gate.deinit();
+        gate.beginBuffering();
+
+        var session: doubao.StreamingSession = undefined;
+        var has_session = false;
+        defer if (has_session) session.deinit();
+
         var stream_state = StreamCaptureState{
             .allocator = allocator,
-            .session = &session,
+            .session = null,
             .captured_audio = &captured_audio,
             .gate = &gate,
         };
@@ -179,6 +204,13 @@ fn runHotkeyLoop(
             .gate = &gate,
             .speaker_guard = &speaker_guard,
             .stream_state = &stream_state,
+            .session = &session,
+            .has_session = &has_session,
+            .session_future_opt = &session_future_opt,
+            .session_future_taken = &session_future_taken,
+            .cfg = cfg,
+            .callback_ctx = &callback_ctx,
+            .debug = debug,
         };
         var release_state = CaptureReleaseState{
             .logger = logger,
@@ -197,13 +229,27 @@ fn runHotkeyLoop(
             .on_stopped = onCaptureStopped,
             .stopped_ctx = @ptrCast(&release_state),
         }) catch |err| {
+            if (isShutdownRequested()) {
+                logger.info("app", "shutting down", .{});
+                return;
+            }
             logger.err("doubao", "capture failed: {s}", .{@errorName(err)});
             output.keyWait(logger);
             continue;
         };
+        if (isShutdownRequested()) {
+            logger.info("app", "shutting down", .{});
+            return;
+        }
         var close_message_buf: [128]u8 = undefined;
         const close_message = formatMicCloseMessage(&close_message_buf, capture_summary) catch "recording already stopped";
         logger.debug("mic", "{s}", .{close_message});
+
+        if (!has_session) {
+            logger.err("doubao", "session unavailable", .{});
+            output.keyWait(logger);
+            continue;
+        }
 
         if (stream_state.stream_error) |stream_err| {
             logger.err("doubao", "stream failed: {s}", .{@errorName(stream_err)});
@@ -248,6 +294,7 @@ fn initSessionWithRetry(
     var delay_ms: i64 = 1000;
     var attempt: usize = 0;
     while (true) {
+        if (isShutdownRequested()) return error.Canceled;
         if (doubao.StreamingSession.init(allocator, io, cfg, .{
             .debug = debug,
             .on_interim = onDoubaoInterim,
@@ -266,7 +313,8 @@ fn initSessionWithRetry(
                 const jitter: i64 = @as(i64, @intCast(rand_val % @as(u64, @intCast(@max(half_delay, 1)))));
                 const sleep_time = delay_ms + jitter;
                 logger.info("doubao", "quota exceeded, retry {d}/3 in {d}ms", .{ attempt, sleep_time });
-                std.Io.sleep(io, .fromMilliseconds(sleep_time), .awake) catch {};
+                shutdown.sleepUntilOr(io, sleep_time);
+                if (isShutdownRequested()) return error.Canceled;
                 delay_ms = @min(delay_ms * 2, 10_000);
                 continue;
             }
@@ -328,22 +376,32 @@ const KeyboardEventStream = struct {
     }
 
     fn readNext(stream: *KeyboardEventStream, key_code: u16) key.DeviceReadError!key.Event {
-        return key.readNextDeviceEvent(stream.file, &stream.state, key_code);
+        return key.readNextDeviceEvent(stream.io, stream.file, &stream.state, key_code);
+    }
+
+    fn readNextOrShutdown(stream: *KeyboardEventStream, key_code: u16) key.DeviceReadError!?key.Event {
+        return key.waitNextDeviceEventOrShutdown(
+            stream.io,
+            stream.file,
+            &stream.state,
+            key_code,
+            isShutdownRequested,
+        );
     }
 
     fn reopenAfterReadFailure(stream: *KeyboardEventStream, read_err: anyerror) void {
         stream.logger.err("kbd", "read failed: {s}; reopening keyboard device", .{@errorName(read_err)});
-        while (true) {
+        while (!isShutdownRequested()) {
             const next_path = key.findKeyboardDevice(stream.allocator, stream.io, stream.environ) catch |err| {
                 stream.logger.err("kbd", "reopen failed: {s}", .{@errorName(err)});
-                sleepMs(stream.io, 500);
+                shutdown.sleepUntilOr(stream.io, 500);
                 continue;
             };
 
             const next_file = openKeyboardFile(stream.io, next_path) catch |err| {
                 stream.logger.err("kbd", "open failed: {s}: {s}", .{ next_path, @errorName(err) });
                 stream.allocator.free(next_path);
-                sleepMs(stream.io, 500);
+                shutdown.sleepUntilOr(stream.io, 500);
                 continue;
             };
 
@@ -383,20 +441,6 @@ fn drainKeyboardEvents(file: std.Io.File, state: *key.State, key_code: u16, logg
     }
 }
 
-/// Commit text to IBus and log the result.
-fn commitAndLog(
-    logger: output.Logger,
-    service: *ibus.gio_ibus.Service,
-    text: []const u8,
-) void {
-    const commit_status = service.commitStatus(text);
-    if (std.mem.startsWith(u8, commit_status, "OK ")) {
-        logger.info("ibus", "✅", .{});
-    } else {
-        logger.err("ibus", "❌ {s}", .{commit_status});
-    }
-}
-
 fn handleFinish(
     allocator: std.mem.Allocator,
     pipeline: *postprocess.Pipeline,
@@ -418,10 +462,6 @@ fn handleFinish(
             return false;
         },
     }
-}
-
-fn sleepMs(io: std.Io, milliseconds: i64) void {
-    std.Io.sleep(io, .fromMilliseconds(milliseconds), .awake) catch {};
 }
 
 fn onDoubaoInterim(ctx: ?*const anyopaque, text: []const u8) void {
@@ -447,14 +487,15 @@ fn sendDoubaoAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
         try state.captured_audio.appendSlice(state.allocator, chunk);
     }
     if (state.stream_error != null) return;
-    state.session.sendChunk(chunk) catch |err| {
+    const session = state.session orelse return;
+    session.sendChunk(chunk) catch |err| {
         state.stream_error = err;
     };
 }
 
 const StreamCaptureState = struct {
     allocator: std.mem.Allocator,
-    session: *doubao.StreamingSession,
+    session: ?*doubao.StreamingSession,
     captured_audio: *std.ArrayList(u8),
     gate: *audio_gate.AudioGate,
     stream_error: ?anyerror = null,
@@ -464,6 +505,9 @@ const DoubaoCallbacks = struct {
     pipeline: *postprocess.Pipeline,
 };
 
+const SessionInitResult = @typeInfo(@TypeOf(initSessionWithRetry)).@"fn".return_type.?;
+const SessionFuture = std.Io.Future(SessionInitResult);
+
 const CaptureStartedState = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -471,6 +515,13 @@ const CaptureStartedState = struct {
     gate: *audio_gate.AudioGate,
     speaker_guard: *SpeakerMuteGuard,
     stream_state: *StreamCaptureState,
+    session: *doubao.StreamingSession,
+    has_session: *bool,
+    session_future_opt: *?SessionFuture,
+    session_future_taken: *bool,
+    cfg: config.Config,
+    callback_ctx: *const DoubaoCallbacks,
+    debug: bool,
 };
 
 const CaptureReleaseState = struct {
@@ -498,11 +549,56 @@ const SpeakerMuteGuard = struct {
     }
 };
 
+fn playBellTask(allocator: std.mem.Allocator, io: std.Io) void {
+    notify.playMicReadyNotification(allocator, io);
+}
+
+fn resolveSession(state: *CaptureStartedState) !void {
+    if (state.has_session.*) return;
+
+    if (state.session_future_opt.*) |future_value| {
+        var future = future_value;
+        state.session_future_opt.* = null;
+        state.session_future_taken.* = true;
+        state.session.* = try future.await(state.io);
+        state.has_session.* = true;
+    } else {
+        state.session.* = try initSessionWithRetry(
+            state.allocator,
+            state.io,
+            state.cfg,
+            state.callback_ctx,
+            state.logger,
+            state.debug,
+        );
+        state.has_session.* = true;
+    }
+
+    try state.session.start();
+    state.stream_state.session = state.session;
+}
+
 fn onCaptureStarted(ctx: ?*anyopaque) !void {
     const state = @as(*CaptureStartedState, @ptrCast(@alignCast(ctx orelse return error.MissingCaptureStartedState)));
-    notify.playMicReadyNotification(state.allocator, state.io);
-    state.gate.beginBuffering();
-    state.speaker_guard.muteAfterPrompt();
+
+    if (state.io.concurrent(playBellTask, .{ state.allocator, state.io })) |bell_future_value| {
+        var bell_future = bell_future_value;
+        resolveSession(state) catch |err| {
+            _ = bell_future.await(state.io);
+            state.logger.err("doubao", "session failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        _ = bell_future.await(state.io);
+        state.speaker_guard.muteAfterPrompt();
+    } else |_| {
+        playBellTask(state.allocator, state.io);
+        state.speaker_guard.muteAfterPrompt();
+        resolveSession(state) catch |err| {
+            state.logger.err("doubao", "session failed: {s}", .{@errorName(err)});
+            return err;
+        };
+    }
+
     try state.gate.openAndFlush(@ptrCast(state.stream_state), sendDoubaoAudioChunk);
     state.logger.info("doubao", "🎤", .{});
 }
@@ -537,4 +633,8 @@ test "keyboard read failed reopens event reader instead of exiting" {
     try std.testing.expectEqual(KeyboardReadFailureAction.reopen, classifyKeyboardReadFailure(error.KeyboardDeviceDisconnected));
     try std.testing.expectEqual(KeyboardReadFailureAction.reopen, classifyKeyboardReadFailure(error.ReadFailed));
     try std.testing.expectEqual(KeyboardReadFailureAction.fail, classifyKeyboardReadFailure(error.AccessDenied));
+}
+
+test "Interrupted is not classified as reopen" {
+    try std.testing.expectEqual(KeyboardReadFailureAction.fail, classifyKeyboardReadFailure(error.Interrupted));
 }

@@ -132,7 +132,12 @@ const TextQueue = struct {
         queue.mutex.lockUncancelable(queue.io);
         defer queue.mutex.unlock(queue.io);
         while (queue.items.items.len == 0 and !queue.closed) {
-            queue.cond.waitUncancelable(queue.io, &queue.mutex);
+            // Cancelable: pipeline deinit close() broadcasts; cancel also wakes workers.
+            queue.cond.wait(queue.io, &queue.mutex) catch {
+                // Canceled while waiting: re-check closed/items after re-acquiring lock.
+                if (queue.closed and queue.items.items.len == 0) return null;
+                continue;
+            };
         }
         if (queue.items.items.len == 0) return null;
         return queue.items.orderedRemove(0);

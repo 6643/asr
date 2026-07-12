@@ -17,14 +17,16 @@ pub fn main(init: std.process.Init) !void {
             return;
         },
         .ibus_service => {
+            asr.runtime.app.installSignalHandlers();
             const service = try asr.runtime.ibus.startService(allocator, init.io, init.minimal.environ);
             defer {
                 service.stop();
                 allocator.destroy(service);
             }
-            while (true) {
+            while (!asr.runtime.app.isShutdownRequested()) {
                 service.iterate();
-                sleepMs(init.io, 100);
+                // Cancelable slice so Ctrl+C is observed within ~25ms.
+                asr.runtime.shutdown.sleepMs(init.io, 25);
             }
             return;
         },
@@ -57,8 +59,4 @@ pub fn main(init: std.process.Init) !void {
             return;
         },
     }
-}
-
-fn sleepMs(io: std.Io, milliseconds: i64) void {
-    std.Io.sleep(io, .fromMilliseconds(milliseconds), .awake) catch {};
 }
