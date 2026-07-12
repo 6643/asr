@@ -437,15 +437,18 @@ pub const StreamingSession = struct {
         return session.takeResolvedResult();
     }
 
-    /// Block until final/error/close is observed (cancelable).
+    /// Block until the streaming session is terminal (cancelable).
+    ///
+    /// Mid-hold VAD finals set `final_seen` / `final_text` while more speech
+    /// may still be recognized. Do not treat those as session completion —
+    /// wait for SessionFinished, reader close, or error. Timeout is handled
+    /// by the Select arm racing this wait.
     fn waitFinishUntilResolved(session: *StreamingSession) void {
         session.state_mutex.lockUncancelable(session.io);
         defer session.state_mutex.unlock(session.io);
 
         while (true) {
             if (session.state.error_message != null) return;
-            if (session.state.final_seen) return;
-            if (session.state.final_text != null) return;
             if (session.state.session_finished or session.state.reader_closed) return;
             session.state_cond.wait(session.io, &session.state_mutex) catch return;
         }
@@ -867,7 +870,9 @@ test "next frame delay uses configured frame interval" {
     try std.testing.expectEqual(@as(i64, 0), nextFrameDelayMs(1_000, 1_100, 100));
 }
 
-test "wait for finish returns early when final already seen via callback" {
+test "wait for finish does not resolve on mid-hold final_seen alone" {
+    // Multi-utterance: first VAD final sets final_seen via on_final callback.
+    // finish() must keep waiting for SessionFinished so later finals can arrive.
     var session: StreamingSession = undefined;
     session.allocator = std.testing.allocator;
     session.io = std.testing.io;
@@ -877,8 +882,56 @@ test "wait for finish returns early when final already seen via callback" {
     defer session.state.deinit(std.testing.allocator);
     session.state.final_seen = true;
 
-    const finish = try session.waitForFinish(1_000);
+    const started = std.Io.Timestamp.now(session.io, .real).toMilliseconds();
+    const finish = try session.waitForFinish(80);
+    const elapsed = std.Io.Timestamp.now(session.io, .real).toMilliseconds() - started;
     try std.testing.expect(finish == .none);
+    try std.testing.expect(elapsed >= 60);
+    try std.testing.expect(elapsed < 500);
+}
+
+test "wait for finish resolves when session finished after earlier final callback" {
+    var session: StreamingSession = undefined;
+    session.allocator = std.testing.allocator;
+    session.io = std.testing.io;
+    session.state_mutex = .init;
+    session.state_cond = .init;
+    session.state = initStreamingResultState();
+    defer session.state.deinit(std.testing.allocator);
+    session.state.final_seen = true;
+    session.state.session_finished = true;
+
+    const started = std.Io.Timestamp.now(session.io, .real).toMilliseconds();
+    const finish = try session.waitForFinish(1_000);
+    const elapsed = std.Io.Timestamp.now(session.io, .real).toMilliseconds() - started;
+    try std.testing.expect(finish == .none);
+    try std.testing.expect(elapsed < 200);
+}
+
+test "wait for finish does not resolve on final_text alone before session end" {
+    const allocator = std.testing.allocator;
+    var session: StreamingSession = undefined;
+    session.allocator = allocator;
+    session.io = std.testing.io;
+    session.state_mutex = .init;
+    session.state_cond = .init;
+    session.state = initStreamingResultState();
+    defer session.state.deinit(allocator);
+    session.state.final_text = try allocator.dupe(u8, "第一段。");
+    session.state.final_seen = true;
+
+    const started = std.Io.Timestamp.now(session.io, .real).toMilliseconds();
+    const finish = try session.waitForFinish(80);
+    const elapsed = std.Io.Timestamp.now(session.io, .real).toMilliseconds() - started;
+    // Still holding final_text for take after session end / timeout.
+    switch (finish) {
+        .text => |text| {
+            defer allocator.free(text);
+            try std.testing.expectEqualStrings("第一段。", text);
+        },
+        else => return error.TestExpectedText,
+    }
+    try std.testing.expect(elapsed >= 60);
 }
 
 test "wait for finish times out when server never resolves" {
