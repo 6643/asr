@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const doubao = @import("../doubao/client.zig");
+const credentials = @import("../doubao/credentials.zig");
 const key = @import("../key.zig");
 const audio_gate = @import("audio_gate.zig");
 const ibus = @import("ibus.zig");
@@ -31,8 +32,20 @@ pub fn run(
     installSignalHandlers();
     const logger = output.Logger{ .io = io, .level = if (debug) .debug else .info };
     var cfg: config.Config = .{};
-    const creds = try config.loadCredentials(allocator, io, cfg.credential_path);
+    var creds = try config.loadCredentials(allocator, io, cfg.credential_path);
     defer creds.deinit(allocator);
+    const refresh_ok = blk: {
+        const result = credentials.refreshFile(allocator, io, cfg.credential_path, debug) catch |err| {
+            logger.err("doubao", "credential refresh failed: {s}; using existing credentials", .{@errorName(err)});
+            break :blk false;
+        };
+        break :blk credentials.refreshSucceeded(result);
+    };
+    if (refresh_ok) {
+        logger.info("doubao", "credentials refreshed", .{});
+        creds.deinit(allocator);
+        creds = try config.loadCredentials(allocator, io, cfg.credential_path);
+    }
     cfg = config.withCredentials(cfg, creds);
     if (cfg.device_id.len == 0 or cfg.token.len == 0) return error.MissingCredentials;
 

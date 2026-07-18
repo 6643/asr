@@ -32,8 +32,20 @@ pub fn main(init: std.process.Init) !void {
         },
         .once_pcm => |pcm_path| {
             var cfg: asr.config.Config = .{};
-            const creds = try asr.config.loadCredentials(allocator, init.io, cfg.credential_path);
+            var creds = try asr.config.loadCredentials(allocator, init.io, cfg.credential_path);
             defer creds.deinit(allocator);
+            const refresh_ok = blk: {
+                const result = asr.doubao.credentials.refreshFile(allocator, init.io, cfg.credential_path, opts.debug) catch |err| {
+                    std.log.warn("doubao credential refresh failed: {s}; using existing credentials", .{@errorName(err)});
+                    break :blk false;
+                };
+                break :blk asr.doubao.credentials.refreshSucceeded(result);
+            };
+            if (refresh_ok) {
+                std.log.info("doubao credentials refreshed", .{});
+                creds.deinit(allocator);
+                creds = try asr.config.loadCredentials(allocator, init.io, cfg.credential_path);
+            }
             cfg = asr.config.withCredentials(cfg, creds);
             if (cfg.device_id.len == 0 or cfg.token.len == 0) return error.MissingCredentials;
 
