@@ -318,14 +318,14 @@ fn initSessionWithRetry(
             return session;
         } else |err| {
             attempt += 1;
-            if (err == error.RemoteAsrError and attempt < 3) {
+            if (err == error.RemoteAsrQuotaExceeded and attempt < 3) {
                 var rand_buf: [8]u8 = undefined;
                 io.random(&rand_buf);
                 const rand_val = std.mem.readInt(u64, &rand_buf, .little);
                 const half_delay = @divTrunc(delay_ms, 2);
                 const jitter: i64 = @as(i64, @intCast(rand_val % @as(u64, @intCast(@max(half_delay, 1)))));
                 const sleep_time = delay_ms + jitter;
-                logger.info("doubao", "quota exceeded, retry {d}/3 in {d}ms", .{ attempt, sleep_time });
+                logger.info("doubao", "concurrency quota exceeded, retry {d}/3 in {d}ms", .{ attempt, sleep_time });
                 shutdown.sleepUntilOr(io, sleep_time);
                 if (isShutdownRequested()) return error.Canceled;
                 delay_ms = @min(delay_ms * 2, 10_000);

@@ -129,7 +129,7 @@ fn fetchAsrToken(
     defer response.deinit(allocator);
     if (response.status != 200) {
         if (debug) std.log.warn("credential refresh ASR request status={d}", .{response.status});
-        return error.CredentialRefreshHttpFailed;
+        return error.CredentialRefreshAsrHttpFailed;
     }
     return try parseTokenField(allocator, response.body, &.{ "data", "settings", "asr_config", "app_key" });
 }
@@ -163,7 +163,7 @@ fn fetchSamiToken(
     defer response.deinit(allocator);
     if (response.status != 200) {
         if (debug) std.log.warn("credential refresh SAMI request status={d}", .{response.status});
-        return error.CredentialRefreshHttpFailed;
+        return error.CredentialRefreshSamiHttpFailed;
     }
     return try parseTokenField(allocator, response.body, &.{ "data", "sami_token" });
 }
@@ -313,6 +313,6 @@ test "does not build refreshed credentials when either token is empty" {
 }
 
 test "refresh failure keeps the loaded credentials" {
-    try std.testing.expect(!refreshSucceeded(error.CredentialRefreshHttpFailed));
+    try std.testing.expect(!refreshSucceeded(error.CredentialRefreshAsrHttpFailed));
     try std.testing.expect(refreshSucceeded(.updated));
 }

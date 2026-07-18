@@ -50,6 +50,13 @@ const StreamingResolution = enum {
     err,
 };
 
+const RemoteErrorKind = enum { quota, other };
+
+fn classifyRemoteError(message: []const u8) RemoteErrorKind {
+    if (std.mem.indexOf(u8, message, "concurrency quota exceeded") != null) return .quota;
+    return .other;
+}
+
 const StreamingResultState = struct {
     final_text: ?[]const u8 = null,
     final_seen: bool = false,
@@ -572,7 +579,10 @@ pub fn transcribePcmBytes(
         switch (event.kind) {
             .final => return try allocator.dupe(u8, event.text),
             .session_finished => return null,
-            .err => return error.RemoteAsrError,
+            .err => return switch (classifyRemoteError(event.message)) {
+                .quota => error.RemoteAsrQuotaExceeded,
+                .other => error.RemoteAsrError,
+            },
             .interim, .vad => {
                 if (event.text.len == 0) continue;
                 if (options.on_interim) |on_interim| {
@@ -696,7 +706,10 @@ fn expectResponse(allocator: std.mem.Allocator, client: *websocket.Client, expec
     defer event.deinit(allocator);
     if (event.kind == .err) {
         if (debug) std.log.err("remote asr error: {s}", .{event.error_message});
-        return error.RemoteAsrError;
+        return switch (classifyRemoteError(event.error_message)) {
+            .quota => error.RemoteAsrQuotaExceeded,
+            .other => error.RemoteAsrError,
+        };
     }
     if (event.kind != expected) {
         if (debug) std.log.err("unexpected response: expected={s} actual={s}", .{ @tagName(expected), @tagName(event.kind) });
@@ -777,9 +790,9 @@ fn requestId(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
         allocator,
         "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}",
         .{
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7],
-            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[0],  bytes[1],  bytes[2],  bytes[3],
+            bytes[4],  bytes[5],  bytes[6],  bytes[7],
+            bytes[8],  bytes[9],  bytes[10], bytes[11],
             bytes[12], bytes[13], bytes[14], bytes[15],
         },
     );
@@ -793,6 +806,12 @@ test "parses websocket url" {
     try std.testing.expectEqual(@as(u16, 443), parsed.port);
     try std.testing.expectEqualStrings("example.com", parsed.host);
     try std.testing.expectEqualStrings("/ws?x=1", parsed.path);
+}
+
+test "classifies only explicit concurrency quota errors as quota" {
+    try std.testing.expectEqual(RemoteErrorKind.quota, classifyRemoteError("concurrency quota exceeded: value=5"));
+    try std.testing.expectEqual(RemoteErrorKind.other, classifyRemoteError("authentication failed"));
+    try std.testing.expectEqual(RemoteErrorKind.other, classifyRemoteError("TlsConnectionTruncated"));
 }
 
 test "pads final pcm frame" {
