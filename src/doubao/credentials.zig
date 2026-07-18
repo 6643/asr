@@ -12,6 +12,11 @@ const request_timeout_seconds = "15";
 
 pub const RefreshResult = enum { updated };
 
+pub fn refreshSucceeded(result: anyerror!RefreshResult) bool {
+    _ = result catch return false;
+    return true;
+}
+
 pub const RefreshIds = struct {
     device_id: []const u8,
     cdid: []const u8,
@@ -305,4 +310,9 @@ test "does not build refreshed credentials when either token is empty" {
         error.EmptyCredentialToken,
         combineRefreshTokens(std.testing.allocator, source, "new", ""),
     );
+}
+
+test "refresh failure keeps the loaded credentials" {
+    try std.testing.expect(!refreshSucceeded(error.CredentialRefreshHttpFailed));
+    try std.testing.expect(refreshSucceeded(.updated));
 }
