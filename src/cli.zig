@@ -7,6 +7,8 @@ pub const ModeTag = enum {
     once_pcm,
 };
 
+pub const Engine = enum { baidu, doubao };
+
 pub const Mode = union(ModeTag) {
     app: void,
     ibus_service: void,
@@ -16,12 +18,14 @@ pub const Mode = union(ModeTag) {
 
 pub const Options = struct {
     mode: Mode,
+    engine: Engine = .baidu,
     debug: bool = false,
 };
 
 pub fn optionsFromArgs(args: []const [:0]const u8) Options {
     return .{
         .mode = modeFromArgs(args),
+        .engine = if (hasArg(args, "--doubao")) .doubao else .baidu,
         .debug = hasArg(args, "--debug"),
     };
 }
@@ -71,4 +75,14 @@ test "recognizes once pcm mode" {
 test "recognizes debug flag" {
     const args = [_][:0]const u8{ "asr", "--debug" };
     try std.testing.expect(optionsFromArgs(&args).debug);
+}
+
+test "defaults to baidu engine" {
+    const args = [_][:0]const u8{"asr"};
+    try std.testing.expectEqual(Engine.baidu, optionsFromArgs(&args).engine);
+}
+
+test "recognizes explicit doubao engine" {
+    const args = [_][:0]const u8{ "asr", "--doubao" };
+    try std.testing.expectEqual(Engine.doubao, optionsFromArgs(&args).engine);
 }

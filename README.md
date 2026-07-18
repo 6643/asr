@@ -12,18 +12,21 @@
 
 ## 配置
 
-默认读取 `config/doubao.json`:
+默认使用 Baidu WebSocket ASR, 配置读取 `config/baidu.json`:
 
 ```json
 {
-  "device_id": "your_device_id",
-  "token": "your_token",
-  "cdid": "optional_cdid",
-  "sami_token": "optional_sami_token"
+  "url": "wss://vse.baidu.com/ws_api",
+  "sample_rate": 16000,
+  "channels": 1,
+  "frame_duration_ms": 100,
+  "user": "baidu_pc",
+  "dev_key": "com.baidu.searchbox.fangyan",
+  "dev_pid": 8068
 }
 ```
 
-`device_id` 和 `token` 为空时会报 `MissingCredentials`。`sami_token` 可选, 有值时会在最终识别结果上走纠错 (rectify) 再提交。
+使用 `--doubao` 可显式切回 Doubao, 其凭证仍读取 `config/doubao.json`。
 
 ## 构建与运行
 
@@ -45,6 +48,7 @@ ASR_KEYBOARD_DEVICE=/dev/input/event2 ./zig-out/bin/asr
 ## 运行模式
 
 - 正常模式: `./zig-out/bin/asr`
+- Doubao 模式: `./zig-out/bin/asr --doubao`
 - 仅 IBus 服务: `./zig-out/bin/asr --ibus`
 - 输出 IBus XML: `./zig-out/bin/asr --ibus-xml`
 - 离线 PCM 识别测试:
@@ -53,7 +57,7 @@ ASR_KEYBOARD_DEVICE=/dev/input/event2 ./zig-out/bin/asr
   ./zig-out/bin/asr --once-pcm /tmp/asr-debug.pcm
   ```
 
-`--once-pcm` 需要 16kHz 单声道 `s16le` PCM 数据。
+`--once-pcm` 默认使用 Baidu, 需要 16kHz 单声道 `s16le` PCM 数据; 加 `--doubao` 可使用 Doubao。
 
 ## 发布构建
 

@@ -13,12 +13,18 @@ pub const runtime = struct {
     pub const postprocess = @import("runtime/postprocess.zig");
     pub const output = @import("runtime/output.zig");
     pub const shutdown = @import("runtime/shutdown.zig");
+    pub const engine = @import("runtime/engine.zig");
 };
 pub const doubao = struct {
     pub const proto = @import("doubao/proto.zig");
     pub const client = @import("doubao/client.zig");
     pub const credentials = @import("doubao/credentials.zig");
     pub const rectify = @import("doubao/rectify.zig");
+};
+
+pub const baidu = struct {
+    pub const proto = @import("baidu/proto.zig");
+    pub const client = @import("baidu/client.zig");
 };
 
 test {
@@ -37,8 +43,11 @@ test {
     _ = runtime.postprocess;
     _ = runtime.output;
     _ = runtime.shutdown;
+    _ = runtime.engine;
     _ = doubao.proto;
     _ = doubao.client;
     _ = doubao.credentials;
     _ = doubao.rectify;
+    _ = baidu.proto;
+    _ = baidu.client;
 }

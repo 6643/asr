@@ -2,6 +2,7 @@ const std = @import("std");
 const config = @import("../config.zig");
 const doubao = @import("../doubao/client.zig");
 const credentials = @import("../doubao/credentials.zig");
+const engine = @import("engine.zig");
 const key = @import("../key.zig");
 const audio_gate = @import("audio_gate.zig");
 const ibus = @import("ibus.zig");
@@ -28,29 +29,48 @@ pub fn run(
     io: std.Io,
     environ: std.process.Environ,
     debug: bool,
+    engine_kind: engine.Kind,
 ) !void {
     installSignalHandlers();
     const logger = output.Logger{ .io = io, .level = if (debug) .debug else .info };
     var cfg: config.Config = .{};
-    var creds = try config.loadCredentials(allocator, io, cfg.credential_path);
-    defer creds.deinit(allocator);
-    const refresh_ok = blk: {
-        const result = credentials.refreshFile(allocator, io, cfg.credential_path, debug) catch |err| {
-            logger.err("doubao", "credential refresh failed: {s}; using existing credentials", .{@errorName(err)});
-            break :blk false;
-        };
-        break :blk credentials.refreshSucceeded(result);
-    };
-    if (refresh_ok) {
-        logger.info("doubao", "credentials refreshed", .{});
-        creds.deinit(allocator);
-        creds = try config.loadCredentials(allocator, io, cfg.credential_path);
+    var baidu_cfg: config.BaiduConfig = undefined;
+    var doubao_creds: ?config.Credentials = null;
+    var engine_cfg: engine.Config = undefined;
+    switch (engine_kind) {
+        .baidu => {
+            baidu_cfg = try config.loadBaiduConfig(allocator, io, config.default_baidu_credential_path);
+            engine_cfg = .{ .baidu = baidu_cfg };
+        },
+        .doubao => {
+            doubao_creds = try config.loadCredentials(allocator, io, cfg.credential_path);
+            var creds = &doubao_creds.?;
+            const refresh_ok = blk: {
+                const result = credentials.refreshFile(allocator, io, cfg.credential_path, debug) catch |err| {
+                    logger.err("doubao", "credential refresh failed: {s}; using existing credentials", .{@errorName(err)});
+                    break :blk false;
+                };
+                break :blk credentials.refreshSucceeded(result);
+            };
+            if (refresh_ok) {
+                logger.info("doubao", "credentials refreshed", .{});
+                creds.deinit(allocator);
+                doubao_creds = try config.loadCredentials(allocator, io, cfg.credential_path);
+                creds = &doubao_creds.?;
+            }
+            cfg = config.withCredentials(cfg, creds.*);
+            if (cfg.device_id.len == 0 or cfg.token.len == 0) return error.MissingCredentials;
+            engine_cfg = .{ .doubao = cfg };
+        },
     }
-    cfg = config.withCredentials(cfg, creds);
-    if (cfg.device_id.len == 0 or cfg.token.len == 0) return error.MissingCredentials;
+    defer if (engine_kind == .baidu) baidu_cfg.deinit(allocator);
+    defer if (doubao_creds) |creds| creds.deinit(allocator);
 
     logger.info("app", "ASR 启动", .{});
-    logger.info("doubao", "{s}", .{cfg.device_id});
+    logger.info(engineLabel(engine_cfg), "engine ready", .{});
+    if (engineKind(engine_cfg) == .doubao) {
+        logger.info("doubao", "{s}", .{cfg.device_id});
+    }
 
     const keyboard_device = try key.findKeyboardDevice(allocator, io, environ);
     defer allocator.free(keyboard_device);
@@ -65,7 +85,7 @@ pub fn run(
         allocator.destroy(service);
     }
 
-    var pipeline = try postprocess.Pipeline.start(allocator, io, logger, service, &cfg);
+    var pipeline = try postprocess.Pipeline.start(allocator, io, logger, service, &cfg, if (engine_kind == .baidu) "baidu" else "doubao");
     defer pipeline.deinit();
 
     var service_loop = ServiceLoop{
@@ -90,7 +110,7 @@ pub fn run(
     ibus.switchToAsrInputMethod(allocator, io) catch |err| {
         logger.err("ibus", "switch failed: {s}", .{@errorName(err)});
         logger.info("ibus", "Auto-switch unavailable; switch to ASR manually", .{});
-        try runHotkeyLoop(allocator, io, environ, logger, cfg, keyboard_device, pipeline, debug);
+        try runHotkeyLoop(allocator, io, environ, logger, engine_cfg, keyboard_device, pipeline, debug);
         return;
     };
     logger.info("ibus", "Switched to ASR input method", .{});
@@ -98,7 +118,7 @@ pub fn run(
         logger.debug("ibus", "service not ready yet", .{});
     }
 
-    try runHotkeyLoop(allocator, io, environ, logger, cfg, keyboard_device, pipeline, debug);
+    try runHotkeyLoop(allocator, io, environ, logger, engine_cfg, keyboard_device, pipeline, debug);
 }
 
 const ServiceLoop = struct {
@@ -128,7 +148,7 @@ fn runHotkeyLoop(
     io: std.Io,
     environ: std.process.Environ,
     logger: output.Logger,
-    cfg: config.Config,
+    cfg: engine.Config,
     initial_keyboard_device: []const u8,
     pipeline: *postprocess.Pipeline,
     debug: bool,
@@ -164,7 +184,7 @@ fn runHotkeyLoop(
         if (event == .release) continue;
         output.keyEvent(logger, .press);
 
-        var callback_ctx = DoubaoCallbacks{
+        var callback_ctx = EngineCallbacks{
             .pipeline = pipeline,
         };
 
@@ -194,7 +214,7 @@ fn runHotkeyLoop(
         defer gate.deinit();
         gate.beginBuffering();
 
-        var session: doubao.StreamingSession = undefined;
+        var session: engine.Session = undefined;
         var has_session = false;
         defer if (has_session) session.deinit();
 
@@ -229,13 +249,13 @@ fn runHotkeyLoop(
             .logger = logger,
             .speaker_guard = &speaker_guard,
         };
+        const audio_params: mic.CaptureOptions = switch (cfg) {
+            .baidu => |value| .{ .sample_rate = value.sample_rate, .channels = value.channels, .frame_duration_ms = value.frame_duration_ms },
+            .doubao => |value| .{ .sample_rate = value.sample_rate, .channels = value.channels, .frame_duration_ms = value.frame_duration_ms },
+        };
         logger.debug("mic", "open", .{});
-        const capture_summary = mic.captureStreamUntilKeyRelease(io, keyboard.file, &keyboard.state, key.right_alt, .{
-            .sample_rate = cfg.sample_rate,
-            .channels = cfg.channels,
-            .frame_duration_ms = cfg.frame_duration_ms,
-        }, .{
-            .on_chunk = onDoubaoAudioChunk,
+        const capture_summary = mic.captureStreamUntilKeyRelease(io, keyboard.file, &keyboard.state, key.right_alt, audio_params, .{
+            .on_chunk = onEngineAudioChunk,
             .chunk_ctx = @ptrCast(&stream_state),
             .on_started = onCaptureStarted,
             .started_ctx = @ptrCast(&started_state),
@@ -246,7 +266,7 @@ fn runHotkeyLoop(
                 logger.info("app", "shutting down", .{});
                 return;
             }
-            logger.err("doubao", "capture failed: {s}", .{@errorName(err)});
+            logger.err(engineLabel(cfg), "capture failed: {s}", .{@errorName(err)});
             output.keyWait(logger);
             continue;
         };
@@ -259,27 +279,29 @@ fn runHotkeyLoop(
         logger.debug("mic", "{s}", .{close_message});
 
         if (!has_session) {
-            logger.err("doubao", "session unavailable", .{});
+            logger.err(engineLabel(cfg), "session unavailable", .{});
             output.keyWait(logger);
             continue;
         }
 
         if (stream_state.stream_error) |stream_err| {
-            logger.err("doubao", "stream failed: {s}", .{@errorName(stream_err)});
+            logger.err(engineLabel(cfg), "stream failed: {s}", .{@errorName(stream_err)});
             const finish = session.finishAfterStreamFailure();
             if (!handleFinish(allocator, pipeline, finish) and !session.hasFinalEvent()) {
-                const fallback = doubao.transcribePcmBytes(allocator, io, cfg, captured_audio.items, .{
-                    .pcm_path = "",
-                    .debug = debug,
-                }) catch |err| {
-                    logger.err("doubao", "fallback failed: {s}", .{@errorName(err)});
-                    output.keyWait(logger);
-                    continue;
-                };
-                if (fallback) |text| {
-                    _ = handleFinish(allocator, pipeline, .{ .text = text });
-                } else {
-                    logger.info("doubao", "session_finished", .{});
+                if (engineKind(cfg) == .doubao) {
+                    const fallback = doubao.transcribePcmBytes(allocator, io, cfg.doubao, captured_audio.items, .{
+                        .pcm_path = "",
+                        .debug = debug,
+                    }) catch |err| {
+                        logger.err("doubao", "fallback failed: {s}", .{@errorName(err)});
+                        output.keyWait(logger);
+                        continue;
+                    };
+                    if (fallback) |text| {
+                        _ = handleFinish(allocator, pipeline, .{ .text = text });
+                    } else {
+                        logger.info("doubao", "session_finished", .{});
+                    }
                 }
             }
             output.keyWait(logger);
@@ -287,7 +309,7 @@ fn runHotkeyLoop(
         }
 
         const finish = session.finish() catch |err| {
-            logger.err("doubao", "recognize failed: {s}", .{@errorName(err)});
+            logger.err(engineLabel(cfg), "recognize failed: {s}", .{@errorName(err)});
             output.keyWait(logger);
             continue;
         };
@@ -299,20 +321,29 @@ fn runHotkeyLoop(
 fn initSessionWithRetry(
     allocator: std.mem.Allocator,
     io: std.Io,
-    cfg: config.Config,
-    callback_ctx: *const DoubaoCallbacks,
+    cfg: engine.Config,
+    callback_ctx: *const EngineCallbacks,
     logger: output.Logger,
     debug: bool,
-) !doubao.StreamingSession {
+) !engine.Session {
+    if (engineKind(cfg) == .baidu) {
+        return engine.Session.init(allocator, io, cfg, .{
+            .debug = debug,
+            .on_interim = onEngineInterim,
+            .interim_ctx = @ptrCast(callback_ctx),
+            .on_final = onEngineFinal,
+            .final_ctx = @ptrCast(callback_ctx),
+        });
+    }
     var delay_ms: i64 = 1000;
     var attempt: usize = 0;
     while (true) {
         if (isShutdownRequested()) return error.Canceled;
-        if (doubao.StreamingSession.init(allocator, io, cfg, .{
+        if (engine.Session.init(allocator, io, cfg, .{
             .debug = debug,
-            .on_interim = onDoubaoInterim,
+            .on_interim = onEngineInterim,
             .interim_ctx = @ptrCast(callback_ctx),
-            .on_final = onDoubaoFinal,
+            .on_final = onEngineFinal,
             .final_ctx = @ptrCast(callback_ctx),
         })) |session| {
             return session;
@@ -334,6 +365,17 @@ fn initSessionWithRetry(
             return err;
         }
     }
+}
+
+fn engineKind(cfg: engine.Config) engine.Kind {
+    return switch (cfg) {
+        .baidu => .baidu,
+        .doubao => .doubao,
+    };
+}
+
+fn engineLabel(cfg: engine.Config) []const u8 {
+    return if (engineKind(cfg) == .baidu) "baidu" else "doubao";
 }
 
 const KeyboardReadFailureAction = enum {
@@ -457,7 +499,7 @@ fn drainKeyboardEvents(file: std.Io.File, state: *key.State, key_code: u16, logg
 fn handleFinish(
     allocator: std.mem.Allocator,
     pipeline: *postprocess.Pipeline,
-    finish: doubao.StreamFinish,
+    finish: engine.StreamFinish,
 ) bool {
     switch (finish) {
         .text => |text| {
@@ -467,34 +509,34 @@ fn handleFinish(
         },
         .err => |message| {
             defer allocator.free(message);
-            pipeline.logger.err("doubao", "recognize failed: {s}", .{message});
+            pipeline.logger.err(pipeline.provider, "recognize failed: {s}", .{message});
             return false;
         },
         .none => {
-            pipeline.logger.info("doubao", "session_finished", .{});
+            pipeline.logger.info(pipeline.provider, "session_finished", .{});
             return false;
         },
     }
 }
 
-fn onDoubaoInterim(ctx: ?*const anyopaque, text: []const u8) void {
+fn onEngineInterim(ctx: ?*const anyopaque, text: []const u8) void {
     if (text.len == 0) return;
-    const callbacks = @as(*const DoubaoCallbacks, @ptrCast(@alignCast(ctx orelse return)));
-    callbacks.pipeline.logger.info("doubao", "🎤 {s}", .{text});
+    const callbacks = @as(*const EngineCallbacks, @ptrCast(@alignCast(ctx orelse return)));
+    callbacks.pipeline.logger.info(callbacks.pipeline.provider, "🎤 {s}", .{text});
 }
 
-fn onDoubaoFinal(ctx: ?*const anyopaque, text: []const u8) void {
+fn onEngineFinal(ctx: ?*const anyopaque, text: []const u8) void {
     if (text.len == 0) return;
-    const callbacks = @as(*const DoubaoCallbacks, @ptrCast(@alignCast(ctx orelse return)));
+    const callbacks = @as(*const EngineCallbacks, @ptrCast(@alignCast(ctx orelse return)));
     callbacks.pipeline.submitFinal(text);
 }
 
-fn onDoubaoAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
+fn onEngineAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
     const state = @as(*StreamCaptureState, @ptrCast(@alignCast(ctx orelse return error.MissingChunkSession)));
-    try state.gate.handleChunk(chunk, @ptrCast(state), sendDoubaoAudioChunk);
+    try state.gate.handleChunk(chunk, @ptrCast(state), sendEngineAudioChunk);
 }
 
-fn sendDoubaoAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
+fn sendEngineAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
     const state = @as(*StreamCaptureState, @ptrCast(@alignCast(ctx orelse return error.MissingChunkSession)));
     if (state.captured_audio.items.len < max_captured_audio_bytes) {
         try state.captured_audio.appendSlice(state.allocator, chunk);
@@ -508,13 +550,13 @@ fn sendDoubaoAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
 
 const StreamCaptureState = struct {
     allocator: std.mem.Allocator,
-    session: ?*doubao.StreamingSession,
+    session: ?*engine.Session,
     captured_audio: *std.ArrayList(u8),
     gate: *audio_gate.AudioGate,
     stream_error: ?anyerror = null,
 };
 
-const DoubaoCallbacks = struct {
+const EngineCallbacks = struct {
     pipeline: *postprocess.Pipeline,
 };
 
@@ -528,12 +570,12 @@ const CaptureStartedState = struct {
     gate: *audio_gate.AudioGate,
     speaker_guard: *SpeakerMuteGuard,
     stream_state: *StreamCaptureState,
-    session: *doubao.StreamingSession,
+    session: *engine.Session,
     has_session: *bool,
     session_future_opt: *?SessionFuture,
     session_future_taken: *bool,
-    cfg: config.Config,
-    callback_ctx: *const DoubaoCallbacks,
+    cfg: engine.Config,
+    callback_ctx: *const EngineCallbacks,
     debug: bool,
 };
 
@@ -612,7 +654,7 @@ fn onCaptureStarted(ctx: ?*anyopaque) !void {
         };
     }
 
-    try state.gate.openAndFlush(@ptrCast(state.stream_state), sendDoubaoAudioChunk);
+    try state.gate.openAndFlush(@ptrCast(state.stream_state), sendEngineAudioChunk);
     state.logger.info("doubao", "🎤", .{});
 }
 

@@ -1,0 +1,12 @@
+{
+  "url": "wss://vse.baidu.com/ws_api",
+  "sample_rate": 16000,
+  "channels": 1,
+  "frame_duration_ms": 100,
+  "user": "baidu_pc",
+  "dev_key": "com.baidu.searchbox.fangyan",
+  "dev_pid": 8068,
+  "vad_type": 1,
+  "vad_mode": 0,
+  "enable_punctuation": true
+}

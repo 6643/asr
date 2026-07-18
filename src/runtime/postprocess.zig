@@ -10,6 +10,7 @@ pub const Pipeline = struct {
     logger: output.Logger,
     service: *ibus.gio_ibus.Service,
     cfg: *const config.Config,
+    provider: []const u8,
     rectify_queue: TextQueue,
     commit_queue: TextQueue,
     rectify_thread: ?std.Thread = null,
@@ -21,6 +22,7 @@ pub const Pipeline = struct {
         logger: output.Logger,
         service: *ibus.gio_ibus.Service,
         cfg: *const config.Config,
+        provider: []const u8,
     ) !*Pipeline {
         const pipeline = try allocator.create(Pipeline);
         pipeline.* = .{
@@ -29,6 +31,7 @@ pub const Pipeline = struct {
             .logger = logger,
             .service = service,
             .cfg = cfg,
+            .provider = provider,
             .rectify_queue = TextQueue.init(allocator, io),
             .commit_queue = TextQueue.init(allocator, io),
         };
@@ -63,12 +66,12 @@ pub const Pipeline = struct {
             const corrected = rectify.rectifyText(ctx.allocator, ctx.io, text, ctx.cfg.sami_token, ctx.cfg.device_id) catch null;
             if (corrected) |c| {
                 defer ctx.allocator.free(c);
-                ctx.logger.info("doubao", "🚀 {s} → {s}", .{ text, c });
+                ctx.logger.info(ctx.provider, "🚀 {s} → {s}", .{ text, c });
                 ctx.commit_queue.enqueueDup(c) catch |err| {
                     ctx.logger.err("postprocess", "enqueue commit failed: {s}", .{@errorName(err)});
                 };
             } else {
-                ctx.logger.info("doubao", "🚀 {s}", .{text});
+                ctx.logger.info(ctx.provider, "🚀 {s}", .{text});
                 ctx.commit_queue.enqueueDup(text) catch |err| {
                     ctx.logger.err("postprocess", "enqueue commit failed: {s}", .{@errorName(err)});
                 };

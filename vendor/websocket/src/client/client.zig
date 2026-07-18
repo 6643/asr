@@ -88,7 +88,7 @@ pub const Client = struct {
         }
 
         const host_name = try Io.net.HostName.init(config.host);
-        const net_stream = try host_name.connect(io, config.port, .{.mode = .stream});
+        const net_stream = try host_name.connect(io, config.port, .{ .mode = .stream });
 
         var tls_client: ?*TLSClient = null;
         if (config.tls) {
@@ -627,13 +627,14 @@ fn sendHandshake(path: []const u8, key: []const u8, buf: []u8, opts: *const Clie
     }
 
     {
-        const headers = " HTTP/1.1\r\ncontent-length: 0\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nconnection: upgrade\r\nsec-websocket-key: ";
+        const headers = " HTTP/1.1\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nconnection: upgrade\r\nsec-websocket-key: ";
         end = pos + headers.len;
         @memcpy(buf[pos..end], headers);
 
         pos = end;
         end = pos + key.len;
         @memcpy(buf[pos..end], key);
+        pos = end;
     }
 
     if (compression) {
@@ -642,13 +643,10 @@ fn sendHandshake(path: []const u8, key: []const u8, buf: []u8, opts: *const Clie
         pos = end;
         end = pos + permessage_deflate.len;
         @memcpy(buf[pos..end], permessage_deflate);
-    }
-
-    {
-        pos = end;
-        end = pos + 2;
-        @memcpy(buf[pos..end], "\r\n");
-        pos = end;
+    } else {
+        buf[pos] = '\r';
+        buf[pos + 1] = '\n';
+        pos += 2;
     }
 
     if (opts.headers) |extra_headers| {
@@ -663,9 +661,9 @@ fn sendHandshake(path: []const u8, key: []const u8, buf: []u8, opts: *const Clie
     }
     buf[pos] = '\r';
     buf[pos + 1] = '\n';
-
+    pos += 2;
     try stream.writeTimeout(opts.timeout_ms);
-    try stream.writeAll(buf[0 .. pos + 2]);
+    try stream.writeAll(buf[0..pos]);
     try stream.writeTimeout(0);
 }
 

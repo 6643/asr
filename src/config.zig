@@ -5,6 +5,8 @@ pub const default_aid = "401734";
 pub const default_user_agent =
     "com.bytedance.android.doubaoime/100102018 (Linux; U; Android 16; en_US; Pixel 7 Pro; Build/BP2A.250605.031.A2; Cronet/TTNetVersion:94cf429a 2025-11-17 QuicVersion:1f89f732 2025-05-08)";
 pub const default_credential_path = "config/doubao.json";
+pub const default_baidu_credential_path = "config/baidu.json";
+pub const default_baidu_ws_url = "wss://vse.baidu.com/ws_api";
 
 pub const Credentials = struct {
     device_id: []const u8 = "",
@@ -33,6 +35,34 @@ pub const Config = struct {
     sami_token: []const u8 = "",
 };
 
+pub const AudioParams = struct {
+    sample_rate: u32 = 16000,
+    channels: u16 = 1,
+    frame_duration_ms: u16 = 100,
+};
+
+pub const BaiduConfig = struct {
+    url: []const u8 = "",
+    sample_rate: u32 = 16000,
+    channels: u16 = 1,
+    frame_duration_ms: u16 = 100,
+    user: []const u8 = "baidu_pc",
+    dev_key: []const u8 = "com.baidu.searchbox.fangyan",
+    dev_pid: u32 = 8068,
+    vad_type: u32 = 1,
+    vad_mode: u32 = 0,
+    enable_punctuation: bool = true,
+    owns_url: bool = false,
+    owns_user: bool = false,
+    owns_dev_key: bool = false,
+
+    pub fn deinit(cfg: BaiduConfig, allocator: std.mem.Allocator) void {
+        if (cfg.owns_url) allocator.free(cfg.url);
+        if (cfg.owns_user) allocator.free(cfg.user);
+        if (cfg.owns_dev_key) allocator.free(cfg.dev_key);
+    }
+};
+
 pub fn withCredentials(base: Config, creds: Credentials) Config {
     var cfg = base;
     if (cfg.device_id.len == 0) cfg.device_id = creds.device_id;
@@ -41,10 +71,19 @@ pub fn withCredentials(base: Config, creds: Credentials) Config {
     return cfg;
 }
 
-pub fn frameBytes(cfg: Config) u32 {
-    const sample_rate = if (cfg.sample_rate == 0) @as(u32, 16000) else cfg.sample_rate;
-    const channels = if (cfg.channels == 0) @as(u16, 1) else cfg.channels;
-    const duration = if (cfg.frame_duration_ms == 0) @as(u16, 100) else cfg.frame_duration_ms;
+pub fn frameBytes(cfg: anytype) u32 {
+    const sample_rate = if (@hasField(@TypeOf(cfg), "sample_rate") and cfg.sample_rate != 0)
+        cfg.sample_rate
+    else
+        @as(u32, 16000);
+    const channels = if (@hasField(@TypeOf(cfg), "channels") and cfg.channels != 0)
+        cfg.channels
+    else
+        @as(u16, 1);
+    const duration = if (@hasField(@TypeOf(cfg), "frame_duration_ms") and cfg.frame_duration_ms != 0)
+        cfg.frame_duration_ms
+    else
+        @as(u16, 100);
     return (sample_rate * duration / 1000) * channels * 2;
 }
 
@@ -88,6 +127,58 @@ fn dupeJsonString(allocator: std.mem.Allocator, value: ?std.json.Value) ![]const
     const v = value orelse return "";
     if (v != .string) return "";
     return allocator.dupe(u8, v.string);
+}
+
+pub fn loadBaiduConfig(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !BaiduConfig {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => try std.Io.Dir.cwd().readFileAlloc(io, "../config/baidu.json", allocator, .limited(1024 * 1024)),
+        else => |e| return e,
+    };
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    var cfg: BaiduConfig = .{};
+    if (obj.get("url")) |v| {
+        if (v == .string and v.string.len > 0) {
+            cfg.url = try allocator.dupe(u8, v.string);
+            cfg.owns_url = true;
+        }
+    }
+    if (obj.get("sample_rate")) |v| {
+        if (v == .integer) cfg.sample_rate = @intCast(v.integer);
+    }
+    if (obj.get("channels")) |v| {
+        if (v == .integer) cfg.channels = @intCast(v.integer);
+    }
+    if (obj.get("frame_duration_ms")) |v| {
+        if (v == .integer) cfg.frame_duration_ms = @intCast(v.integer);
+    }
+    if (obj.get("user")) |v| {
+        if (v == .string and v.string.len > 0) {
+            cfg.user = try allocator.dupe(u8, v.string);
+            cfg.owns_user = true;
+        }
+    }
+    if (obj.get("dev_key")) |v| {
+        if (v == .string and v.string.len > 0) {
+            cfg.dev_key = try allocator.dupe(u8, v.string);
+            cfg.owns_dev_key = true;
+        }
+    }
+    if (obj.get("dev_pid")) |v| {
+        if (v == .integer) cfg.dev_pid = @intCast(v.integer);
+    }
+    if (obj.get("vad_type")) |v| {
+        if (v == .integer) cfg.vad_type = @intCast(v.integer);
+    }
+    if (obj.get("vad_mode")) |v| {
+        if (v == .integer) cfg.vad_mode = @intCast(v.integer);
+    }
+    if (obj.get("enable_punctuation")) |v| {
+        if (v == .bool) cfg.enable_punctuation = v.bool;
+    }
+    return cfg;
 }
 
 fn hostFromUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {

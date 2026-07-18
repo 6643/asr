@@ -31,6 +31,19 @@ pub fn main(init: std.process.Init) !void {
             return;
         },
         .once_pcm => |pcm_path| {
+            if (opts.engine == .baidu) {
+                var cfg = try asr.config.loadBaiduConfig(allocator, init.io, asr.config.default_baidu_credential_path);
+                defer cfg.deinit(allocator);
+                const text = try asr.baidu.client.transcribePcmFile(allocator, init.io, cfg, .{
+                    .pcm_path = pcm_path,
+                    .debug = opts.debug,
+                });
+                if (text) |value| {
+                    defer allocator.free(value);
+                    try stdout.print("{s}\n", .{value});
+                }
+                return;
+            }
             var cfg: asr.config.Config = .{};
             var creds = try asr.config.loadCredentials(allocator, init.io, cfg.credential_path);
             defer creds.deinit(allocator);
@@ -67,7 +80,10 @@ pub fn main(init: std.process.Init) !void {
         },
         .app => {
             try stdout.flush();
-            try asr.runtime.app.run(allocator, init.io, init.minimal.environ, opts.debug);
+            try asr.runtime.app.run(allocator, init.io, init.minimal.environ, opts.debug, switch (opts.engine) {
+                .baidu => .baidu,
+                .doubao => .doubao,
+            });
             return;
         },
     }
