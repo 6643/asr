@@ -397,6 +397,10 @@ pub const StreamingSession = struct {
             },
             .session_finish => session.recordEvent(.{ .kind = .session_finished }),
             .err => {
+                if (response.err_no == -4) {
+                    session.recordEvent(.{ .kind = .session_finished });
+                    return;
+                }
                 const message = response.error_message;
                 response.error_message = "";
                 session.recordEvent(.{ .kind = .err, .message = message });
@@ -855,6 +859,28 @@ test "final text does not mask later error" {
         },
         else => return error.TestExpectedError,
     }
+}
+
+test "no effective speech finishes without an error" {
+    const allocator = std.testing.allocator;
+    var session: StreamingSession = undefined;
+    session.allocator = allocator;
+    session.io = std.testing.io;
+    session.state_mutex = .init;
+    session.state_cond = .init;
+    session.state = initStreamingResultState();
+    defer session.state.deinit(allocator);
+
+    var response = proto.ServerMessage{
+        .kind = .err,
+        .error_message = try allocator.dupe(u8, "asr server not find effective speech[info:-4]"),
+        .err_no = -4,
+    };
+    defer response.deinit(allocator);
+
+    session.handleResponse(&response);
+    try std.testing.expectEqual(StreamingResolution.session_finished, currentStreamingResolution(session.state));
+    try std.testing.expect(session.state.error_message == null);
 }
 
 test "suppresses read loop warning after local stop request" {

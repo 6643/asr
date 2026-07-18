@@ -640,7 +640,7 @@ fn onCaptureStarted(ctx: ?*anyopaque) !void {
         var bell_future = bell_future_value;
         resolveSession(state) catch |err| {
             _ = bell_future.await(state.io);
-            state.logger.err("doubao", "session failed: {s}", .{@errorName(err)});
+            state.logger.err(engineLabel(state.cfg), "session failed: {s}", .{@errorName(err)});
             return err;
         };
         _ = bell_future.await(state.io);
@@ -649,13 +649,13 @@ fn onCaptureStarted(ctx: ?*anyopaque) !void {
         playBellTask(state.allocator, state.io);
         state.speaker_guard.muteAfterPrompt();
         resolveSession(state) catch |err| {
-            state.logger.err("doubao", "session failed: {s}", .{@errorName(err)});
+            state.logger.err(engineLabel(state.cfg), "session failed: {s}", .{@errorName(err)});
             return err;
         };
     }
 
     try state.gate.openAndFlush(@ptrCast(state.stream_state), sendEngineAudioChunk);
-    state.logger.info("doubao", "🎤", .{});
+    state.logger.info(engineLabel(state.cfg), "🎤", .{});
 }
 
 fn onCaptureStopped(ctx: ?*anyopaque) void {
