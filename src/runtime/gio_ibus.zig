@@ -389,15 +389,21 @@ fn commitTextStatus(service: *Service, text: []const u8, flush: bool) []const u8
     const eligibility = commitEligibilityStatus(service, text);
     if (!std.mem.startsWith(u8, eligibility, "OK ")) return eligibility;
 
-    service.mutex.lockUncancelable(service.io);
-    const engine = service.state.active_engine.?;
-    service.mutex.unlock(service.io);
+    // Copy engine object_path under lock so dropAllEngines in another thread
+    // cannot free the path while we are emitting the signal below (use-after-free).
+    const path = blk: {
+        service.mutex.lockUncancelable(service.io);
+        defer service.mutex.unlock(service.io);
+        const engine = service.state.active_engine orelse return "ERR engine_not_created";
+        break :blk service.allocator.dupe(u8, engine.object_path) catch return "ERR alloc_failed";
+    };
+    defer service.allocator.free(path);
 
     const raw_parameters = createIbusTextSignalParameters(&service.libs, text) catch return "ERR service_unavailable";
     const parameters = gio.refSink(&service.libs, raw_parameters) catch return "ERR service_unavailable";
     defer gio.unrefVariant(&service.libs, parameters);
 
-    gio.emitSignal(&service.libs, service.connection, engine.object_path, engine_iface, commit_text_signal, parameters) catch return "ERR service_unavailable";
+    gio.emitSignal(&service.libs, service.connection, path, engine_iface, commit_text_signal, parameters) catch return "ERR service_unavailable";
     if (flush) {
         gio.flushConnection(&service.libs, service.connection) catch return "ERR service_unavailable";
         return "OK committed";

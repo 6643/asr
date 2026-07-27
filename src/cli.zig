@@ -25,7 +25,7 @@ pub const Options = struct {
 pub fn optionsFromArgs(args: []const [:0]const u8) Options {
     return .{
         .mode = modeFromArgs(args),
-        .engine = if (hasArg(args, "--doubao")) .doubao else .baidu,
+        .engine = if (hasArg(args, "--baidu")) .baidu else .doubao,
         .debug = hasArg(args, "--debug"),
     };
 }
@@ -77,12 +77,12 @@ test "recognizes debug flag" {
     try std.testing.expect(optionsFromArgs(&args).debug);
 }
 
-test "defaults to baidu engine" {
+test "defaults to doubao engine" {
     const args = [_][:0]const u8{"asr"};
-    try std.testing.expectEqual(Engine.baidu, optionsFromArgs(&args).engine);
+    try std.testing.expectEqual(Engine.doubao, optionsFromArgs(&args).engine);
 }
 
-test "recognizes explicit doubao engine" {
-    const args = [_][:0]const u8{ "asr", "--doubao" };
-    try std.testing.expectEqual(Engine.doubao, optionsFromArgs(&args).engine);
+test "recognizes explicit baidu engine" {
+    const args = [_][:0]const u8{ "asr", "--baidu" };
+    try std.testing.expectEqual(Engine.baidu, optionsFromArgs(&args).engine);
 }

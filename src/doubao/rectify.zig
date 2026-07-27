@@ -219,11 +219,11 @@ fn parseAndApply(allocator: std.mem.Allocator, text: []const u8, response_body: 
 fn codePointToByteOffset(text: []const u8, codepoint_index: usize) !usize {
     var cp_count: usize = 0;
     var it = (std.unicode.Utf8View.init(text) catch return error.InvalidUtf8).iterator();
-    while (it.nextCodepoint()) |_| {
-        if (cp_count == codepoint_index) return it.i;
+    while (cp_count < codepoint_index) {
+        _ = it.nextCodepoint() orelse return error.IndexOutOfBounds;
         cp_count += 1;
     }
-    return error.IndexOutOfBounds;
+    return it.i;
 }
 
 test "request timeout constant is short enough for commit path" {
