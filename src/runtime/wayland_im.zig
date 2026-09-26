@@ -95,6 +95,77 @@ pub fn readString(payload: []const u8, offset: *usize) ?[]const u8 {
     return bytes[0 .. bytes.len - 1];
 }
 
+pub const Client = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    mutex: std.Io.Mutex = .init,
+    next_id: u32 = 2,
+    registry_id: u32 = 0,
+    callback_id: u32 = 0,
+    seat_id: u32 = 0,
+    manager_id: u32 = 0,
+    im_id: u32 = 0,
+    seat_global_name: u32 = 0,
+    manager_global_name: u32 = 0,
+    done_count: u32 = 0,
+    active: bool = false,
+    pending_active: bool = false,
+    sync_done: bool = false,
+    dead: bool = false,
+    read_buf: std.ArrayList(u8) = .empty,
+
+    pub fn allocId(self: *Client) u32 {
+        const id = self.next_id;
+        self.next_id += 1;
+        return id;
+    }
+
+    pub fn applyMessage(self: *Client, object_id: u32, opcode: u16, payload: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (object_id == 1) {
+            if (opcode == 0) {
+                self.dead = true;
+                return error.DisplayError;
+            }
+            return; // delete_id
+        }
+        if (object_id == self.registry_id and opcode == 0) {
+            const name = readU32(payload) orelse return;
+            var offset: usize = 4;
+            const interface = readString(payload, &offset) orelse return;
+            if (std.mem.eql(u8, interface, "wl_seat")) self.seat_global_name = name;
+            if (std.mem.eql(u8, interface, "zwp_input_method_manager_v2")) self.manager_global_name = name;
+            return;
+        }
+        if (object_id == self.callback_id and opcode == 0) {
+            self.sync_done = true;
+            return;
+        }
+        if (object_id == self.im_id) {
+            switch (opcode) {
+                0 => self.pending_active = true,
+                1 => self.pending_active = false,
+                5 => {
+                    self.done_count += 1;
+                    self.active = self.pending_active;
+                },
+                6 => self.dead = true,
+                else => {},
+            }
+            return;
+        }
+    }
+
+    pub fn isActive(self: *Client) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.active;
+    }
+};
+
 test "appendString pads length-prefixed strings to four bytes" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
@@ -142,4 +213,67 @@ test "readString returns unterminated-safe slices" {
     const truncated = [_]u8{ 0x08, 0x00, 0x00, 0x00, 'w', 'l' };
     offset = 0;
     try std.testing.expect(readString(&truncated, &offset) == null);
+}
+
+fn testClient() Client {
+    return .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .stream = undefined,
+        .registry_id = 2,
+        .callback_id = 3,
+        .seat_id = 4,
+        .manager_id = 5,
+        .im_id = 6,
+    };
+}
+
+test "done events advance serial and apply pending active state" {
+    var client = testClient();
+    try client.applyMessage(6, 0, &.{}); // activate
+    try std.testing.expect(!client.isActive());
+    try client.applyMessage(6, 5, &.{}); // done
+    try std.testing.expect(client.isActive());
+    try std.testing.expectEqual(@as(u32, 1), client.done_count);
+    try client.applyMessage(6, 1, &.{}); // deactivate
+    try client.applyMessage(6, 5, &.{}); // done
+    try std.testing.expect(!client.isActive());
+    try std.testing.expectEqual(@as(u32, 2), client.done_count);
+}
+
+test "unavailable marks client dead" {
+    var client = testClient();
+    try client.applyMessage(6, 6, &.{});
+    try std.testing.expect(client.dead);
+}
+
+test "display error is reported and marks dead" {
+    var client = testClient();
+    const payload = [_]u8{ 0, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 'o', 'o', 'p', 's', 0, 0, 0, 0 };
+    try std.testing.expectError(error.DisplayError, client.applyMessage(1, 0, &payload));
+    try std.testing.expect(client.dead);
+}
+
+test "registry globals record seat and manager names" {
+    var client = testClient();
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(std.testing.allocator);
+    try payload.appendSlice(std.testing.allocator, &.{ 40, 0, 0, 0 });
+    try appendString(std.testing.allocator, &payload, "wl_seat");
+    try payload.appendSlice(std.testing.allocator, &.{ 9, 0, 0, 0 });
+    try client.applyMessage(2, 0, payload.items);
+    try std.testing.expectEqual(@as(u32, 40), client.seat_global_name);
+    payload.clearRetainingCapacity();
+    try payload.appendSlice(std.testing.allocator, &.{ 24, 0, 0, 0 });
+    try appendString(std.testing.allocator, &payload, "zwp_input_method_manager_v2");
+    try payload.appendSlice(std.testing.allocator, &.{ 1, 0, 0, 0 });
+    try client.applyMessage(2, 0, payload.items);
+    try std.testing.expectEqual(@as(u32, 24), client.manager_global_name);
+}
+
+test "identifiers are allocated strictly sequentially" {
+    var client = testClient();
+    try std.testing.expectEqual(@as(u32, 2), client.allocId());
+    try std.testing.expectEqual(@as(u32, 3), client.allocId());
+    try std.testing.expectEqual(@as(u32, 4), client.allocId());
 }
