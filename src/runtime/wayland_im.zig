@@ -55,6 +55,27 @@ pub fn encodeCommit(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), im_id
     try appendMessage(allocator, buf, im_id, 3, &payload);
 }
 
+pub fn nextChunk(text: []const u8, start: usize) []const u8 {
+    var end = @min(start + max_commit_bytes, text.len);
+    if (end < text.len) {
+        while (end > start and (text[end] & 0xC0) == 0x80) end -= 1;
+    }
+    return text[start..end];
+}
+
+pub fn buildCommitMessages(allocator: std.mem.Allocator, im_id: u32, serial: u32, text: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var start: usize = 0;
+    while (start < text.len) {
+        const chunk = nextChunk(text, start);
+        try encodeCommitString(allocator, &buf, im_id, chunk);
+        try encodeCommit(allocator, &buf, im_id, serial);
+        start += chunk.len;
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
 pub fn extractMessage(buf: *const std.ArrayList(u8)) ?Message {
     if (buf.items.len < header_size) return null;
     const object_id = std.mem.readInt(u32, buf.items[0..4], .little);
@@ -196,6 +217,21 @@ pub const Client = struct {
         }
     }
 
+    pub fn commit(self: *Client, text: []const u8) []const u8 {
+        if (std.mem.trim(u8, text, " \t\r\n").len == 0) return "ERR empty_response";
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.dead) return "ERR wayland_unavailable";
+        if (!self.active) return "ERR no_text_input";
+        const bytes = buildCommitMessages(self.allocator, self.im_id, self.done_count, text) catch return "ERR alloc_failed";
+        defer self.allocator.free(bytes);
+        writeAll(self, bytes) catch {
+            self.dead = true;
+            return "ERR wayland_unavailable";
+        };
+        return "OK committed";
+    }
+
     pub fn deinit(self: *Client) void {
         if (!self.dead) {
             var out: std.ArrayList(u8) = .empty;
@@ -240,14 +276,14 @@ fn writeAll(client: *Client, bytes: []const u8) ConnectError!void {
     var written: usize = 0;
     while (written < bytes.len) {
         const rc = std.posix.system.write(client.stream.socket.handle, bytes.ptr + written, bytes.len - written);
-        switch (std.posix.errno(rc)) {
-            .SUCCESS => {
-                if (rc == 0) return error.ConnectionFailed;
-                written += rc;
-            },
-            .INTR => continue,
-            else => return error.ConnectionFailed,
+        if (rc < 0) {
+            switch (std.posix.errno(@as(usize, @bitCast(rc)))) {
+                .INTR => continue,
+                else => return error.ConnectionFailed,
+            }
         }
+        if (rc == 0) return error.ConnectionFailed;
+        written += @intCast(rc);
     }
 }
 
@@ -473,4 +509,35 @@ test "default display name is used when unset" {
     const path = try resolveSocketPath(std.testing.allocator, .{ .block = block });
     defer std.testing.allocator.free(path);
     try std.testing.expectEqualStrings("/run/user/1000/wayland-0", path);
+}
+
+test "nextChunk does not split utf8 characters" {
+    const text = ("a" ** 3999) ++ "你" ++ "b";
+    const first = nextChunk(text, 0);
+    try std.testing.expectEqual(@as(usize, 3999), first.len);
+    const second = nextChunk(text, first.len);
+    try std.testing.expectEqualStrings("你b", second);
+    try std.testing.expectEqual(@as(usize, text.len), first.len + second.len);
+}
+
+test "nextChunk keeps exactly 4000 bytes as one chunk" {
+    const text = "a" ** 4000;
+    try std.testing.expectEqual(@as(usize, 4000), nextChunk(text, 0).len);
+}
+
+test "buildCommitMessages emits commit_string plus commit per chunk" {
+    const bytes = try buildCommitMessages(std.testing.allocator, 5, 3, "hi");
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x03, 0x00, 0x00, 0x00, 'h', 'i', 0x00, 0x00,
+        0x05, 0x00, 0x00, 0x00, 0x03, 0x00, 0x0c, 0x00, 0x03, 0x00, 0x00, 0x00,
+    }, bytes);
+}
+
+test "commit rejects empty and inactive states" {
+    var client = testClient();
+    try std.testing.expectEqualStrings("ERR empty_response", client.commit("   "));
+    try std.testing.expectEqualStrings("ERR no_text_input", client.commit("hi"));
+    client.dead = true;
+    try std.testing.expectEqualStrings("ERR wayland_unavailable", client.commit("hi"));
 }
