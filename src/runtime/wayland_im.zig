@@ -164,7 +164,161 @@ pub const Client = struct {
         defer self.mutex.unlock(self.io);
         return self.active;
     }
+
+    pub fn pump(self: *Client, timeout_ms: i32) !void {
+        var fds = [_]std.posix.pollfd{.{ .fd = self.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, timeout_ms) catch return error.ConnectionFailed;
+        if (ready == 0) return;
+
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const rc = std.posix.system.read(self.stream.socket.handle, &buf, buf.len);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) {
+                        self.dead = true;
+                        return error.ConnectionFailed;
+                    }
+                    self.read_buf.appendSlice(self.allocator, buf[0..rc]) catch return error.ConnectionFailed;
+                },
+                .INTR => continue,
+                .AGAIN => break,
+                else => {
+                    self.dead = true;
+                    return error.ConnectionFailed;
+                },
+            }
+        }
+
+        while (extractMessage(&self.read_buf)) |message| {
+            try self.applyMessage(message.object_id, message.opcode, message.payload);
+            consumeMessage(&self.read_buf, message.total_size);
+        }
+    }
+
+    pub fn deinit(self: *Client) void {
+        if (!self.dead) {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(self.allocator);
+            appendMessage(self.allocator, &out, self.im_id, 6, &.{}) catch {};
+            appendMessage(self.allocator, &out, self.manager_id, 1, &.{}) catch {};
+            writeAll(self, out.items) catch {};
+        }
+        destroyConnection(self);
+    }
 };
+
+pub const listen_display_default = "wayland-0";
+pub const setup_timeout_ms: i64 = 2000;
+pub const unavailable_probe_ms: i64 = 200;
+
+pub const ConnectError = error{
+    MissingRuntimeDir,
+    ConnectionFailed,
+    InputMethodUnavailable,
+    SetupTimeout,
+    DisplayError,
+    OutOfMemory,
+};
+
+fn le32(value: u32) [4]u8 {
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, value, .little);
+    return bytes;
+}
+
+pub fn resolveSocketPath(allocator: std.mem.Allocator, environ: std.process.Environ) ConnectError![]u8 {
+    if (std.process.Environ.getPosix(environ, "WAYLAND_DISPLAY")) |display| {
+        if (std.mem.startsWith(u8, display, "/")) return try allocator.dupe(u8, display);
+    }
+    const runtime = std.process.Environ.getPosix(environ, "XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDir;
+    const display = std.process.Environ.getPosix(environ, "WAYLAND_DISPLAY") orelse listen_display_default;
+    return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ runtime, display });
+}
+
+fn writeAll(client: *Client, bytes: []const u8) ConnectError!void {
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const rc = std.posix.system.write(client.stream.socket.handle, bytes.ptr + written, bytes.len - written);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return error.ConnectionFailed;
+                written += rc;
+            },
+            .INTR => continue,
+            else => return error.ConnectionFailed,
+        }
+    }
+}
+
+fn appendBind(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    registry_id: u32,
+    name: u32,
+    interface: []const u8,
+    version: u32,
+    new_id: u32,
+) !void {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(allocator);
+    try payload.appendSlice(allocator, &le32(name));
+    try appendString(allocator, &payload, interface);
+    try payload.appendSlice(allocator, &le32(version));
+    try payload.appendSlice(allocator, &le32(new_id));
+    try appendMessage(allocator, buf, registry_id, 0, payload.items);
+}
+
+fn destroyConnection(client: *Client) void {
+    client.stream.close(client.io);
+    client.read_buf.deinit(client.allocator);
+    client.allocator.destroy(client);
+}
+
+pub fn connect(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ) ConnectError!*Client {
+    const path = try resolveSocketPath(allocator, environ);
+    defer allocator.free(path);
+    const address = std.Io.net.UnixAddress.init(path) catch return error.ConnectionFailed;
+    const stream = address.connect(io) catch return error.ConnectionFailed;
+    const client = allocator.create(Client) catch return error.OutOfMemory;
+    client.* = .{ .allocator = allocator, .io = io, .stream = stream };
+    errdefer destroyConnection(client);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    client.registry_id = client.allocId();
+    try appendMessage(allocator, &out, 1, 1, &le32(client.registry_id)); // get_registry
+    client.callback_id = client.allocId();
+    try appendMessage(allocator, &out, 1, 0, &le32(client.callback_id)); // sync
+    try writeAll(client, out.items);
+
+    var elapsed: i64 = 0;
+    while (!client.sync_done and elapsed <= setup_timeout_ms) : (elapsed += 10) {
+        try client.pump(10);
+    }
+    if (!client.sync_done) return error.SetupTimeout;
+    if (client.seat_global_name == 0 or client.manager_global_name == 0) return error.InputMethodUnavailable;
+
+    out.clearRetainingCapacity();
+    client.seat_id = client.allocId();
+    try appendBind(allocator, &out, client.registry_id, client.seat_global_name, "wl_seat", 1, client.seat_id);
+    client.manager_id = client.allocId();
+    try appendBind(allocator, &out, client.registry_id, client.manager_global_name, "zwp_input_method_manager_v2", 1, client.manager_id);
+    client.im_id = client.allocId();
+    var im_payload: [8]u8 = undefined;
+    std.mem.writeInt(u32, im_payload[0..4], client.seat_id, .little);
+    std.mem.writeInt(u32, im_payload[4..8], client.im_id, .little);
+    try appendMessage(allocator, &out, client.manager_id, 0, &im_payload);
+    try writeAll(client, out.items);
+
+    elapsed = 0;
+    while (!client.dead and client.done_count == 0 and elapsed <= unavailable_probe_ms) : (elapsed += 10) {
+        try client.pump(10);
+    }
+    if (client.dead) return error.InputMethodUnavailable;
+    return client;
+}
 
 test "appendString pads length-prefixed strings to four bytes" {
     var buf: std.ArrayList(u8) = .empty;
@@ -276,4 +430,47 @@ test "identifiers are allocated strictly sequentially" {
     try std.testing.expectEqual(@as(u32, 2), client.allocId());
     try std.testing.expectEqual(@as(u32, 3), client.allocId());
     try std.testing.expectEqual(@as(u32, 4), client.allocId());
+}
+
+test "resolves socket path from runtime dir and display" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("XDG_RUNTIME_DIR", "/run/user/1000");
+    try env_map.put("WAYLAND_DISPLAY", "wayland-1");
+    const block = try env_map.createPosixBlock(std.testing.allocator, .{});
+    defer block.deinit(std.testing.allocator);
+    const path = try resolveSocketPath(std.testing.allocator, .{ .block = block });
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("/run/user/1000/wayland-1", path);
+}
+
+test "absolute wayland display path wins over runtime dir" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("WAYLAND_DISPLAY", "/tmp/wayland-test");
+    const block = try env_map.createPosixBlock(std.testing.allocator, .{});
+    defer block.deinit(std.testing.allocator);
+    const path = try resolveSocketPath(std.testing.allocator, .{ .block = block });
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("/tmp/wayland-test", path);
+}
+
+test "missing runtime dir fails" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("WAYLAND_DISPLAY", "wayland-1");
+    const block = try env_map.createPosixBlock(std.testing.allocator, .{});
+    defer block.deinit(std.testing.allocator);
+    try std.testing.expectError(error.MissingRuntimeDir, resolveSocketPath(std.testing.allocator, .{ .block = block }));
+}
+
+test "default display name is used when unset" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("XDG_RUNTIME_DIR", "/run/user/1000");
+    const block = try env_map.createPosixBlock(std.testing.allocator, .{});
+    defer block.deinit(std.testing.allocator);
+    const path = try resolveSocketPath(std.testing.allocator, .{ .block = block });
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("/run/user/1000/wayland-0", path);
 }
