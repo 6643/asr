@@ -28,7 +28,7 @@
 ## 架构与组件边界
 
 - 新增 `src/runtime/wayland_im.zig`：
-  - `Client.connect(allocator, io, environ) !*Client`：解析 `WAYLAND_DISPLAY`（默认 `wayland-0`）与 `XDG_RUNTIME_DIR`，连接 AF_UNIX socket；`get_registry` + `sync`；在 2 秒内收集 globals（超时 → `error.SetupTimeout`）；缺少 `wl_seat` 或 `zwp_input_method_manager_v2` → `error.InputMethodUnavailable`。随后顺序绑定 seat（v1）与 manager（v1），`get_input_method(seat)`；在同样 2 秒超时内等待首个 `done` 或 `unavailable`（超时 → `error.SetupTimeout`）；收到 `unavailable` → `error.InputMethodUnavailable`。
+  - `Client.connect(allocator, io, environ) !*Client`：解析 `WAYLAND_DISPLAY`（默认 `wayland-0`）与 `XDG_RUNTIME_DIR`，连接 AF_UNIX socket；`get_registry` + `sync`；在 2 秒内收集 globals（超时 → `error.SetupTimeout`）；缺少 `wl_seat` 或 `zwp_input_method_manager_v2` → `error.InputMethodUnavailable`。随后顺序绑定 seat（v1）与 manager（v1），`get_input_method(seat)`；随后最多 200ms 内 pump 事件以捕获立即到达的 `unavailable`（收到 → `error.InputMethodUnavailable`）；若期间无任何事件（超时）视为绑定成功并继续，后续事件由事件循环处理。
   - `dispatch() !void`：非阻塞读取并解析消息，处理 `wl_display.error`、`wl_display.delete_id`、registry/seat 事件（忽略）、`activate`/`deactivate`/`done`/`unavailable` 与其余 IM 事件（记录后忽略）。`done` 使 `done_count += 1` 并应用 pending 的 active 状态。
   - `commit(text) []const u8`：返回现有 `"OK …"` / `"ERR …"` 字符串。空白文本 → `ERR empty_response`；连接失效/`unavailable` → `ERR wayland_unavailable`；当前 inactive → `ERR no_text_input`；否则按 UTF-8 边界切分为 ≤4000 字节的分段，逐段发送 `commit_string` + `commit(done_count)`，写入失败（EPIPE/EOF）→ 标记失效并返回 `ERR wayland_unavailable`。
   - object id 由 `nextId()` 严格递增分配（从 2 开始），不跳号、不复用。
@@ -62,7 +62,7 @@
 
 ## 错误处理
 
-- 连接失败、缺少协议 global、setup 超时、立即 `unavailable`：`connect` 返回错误；非强制模式下回退 IBus，强制模式下进程报错退出。
+- 连接失败、缺少协议 global、registry 收集超时、立即 `unavailable`：`connect` 返回错误；非强制模式下回退 IBus，强制模式下进程报错退出。
 - `wl_display.error` 或 socket EOF/EPIPE：标记 `dead`，事件循环记录一次错误后退出；后续提交返回 `ERR wayland_unavailable`。
 - `unavailable` 事件：与 `dead` 同等处理。
 - inactive 时提交：丢弃并向 commit 队列返回 `ERR no_text_input`，日志明确标注文本未送达。
