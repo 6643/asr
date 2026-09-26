@@ -2,13 +2,33 @@ const std = @import("std");
 const config = @import("../config.zig");
 const rectify = @import("../doubao/rectify.zig");
 const ibus = @import("ibus.zig");
+const wayland_im = @import("wayland_im.zig");
 const output = @import("output.zig");
+
+pub const CommitBackend = union(enum) {
+    ibus: *ibus.gio_ibus.Service,
+    wayland: *wayland_im.Client,
+
+    pub fn commit(backend: CommitBackend, text: []const u8) []const u8 {
+        return switch (backend) {
+            .ibus => |service| service.commitStatus(text),
+            .wayland => |client| client.commit(text),
+        };
+    }
+
+    pub fn domain(backend: CommitBackend) []const u8 {
+        return switch (backend) {
+            .ibus => "ibus",
+            .wayland => "wayland",
+        };
+    }
+};
 
 pub const Pipeline = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     logger: output.Logger,
-    service: *ibus.gio_ibus.Service,
+    backend: CommitBackend,
     cfg: *const config.Config,
     provider: []const u8,
     rectify_queue: TextQueue,
@@ -20,7 +40,7 @@ pub const Pipeline = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         logger: output.Logger,
-        service: *ibus.gio_ibus.Service,
+        backend: CommitBackend,
         cfg: *const config.Config,
         provider: []const u8,
     ) !*Pipeline {
@@ -29,7 +49,7 @@ pub const Pipeline = struct {
             .allocator = allocator,
             .io = io,
             .logger = logger,
-            .service = service,
+            .backend = backend,
             .cfg = cfg,
             .provider = provider,
             .rectify_queue = TextQueue.init(allocator, io),
@@ -82,11 +102,11 @@ pub const Pipeline = struct {
     fn commitWorker(ctx: *Pipeline) void {
         while (ctx.commit_queue.pop()) |text| {
             defer ctx.allocator.free(text);
-            const status = ctx.service.commitStatus(text);
+            const status = ctx.backend.commit(text);
             if (std.mem.startsWith(u8, status, "OK ")) {
-                ctx.logger.info("ibus", "✅", .{});
+                ctx.logger.info(ctx.backend.domain(), "✅", .{});
             } else {
-                ctx.logger.err("ibus", "❌ {s}", .{status});
+                ctx.logger.err(ctx.backend.domain(), "❌ {s}", .{status});
             }
         }
     }
@@ -163,4 +183,9 @@ test "queue preserves fifo order" {
 
     try std.testing.expectEqualStrings("one", first.?);
     try std.testing.expectEqualStrings("two", second.?);
+}
+
+test "commit backend reports provider domain" {
+    try std.testing.expectEqualStrings("ibus", (CommitBackend{ .ibus = undefined }).domain());
+    try std.testing.expectEqualStrings("wayland", (CommitBackend{ .wayland = undefined }).domain());
 }

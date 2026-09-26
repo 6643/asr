@@ -85,7 +85,7 @@ pub fn run(
         allocator.destroy(service);
     }
 
-    var pipeline = try postprocess.Pipeline.start(allocator, io, logger, service, &cfg, if (engine_kind == .baidu) "baidu" else "doubao");
+    var pipeline = try postprocess.Pipeline.start(allocator, io, logger, .{ .ibus = service }, &cfg, if (engine_kind == .baidu) "baidu" else "doubao");
     defer pipeline.deinit();
 
     var service_loop = ServiceLoop{
