@@ -11,6 +11,7 @@ pub const runtime = struct {
     pub const mute = @import("runtime/mute.zig");
     pub const notify = @import("runtime/notify.zig");
     pub const postprocess = @import("runtime/postprocess.zig");
+    pub const wayland_im = @import("runtime/wayland_im.zig");
     pub const output = @import("runtime/output.zig");
     pub const shutdown = @import("runtime/shutdown.zig");
     pub const engine = @import("runtime/engine.zig");
@@ -41,6 +42,7 @@ test {
     _ = runtime.mute;
     _ = runtime.notify;
     _ = runtime.postprocess;
+    _ = runtime.wayland_im;
     _ = runtime.output;
     _ = runtime.shutdown;
     _ = runtime.engine;
