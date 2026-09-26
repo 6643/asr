@@ -9,6 +9,8 @@ pub const ModeTag = enum {
 
 pub const Engine = enum { baidu, doubao };
 
+pub const WaylandMode = enum { auto, force, disabled };
+
 pub const Mode = union(ModeTag) {
     app: void,
     ibus_service: void,
@@ -20,6 +22,7 @@ pub const Options = struct {
     mode: Mode,
     engine: Engine = .baidu,
     debug: bool = false,
+    wayland: WaylandMode = .auto,
 };
 
 pub fn optionsFromArgs(args: []const [:0]const u8) Options {
@@ -27,6 +30,7 @@ pub fn optionsFromArgs(args: []const [:0]const u8) Options {
         .mode = modeFromArgs(args),
         .engine = if (hasArg(args, "--baidu")) .baidu else .doubao,
         .debug = hasArg(args, "--debug"),
+        .wayland = if (hasArg(args, "--wayland")) .force else if (hasArg(args, "--no-wayland")) .disabled else .auto,
     };
 }
 
@@ -85,4 +89,18 @@ test "defaults to doubao engine" {
 test "recognizes explicit baidu engine" {
     const args = [_][:0]const u8{ "asr", "--baidu" };
     try std.testing.expectEqual(Engine.baidu, optionsFromArgs(&args).engine);
+}
+
+test "defaults to auto wayland selection" {
+    const args = [_][:0]const u8{"asr"};
+    try std.testing.expectEqual(WaylandMode.auto, optionsFromArgs(&args).wayland);
+}
+
+test "recognizes wayland flags" {
+    const force = [_][:0]const u8{ "asr", "--wayland" };
+    try std.testing.expectEqual(WaylandMode.force, optionsFromArgs(&force).wayland);
+    const disabled = [_][:0]const u8{ "asr", "--no-wayland" };
+    try std.testing.expectEqual(WaylandMode.disabled, optionsFromArgs(&disabled).wayland);
+    const both = [_][:0]const u8{ "asr", "--wayland", "--no-wayland" };
+    try std.testing.expectEqual(WaylandMode.force, optionsFromArgs(&both).wayland);
 }
