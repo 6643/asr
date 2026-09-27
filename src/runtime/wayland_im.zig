@@ -131,6 +131,7 @@ pub const Client = struct {
     manager_global_name: u32 = 0,
     done_count: u32 = 0,
     active: bool = false,
+    active_changed: bool = false,
     pending_active: bool = false,
     sync_done: bool = false,
     dead: bool = false,
@@ -171,6 +172,7 @@ pub const Client = struct {
                 1 => self.pending_active = false,
                 5 => {
                     self.done_count += 1;
+                    if (self.pending_active != self.active) self.active_changed = true;
                     self.active = self.pending_active;
                 },
                 6 => self.dead = true,
@@ -183,6 +185,14 @@ pub const Client = struct {
     pub fn isActive(self: *Client) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        return self.active;
+    }
+
+    pub fn takeActiveChange(self: *Client) ?bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.active_changed) return null;
+        self.active_changed = false;
         return self.active;
     }
 
@@ -476,6 +486,33 @@ test "identifiers are allocated strictly sequentially" {
     try std.testing.expectEqual(@as(u32, 2), client.allocId());
     try std.testing.expectEqual(@as(u32, 3), client.allocId());
     try std.testing.expectEqual(@as(u32, 4), client.allocId());
+}
+
+test "active changes are reported once per transition" {
+    var client = testClient();
+    try std.testing.expect(client.takeActiveChange() == null);
+    try client.applyMessage(6, 0, &.{}); // activate
+    try std.testing.expect(client.takeActiveChange() == null);
+    try client.applyMessage(6, 5, &.{}); // done applies the pending state
+    try std.testing.expectEqual(true, client.takeActiveChange().?);
+    try std.testing.expect(client.takeActiveChange() == null);
+    try client.applyMessage(6, 5, &.{}); // done with no pending change
+    try std.testing.expect(client.takeActiveChange() == null);
+}
+
+test "consumeMessage removes the leading message" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try appendMessage(std.testing.allocator, &buf, 5, 3, &.{ 0x01, 0x00, 0x00, 0x00 });
+    try appendMessage(std.testing.allocator, &buf, 6, 5, &.{});
+    const first = extractMessage(&buf).?;
+    consumeMessage(&buf, first.total_size);
+    const second = extractMessage(&buf).?;
+    try std.testing.expectEqual(@as(u32, 6), second.object_id);
+    try std.testing.expectEqual(@as(u16, 5), second.opcode);
+    try std.testing.expectEqual(@as(usize, 0), second.payload.len);
+    consumeMessage(&buf, second.total_size);
+    try std.testing.expectEqual(@as(usize, 0), buf.items.len);
 }
 
 test "resolves socket path from runtime dir and display" {

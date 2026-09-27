@@ -203,6 +203,9 @@ fn runWaylandLoop(loop: *WaylandLoop) void {
             loop.logger.err("wayland", "event dispatch failed: {s}", .{@errorName(err)});
             return;
         };
+        if (loop.client.takeActiveChange()) |active| {
+            loop.logger.debug("wayland", "{s}", .{if (active) "activated" else "deactivated"});
+        }
         shutdown.sleepUntilOr(loop.io, 10);
     }
 }
