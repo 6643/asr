@@ -83,7 +83,7 @@ pub fn main(init: std.process.Init) !void {
             try asr.runtime.app.run(allocator, init.io, init.minimal.environ, opts.debug, switch (opts.engine) {
                 .baidu => .baidu,
                 .doubao => .doubao,
-            });
+            }, opts.wayland);
             return;
         },
     }

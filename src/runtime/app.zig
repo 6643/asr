@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("../config.zig");
+const cli = @import("../cli.zig");
 const doubao = @import("../doubao/client.zig");
 const credentials = @import("../doubao/credentials.zig");
 const engine = @import("engine.zig");
@@ -7,6 +8,7 @@ const key = @import("../key.zig");
 const audio_gate = @import("audio_gate.zig");
 const ibus = @import("ibus.zig");
 const postprocess = @import("postprocess.zig");
+const wayland_im = @import("wayland_im.zig");
 const mic = @import("mic.zig");
 const mute = @import("mute.zig");
 const notify = @import("notify.zig");
@@ -30,6 +32,7 @@ pub fn run(
     environ: std.process.Environ,
     debug: bool,
     engine_kind: engine.Kind,
+    wayland: cli.WaylandMode,
 ) !void {
     installSignalHandlers();
     const logger = output.Logger{ .io = io, .level = if (debug) .debug else .info };
@@ -75,50 +78,103 @@ pub fn run(
     const keyboard_device = try key.findKeyboardDevice(allocator, io, environ);
     defer allocator.free(keyboard_device);
 
-    const component_path = try ibus.initRuntime(allocator, io, environ);
-    defer allocator.free(component_path);
-    logger.debug("app", "{s}", .{component_path});
+    var service: ?*ibus.gio_ibus.Service = null;
+    defer if (service) |s| {
+        s.stop();
+        allocator.destroy(s);
+    };
+    var wayland_client: ?*wayland_im.Client = null;
+    defer if (wayland_client) |c| c.deinit();
 
-    const service = try ibus.startService(allocator, io, environ);
-    defer {
-        service.stop();
-        allocator.destroy(service);
-    }
+    const backend: postprocess.CommitBackend = blk: {
+        if (wayland != .disabled) {
+            if (wayland_im.connect(allocator, io, environ)) |client| {
+                wayland_client = client;
+                logger.info("wayland", "input method bound", .{});
+                break :blk .{ .wayland = client };
+            } else |err| {
+                if (wayland == .force) return err;
+                logger.err("wayland", "unavailable: {s}; falling back to IBus", .{@errorName(err)});
+            }
+        }
+        const started = try startIbusBackend(allocator, io, environ, logger);
+        service = started;
+        break :blk .{ .ibus = started };
+    };
 
-    var pipeline = try postprocess.Pipeline.start(allocator, io, logger, .{ .ibus = service }, &cfg, if (engine_kind == .baidu) "baidu" else "doubao");
+    var pipeline = try postprocess.Pipeline.start(allocator, io, logger, backend, &cfg, if (engine_kind == .baidu) "baidu" else "doubao");
     defer pipeline.deinit();
 
     var service_loop = ServiceLoop{
-        .service = service,
+        .service = service orelse undefined,
         .io = io,
-        .running = std.atomic.Value(bool).init(true),
+        .running = std.atomic.Value(bool).init(false),
     };
-    var service_future_opt = io.concurrent(runServiceLoop, .{&service_loop}) catch null;
+    var wayland_loop = WaylandLoop{
+        .client = wayland_client orelse undefined,
+        .io = io,
+        .logger = logger,
+        .running = std.atomic.Value(bool).init(false),
+    };
+    var service_future_opt: ?std.Io.Future(void) = null;
+    var wayland_future_opt: ?std.Io.Future(void) = null;
     var service_thread: ?std.Thread = null;
-    if (service_future_opt == null) {
-        service_thread = try std.Thread.spawn(.{}, runServiceLoop, .{&service_loop});
+    var wayland_thread: ?std.Thread = null;
+    if (service != null) {
+        service_loop.running.store(true, .release);
+        service_future_opt = io.concurrent(runServiceLoop, .{&service_loop}) catch null;
+        if (service_future_opt == null) {
+            service_thread = try std.Thread.spawn(.{}, runServiceLoop, .{&service_loop});
+        }
+    }
+    if (wayland_client != null) {
+        wayland_loop.running.store(true, .release);
+        wayland_future_opt = io.concurrent(runWaylandLoop, .{&wayland_loop}) catch null;
+        if (wayland_future_opt == null) {
+            wayland_thread = try std.Thread.spawn(.{}, runWaylandLoop, .{&wayland_loop});
+        }
     }
     defer {
         service_loop.running.store(false, .release);
+        wayland_loop.running.store(false, .release);
         if (service_future_opt) |*f| {
             _ = f.cancel(io);
         } else if (service_thread) |t| {
             t.join();
         }
+        if (wayland_future_opt) |*f| {
+            _ = f.cancel(io);
+        } else if (wayland_thread) |t| {
+            t.join();
+        }
     }
 
-    ibus.switchToAsrInputMethod(allocator, io) catch |err| {
-        logger.err("ibus", "switch failed: {s}", .{@errorName(err)});
-        logger.info("ibus", "Auto-switch unavailable; switch to ASR manually", .{});
-        try runHotkeyLoop(allocator, io, environ, logger, engine_cfg, keyboard_device, pipeline, debug);
-        return;
-    };
-    logger.info("ibus", "Switched to ASR input method", .{});
-    if (!waitForServiceReady(io, service, 4000)) {
-        logger.debug("ibus", "service not ready yet", .{});
+    if (service) |s| {
+        ibus.switchToAsrInputMethod(allocator, io) catch |err| {
+            logger.err("ibus", "switch failed: {s}", .{@errorName(err)});
+            logger.info("ibus", "Auto-switch unavailable; switch to ASR manually", .{});
+            try runHotkeyLoop(allocator, io, environ, logger, engine_cfg, keyboard_device, pipeline, debug);
+            return;
+        };
+        logger.info("ibus", "Switched to ASR input method", .{});
+        if (!waitForServiceReady(io, s, 4000)) {
+            logger.debug("ibus", "service not ready yet", .{});
+        }
     }
 
     try runHotkeyLoop(allocator, io, environ, logger, engine_cfg, keyboard_device, pipeline, debug);
+}
+
+fn startIbusBackend(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+    logger: output.Logger,
+) !*ibus.gio_ibus.Service {
+    const component_path = try ibus.initRuntime(allocator, io, environ);
+    defer allocator.free(component_path);
+    logger.debug("app", "{s}", .{component_path});
+    return try ibus.startService(allocator, io, environ);
 }
 
 const ServiceLoop = struct {
@@ -130,6 +186,23 @@ const ServiceLoop = struct {
 fn runServiceLoop(loop: *ServiceLoop) void {
     while (loop.running.load(.acquire) and !isShutdownRequested()) {
         loop.service.iterate();
+        shutdown.sleepUntilOr(loop.io, 10);
+    }
+}
+
+const WaylandLoop = struct {
+    client: *wayland_im.Client,
+    io: std.Io,
+    logger: output.Logger,
+    running: std.atomic.Value(bool),
+};
+
+fn runWaylandLoop(loop: *WaylandLoop) void {
+    while (loop.running.load(.acquire) and !isShutdownRequested()) {
+        loop.client.pump(0) catch |err| {
+            loop.logger.err("wayland", "event dispatch failed: {s}", .{@errorName(err)});
+            return;
+        };
         shutdown.sleepUntilOr(loop.io, 10);
     }
 }

@@ -200,7 +200,7 @@ pub const Client = struct {
                         self.dead = true;
                         return error.ConnectionFailed;
                     }
-                    self.read_buf.appendSlice(self.allocator, buf[0..rc]) catch return error.ConnectionFailed;
+                    self.read_buf.appendSlice(self.allocator, buf[0..@intCast(rc)]) catch return error.ConnectionFailed;
                 },
                 .INTR => continue,
                 .AGAIN => break,
@@ -276,14 +276,14 @@ fn writeAll(client: *Client, bytes: []const u8) ConnectError!void {
     var written: usize = 0;
     while (written < bytes.len) {
         const rc = std.posix.system.write(client.stream.socket.handle, bytes.ptr + written, bytes.len - written);
-        if (rc < 0) {
-            switch (std.posix.errno(@as(usize, @bitCast(rc)))) {
-                .INTR => continue,
-                else => return error.ConnectionFailed,
-            }
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return error.ConnectionFailed;
+                written += @intCast(rc);
+            },
+            .INTR => continue,
+            else => return error.ConnectionFailed,
         }
-        if (rc == 0) return error.ConnectionFailed;
-        written += @intCast(rc);
     }
 }
 
@@ -316,6 +316,16 @@ pub fn connect(allocator: std.mem.Allocator, io: std.Io, environ: std.process.En
     defer allocator.free(path);
     const address = std.Io.net.UnixAddress.init(path) catch return error.ConnectionFailed;
     const stream = address.connect(io) catch return error.ConnectionFailed;
+    const flags = std.posix.system.fcntl(stream.socket.handle, std.posix.system.F.GETFL, @as(usize, 0));
+    if (flags < 0) {
+        stream.close(io);
+        return error.ConnectionFailed;
+    }
+    const nonblock_flag = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
+    if (std.posix.system.fcntl(stream.socket.handle, std.posix.system.F.SETFL, @as(usize, @intCast(flags)) | nonblock_flag) < 0) {
+        stream.close(io);
+        return error.ConnectionFailed;
+    }
     const client = allocator.create(Client) catch return error.OutOfMemory;
     client.* = .{ .allocator = allocator, .io = io, .stream = stream };
     errdefer destroyConnection(client);
