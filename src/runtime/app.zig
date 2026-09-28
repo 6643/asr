@@ -468,7 +468,16 @@ const KeyboardEventStream = struct {
         const owned_path = try allocator.dupe(u8, initial_path);
         errdefer allocator.free(owned_path);
 
-        const file = try openKeyboardFile(io, owned_path);
+        const file = openKeyboardFile(io, owned_path) catch |err| {
+            // A device we may not read is a different problem from a missing
+            // one, and the user fixes it differently.
+            const mapped: anyerror = switch (key.classifyDeviceOpenError(err)) {
+                .denied => error.KeyboardPermissionDenied,
+                else => error.KeyboardDeviceNotFound,
+            };
+            logger.err("kbd", "{s}: {s}: {s}", .{ owned_path, @errorName(err), keyFailureHint(mapped) });
+            return mapped;
+        };
         logger.info("kbd", "{s}", .{owned_path});
 
         return .{

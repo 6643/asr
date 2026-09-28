@@ -60,17 +60,26 @@ pub fn findKeyboardDevice(allocator: std.mem.Allocator, io: std.Io, environ: std
         if (trimmed.len > 0) return allocator.dupe(u8, trimmed);
     }
 
+    var saw_denied = false;
     const content = try std.Io.Dir.cwd().readFileAlloc(io, "/proc/bus/input/devices", allocator, .limited(1024 * 1024));
     defer allocator.free(content);
     if (findKeyboardDeviceInProcInput(allocator, content)) |path| {
-        if (isUsableInputDevice(io, path)) return path;
+        switch (openDeviceState(io, path)) {
+            .usable => return path,
+            .denied => saw_denied = true,
+            .missing => {},
+        }
         allocator.free(path);
     }
     if (findKeyboardDeviceFromSymlinkDirs(allocator, io)) |path| {
-        if (isUsableInputDevice(io, path)) return path;
+        switch (openDeviceState(io, path)) {
+            .usable => return path,
+            .denied => saw_denied = true,
+            .missing => {},
+        }
         allocator.free(path);
     }
-    return error.KeyboardDeviceNotFound;
+    return deviceSearchFailure(saw_denied);
 }
 
 pub fn findKeyboardDeviceInProcInput(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
@@ -364,10 +373,26 @@ fn eventNameFromLinkTarget(target: []const u8) ?[]const u8 {
     return event_name;
 }
 
-fn isUsableInputDevice(io: std.Io, path: []const u8) bool {
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+/// How a candidate keyboard device responded to being opened.
+pub const DeviceOpen = enum { usable, missing, denied };
+
+pub fn classifyDeviceOpenError(err: anyerror) DeviceOpen {
+    return switch (err) {
+        error.AccessDenied => .denied,
+        else => .missing,
+    };
+}
+
+pub fn openDeviceState(io: std.Io, path: []const u8) DeviceOpen {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| return classifyDeviceOpenError(err);
     file.close(io);
-    return true;
+    return .usable;
+}
+
+/// Distinguishes "no keyboard at all" from "keyboards exist but we may not
+/// read them": the fixes are different (plug one in vs join the input group).
+pub fn deviceSearchFailure(saw_denied: bool) error{ KeyboardDeviceNotFound, KeyboardPermissionDenied } {
+    return if (saw_denied) error.KeyboardPermissionDenied else error.KeyboardDeviceNotFound;
 }
 
 fn inputEvent(event_type: u16, code: u16, value: u32) [input_event_size]u8 {
@@ -462,4 +487,28 @@ test "maps Io cancelation to Interrupted" {
     try std.testing.expectEqual(DeviceReadError.Interrupted, mapReadStreamingError(error.Canceled));
     try std.testing.expectEqual(DeviceReadError.EndOfStream, mapReadStreamingError(error.EndOfStream));
     try std.testing.expectEqual(DeviceReadError.ReadFailed, mapReadStreamingError(error.InputOutput));
+}
+
+test "classifies device open errors" {
+    try std.testing.expectEqual(DeviceOpen.denied, classifyDeviceOpenError(error.AccessDenied));
+    try std.testing.expectEqual(DeviceOpen.missing, classifyDeviceOpenError(error.FileNotFound));
+    try std.testing.expectEqual(DeviceOpen.missing, classifyDeviceOpenError(error.IsDir));
+}
+
+test "unreadable input device is reported as denied" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "dev", .{ .permissions = .fromMode(0o000) });
+    file.close(std.testing.io);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache/tmp", tmp.sub_path[0..], "dev" });
+    defer std.testing.allocator.free(path);
+
+    if (openDeviceState(std.testing.io, path) == .usable) return error.SkipZigTest; // root 下权限位无效
+
+    try std.testing.expectEqual(DeviceOpen.denied, openDeviceState(std.testing.io, path));
+}
+
+test "device search failure names the permission problem" {
+    try std.testing.expectEqual(error.KeyboardPermissionDenied, deviceSearchFailure(true));
+    try std.testing.expectEqual(error.KeyboardDeviceNotFound, deviceSearchFailure(false));
 }
