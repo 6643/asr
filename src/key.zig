@@ -200,7 +200,20 @@ fn deviceSupportsRightAlt(io: std.Io, allocator: std.mem.Allocator, event_name: 
 
 /// Collects `*-event-kbd` links of one directory, resolving each to
 /// `/dev/input/eventN` and keeping only capable devices.
+/// Capability probe used while scanning symlink directories: kept as a
+/// parameter so tests can drive the scan without real sysfs devices.
+pub const RightAltProbe = *const fn (std.Io, std.mem.Allocator, []const u8) bool;
+
 pub fn collectCapableKeyboardsInSymlinkDir(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) ![][]u8 {
+    return collectCapableKeyboardsInSymlinkDirWith(io, allocator, dir_path, deviceSupportsRightAlt);
+}
+
+pub fn collectCapableKeyboardsInSymlinkDirWith(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    supports_right_alt: RightAltProbe,
+) ![][]u8 {
     var paths: std.ArrayList([]u8) = .empty;
     errdefer freePathList(allocator, &paths);
 
@@ -216,7 +229,7 @@ pub fn collectCapableKeyboardsInSymlinkDir(io: std.Io, allocator: std.mem.Alloca
         var link_buf: [std.fs.max_path_bytes]u8 = undefined;
         const link_len = dir.readLink(io, entry.name, &link_buf) catch continue;
         const event_name = eventNameFromLinkTarget(link_buf[0..link_len]) orelse continue;
-        if (!deviceSupportsRightAlt(io, allocator, event_name)) continue;
+        if (!supports_right_alt(io, allocator, event_name)) continue;
         const path = try std.fmt.allocPrint(allocator, "/dev/input/{s}", .{event_name});
         if (containsPath(paths.items, path)) {
             allocator.free(path);
@@ -717,7 +730,9 @@ test "live discovery only returns readable, capable keyboards" {
     const devices = try dropUnreadableDevices(allocator, std.testing.io, candidates);
     defer freeDeviceList(allocator, devices);
 
-    try std.testing.expect(devices.len > 0);
+    // CI runners have no keyboards at all; the filtering rules themselves are
+    // covered by the synthetic bitmaps and the injected-probe test below.
+    if (devices.len == 0) return error.SkipZigTest;
     for (devices) |path| {
         try std.testing.expect(std.mem.startsWith(u8, path, "/dev/input/event"));
         const event_name = std.fs.path.basename(path);
@@ -739,11 +754,23 @@ test "collects capable keyboards from a symlink dir" {
     try dir.symLink(std.testing.io, "../../event99", "usb-Ghost-event-kbd", .{});
     try dir.symLink(std.testing.io, "../../event5", "usb-Other-if01", .{}); // 非 -event-kbd 应忽略
 
-    const devices = try collectCapableKeyboardsInSymlinkDir(std.testing.io, std.testing.allocator, dir_path);
+    // 能力位检查注入：只有 event5 合格，不依赖本机 sysfs。
+    const devices = try collectCapableKeyboardsInSymlinkDirWith(
+        std.testing.io,
+        std.testing.allocator,
+        dir_path,
+        onlyEvent5SupportsRightAlt,
+    );
     defer freeDeviceList(std.testing.allocator, devices);
 
     try std.testing.expectEqual(@as(usize, 1), devices.len);
     try std.testing.expectEqualStrings("/dev/input/event5", devices[0]);
+}
+
+fn onlyEvent5SupportsRightAlt(io: std.Io, allocator: std.mem.Allocator, event_name: []const u8) bool {
+    _ = io;
+    _ = allocator;
+    return std.mem.eql(u8, event_name, "event5");
 }
 
 test "device read error set includes Interrupted for cancel/signal wakeups" {
