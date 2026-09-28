@@ -76,20 +76,35 @@ pub fn buildCommitMessages(allocator: std.mem.Allocator, im_id: u32, serial: u32
     return try buf.toOwnedSlice(allocator);
 }
 
-pub fn extractMessage(buf: *const std.ArrayList(u8)) ?Message {
-    if (buf.items.len < header_size) return null;
+/// Largest amount of unparsed input we will hold: a peer that keeps sending an
+/// incomplete message must not grow our memory forever.
+pub const max_read_buffer_bytes: usize = 1024 * 1024;
+
+pub const MessageTag = enum { message, incomplete, malformed };
+
+pub const MessageSlice = union(MessageTag) {
+    message: Message,
+    incomplete: void,
+    malformed: void,
+};
+
+/// Splits the head of `buf` into either one complete message, a partial
+/// header/body (`incomplete`), or bytes that can never be a message
+/// (`malformed`, e.g. a size that is not header-aligned).
+pub fn classifyMessage(buf: *const std.ArrayList(u8)) MessageSlice {
+    if (buf.items.len < header_size) return .incomplete;
     const object_id = std.mem.readInt(u32, buf.items[0..4], .little);
     const word = std.mem.readInt(u32, buf.items[4..8], .little);
     const size: usize = word >> 16;
     const opcode: u16 = @truncate(word);
-    if (size < header_size or size % 4 != 0) return null;
-    if (buf.items.len < size) return null;
-    return .{
+    if (size < header_size or size % 4 != 0) return .malformed;
+    if (buf.items.len < size) return .incomplete;
+    return .{ .message = .{
         .object_id = object_id,
         .opcode = opcode,
         .payload = buf.items[header_size..size],
         .total_size = size,
-    };
+    } };
 }
 
 pub fn consumeMessage(buf: *std.ArrayList(u8), total_size: usize) void {
@@ -196,34 +211,65 @@ pub const Client = struct {
         return self.active;
     }
 
-    pub fn pump(self: *Client, timeout_ms: i32) !void {
-        var fds = [_]std.posix.pollfd{.{ .fd = self.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-        const ready = std.posix.poll(&fds, timeout_ms) catch return error.ConnectionFailed;
-        if (ready == 0) return;
+    /// One poll + non-blocking read pass, then dispatch every complete message.
+    /// Every failure mode marks the client dead: the caller must stop
+    /// committing instead of silently dropping text.
+    pub fn pump(self: *Client, timeout_ms: i32) ConnectError!void {
+        return self.pumpWith(.{
+            .ctx = self,
+            .readFn = socketRead,
+            .pollFn = socketPoll,
+        }, timeout_ms);
+    }
+
+    pub fn pumpWith(self: *Client, io: ReadIo, timeout_ms: i32) ConnectError!void {
+        const ready = io.pollFn(io.ctx, timeout_ms) catch {
+            self.dead = true;
+            return error.ConnectionFailed;
+        };
+        if (!ready) return;
 
         var buf: [4096]u8 = undefined;
         while (true) {
-            const rc = std.posix.system.read(self.stream.socket.handle, &buf, buf.len);
-            switch (std.posix.errno(rc)) {
-                .SUCCESS => {
-                    if (rc == 0) {
-                        self.dead = true;
-                        return error.ConnectionFailed;
-                    }
-                    self.read_buf.appendSlice(self.allocator, buf[0..@intCast(rc)]) catch return error.ConnectionFailed;
-                },
-                .INTR => continue,
-                .AGAIN => break,
-                else => {
+            const count = io.readFn(io.ctx, &buf) catch |err| switch (err) {
+                error.WouldBlock => break,
+                error.ReadFailed => {
                     self.dead = true;
                     return error.ConnectionFailed;
                 },
+            };
+            if (count == 0) {
+                self.dead = true;
+                return error.ConnectionFailed;
             }
+            self.read_buf.appendSlice(self.allocator, buf[0..count]) catch {
+                self.dead = true;
+                return error.ConnectionFailed;
+            };
         }
 
-        while (extractMessage(&self.read_buf)) |message| {
-            try self.applyMessage(message.object_id, message.opcode, message.payload);
-            consumeMessage(&self.read_buf, message.total_size);
+        try self.drainMessages();
+    }
+
+    /// Dispatches complete messages from `read_buf`; any impossible byte
+    /// sequence or unbounded growth disconnects us for good.
+    pub fn drainMessages(self: *Client) ConnectError!void {
+        while (true) {
+            if (self.read_buf.items.len > max_read_buffer_bytes) {
+                self.dead = true;
+                return error.ConnectionFailed;
+            }
+            switch (classifyMessage(&self.read_buf)) {
+                .incomplete => return,
+                .malformed => {
+                    self.dead = true;
+                    return error.MalformedMessage;
+                },
+                .message => |message| {
+                    try self.applyMessage(message.object_id, message.opcode, message.payload);
+                    consumeMessage(&self.read_buf, message.total_size);
+                },
+            }
         }
     }
 
@@ -254,6 +300,39 @@ pub const Client = struct {
     }
 };
 
+pub const ReadError = error{
+    WouldBlock,
+    ReadFailed,
+};
+
+/// Injectable read side of the socket, so socket failures (eof, poll error,
+/// malformed peer data) are testable without a live compositor.
+pub const ReadIo = struct {
+    ctx: ?*anyopaque,
+    readFn: *const fn (ctx: ?*anyopaque, buf: []u8) ReadError!usize,
+    pollFn: *const fn (ctx: ?*anyopaque, timeout_ms: i32) ReadError!bool,
+};
+
+fn socketRead(ctx: ?*anyopaque, buf: []u8) ReadError!usize {
+    const client: *Client = @ptrCast(@alignCast(ctx.?));
+    while (true) {
+        const rc = std.posix.system.read(client.stream.socket.handle, buf.ptr, buf.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => return error.ReadFailed,
+        }
+    }
+}
+
+fn socketPoll(ctx: ?*anyopaque, timeout_ms: i32) ReadError!bool {
+    const client: *Client = @ptrCast(@alignCast(ctx.?));
+    var fds = [_]std.posix.pollfd{.{ .fd = client.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = std.posix.poll(&fds, timeout_ms) catch return error.ReadFailed;
+    return ready > 0;
+}
+
 pub const listen_display_default = "wayland-0";
 pub const setup_timeout_ms: i64 = 2000;
 pub const unavailable_probe_ms: i64 = 200;
@@ -264,6 +343,7 @@ pub const ConnectError = error{
     InputMethodUnavailable,
     SetupTimeout,
     DisplayError,
+    MalformedMessage,
     OutOfMemory,
 };
 
@@ -402,14 +482,14 @@ test "encodeCommit writes serial argument" {
     }, buf.items);
 }
 
-test "extractMessage waits for the complete message" {
+test "classifyMessage waits for the complete message" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
     try appendMessage(std.testing.allocator, &buf, 5, 3, &.{ 0x03, 0x00, 0x00, 0x00 });
     try buf.replaceRange(std.testing.allocator, 8, buf.items.len - 8, &.{}); // 只留前 8 字节 header
-    try std.testing.expect(extractMessage(&buf) == null);
+    try std.testing.expectEqual(MessageTag.incomplete, std.meta.activeTag(classifyMessage(&buf)));
     try buf.appendSlice(std.testing.allocator, &.{ 0x03, 0x00, 0x00, 0x00 });
-    const message = extractMessage(&buf).?;
+    const message = classifyMessage(&buf).message;
     try std.testing.expectEqual(@as(u32, 5), message.object_id);
     try std.testing.expectEqual(@as(u16, 3), message.opcode);
     try std.testing.expectEqual(@as(u32, 3), readU32(message.payload).?);
@@ -436,6 +516,116 @@ fn testClient() Client {
         .manager_id = 5,
         .im_id = 6,
     };
+}
+
+/// Fake socket used to drive Client.pumpWith without a real wayland socket.
+const FakeReadIo = struct {
+    var poll_error: ?ReadError = null;
+    var ready: bool = true;
+    var script: []const u8 = "";
+    var offset: usize = 0;
+    var eof: bool = false;
+
+    fn reset() void {
+        poll_error = null;
+        ready = true;
+        script = "";
+        offset = 0;
+        eof = false;
+    }
+
+    fn poll(ctx: ?*anyopaque, timeout_ms: i32) ReadError!bool {
+        _ = ctx;
+        _ = timeout_ms;
+        if (poll_error) |err| return err;
+        return ready;
+    }
+
+    fn read(ctx: ?*anyopaque, buf: []u8) ReadError!usize {
+        _ = ctx;
+        if (eof) return 0;
+        if (offset >= script.len) return error.WouldBlock;
+        const count = @min(buf.len, script.len - offset);
+        @memcpy(buf[0..count], script[offset .. offset + count]);
+        offset += count;
+        return count;
+    }
+
+    fn io() ReadIo {
+        return .{ .ctx = null, .readFn = read, .pollFn = poll };
+    }
+};
+
+test "pump applies messages read from the socket" {
+    var client = testClient();
+    defer client.read_buf.deinit(std.testing.allocator);
+    FakeReadIo.reset();
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(std.testing.allocator);
+    try appendMessage(std.testing.allocator, &script, 6, 0, &.{}); // activate
+    try appendMessage(std.testing.allocator, &script, 6, 5, &.{}); // done
+    FakeReadIo.script = script.items;
+
+    try client.pumpWith(FakeReadIo.io(), 0);
+
+    try std.testing.expect(client.isActive());
+    try std.testing.expectEqual(@as(usize, 0), client.read_buf.items.len);
+    try std.testing.expect(!client.dead);
+}
+
+test "pump marks client dead when poll fails" {
+    var client = testClient();
+    defer client.read_buf.deinit(std.testing.allocator);
+    FakeReadIo.reset();
+    FakeReadIo.poll_error = error.ReadFailed;
+
+    try std.testing.expectError(error.ConnectionFailed, client.pumpWith(FakeReadIo.io(), 0));
+
+    try std.testing.expect(client.dead);
+}
+
+test "pump marks client dead on eof" {
+    var client = testClient();
+    defer client.read_buf.deinit(std.testing.allocator);
+    FakeReadIo.reset();
+    FakeReadIo.eof = true;
+
+    try std.testing.expectError(error.ConnectionFailed, client.pumpWith(FakeReadIo.io(), 0));
+
+    try std.testing.expect(client.dead);
+}
+
+test "malformed header marks client dead" {
+    var client = testClient();
+    defer client.read_buf.deinit(std.testing.allocator);
+    var bad: [8]u8 = @splat(0);
+    std.mem.writeInt(u32, bad[4..8], (3 << 16) | 0, .little); // size = 3 不是 4 的倍数
+    try client.read_buf.appendSlice(std.testing.allocator, &bad);
+
+    try std.testing.expectError(error.MalformedMessage, client.drainMessages());
+
+    try std.testing.expect(client.dead);
+}
+
+test "read buffer over the cap marks client dead" {
+    var client = testClient();
+    defer client.read_buf.deinit(std.testing.allocator);
+    try client.read_buf.appendNTimes(std.testing.allocator, 0, max_read_buffer_bytes + 8);
+
+    try std.testing.expectError(error.ConnectionFailed, client.drainMessages());
+
+    try std.testing.expect(client.dead);
+}
+
+test "incomplete header keeps the client alive" {
+    var client = testClient();
+    defer client.read_buf.deinit(std.testing.allocator);
+    try client.read_buf.appendSlice(std.testing.allocator, "abc");
+
+    try client.drainMessages();
+
+    try std.testing.expect(!client.dead);
+    try std.testing.expectEqual(@as(usize, 3), client.read_buf.items.len);
 }
 
 test "done events advance serial and apply pending active state" {
@@ -505,9 +695,9 @@ test "consumeMessage removes the leading message" {
     defer buf.deinit(std.testing.allocator);
     try appendMessage(std.testing.allocator, &buf, 5, 3, &.{ 0x01, 0x00, 0x00, 0x00 });
     try appendMessage(std.testing.allocator, &buf, 6, 5, &.{});
-    const first = extractMessage(&buf).?;
+    const first = classifyMessage(&buf).message;
     consumeMessage(&buf, first.total_size);
-    const second = extractMessage(&buf).?;
+    const second = classifyMessage(&buf).message;
     try std.testing.expectEqual(@as(u32, 6), second.object_id);
     try std.testing.expectEqual(@as(u16, 5), second.opcode);
     try std.testing.expectEqual(@as(usize, 0), second.payload.len);
