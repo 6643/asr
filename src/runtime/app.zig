@@ -69,7 +69,7 @@ pub fn run(
     defer if (engine_kind == .baidu) baidu_cfg.deinit(allocator);
     defer if (doubao_creds) |creds| creds.deinit(allocator);
 
-    logger.info("app", "ASR 启动", .{});
+    logger.info("app", "ASR started", .{});
     logger.info(engineLabel(engine_cfg), "engine ready", .{});
     if (engineKind(engine_cfg) == .doubao) {
         logger.info("doubao", "{s}", .{cfg.device_id});

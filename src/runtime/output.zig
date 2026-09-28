@@ -35,7 +35,7 @@ pub const Logger = struct {
     }
 };
 
-fn timestamp(io: std.Io) [23]u8 {
+fn timestamp(io: std.Io) [12]u8 {
     const now = std.Io.Clock.real.now(io);
     const raw_seconds = now.toSeconds();
     const raw_milliseconds = now.toMilliseconds();
@@ -44,19 +44,16 @@ fn timestamp(io: std.Io) [23]u8 {
         0
     else
         @intCast(@mod(raw_milliseconds, 1000));
-    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = seconds };
-    const day_secs = epoch_seconds.getDaySeconds();
-    const epoch_day = epoch_seconds.getEpochDay();
-    const year_day = epoch_day.calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    var out: [23]u8 = undefined;
+    return formatTimeOfDay(seconds, milliseconds);
+}
+
+fn formatTimeOfDay(seconds: u64, milliseconds: u16) [12]u8 {
+    const day_secs = (std.time.epoch.EpochSeconds{ .secs = seconds }).getDaySeconds();
+    var out: [12]u8 = undefined;
     _ = std.fmt.bufPrint(
         &out,
-        "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}",
+        "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}",
         .{
-            year_day.year,
-            month_day.month.numeric(),
-            month_day.day_index + 1,
             day_secs.getHoursIntoDay(),
             day_secs.getMinutesIntoHour(),
             day_secs.getSecondsIntoMinute(),
@@ -78,5 +75,11 @@ pub fn keyEvent(logger: Logger, event: @import("../key.zig").Event) void {
 }
 
 test "formats timestamp" {
-    try std.testing.expectEqual(@as(usize, 23), timestamp(std.testing.io).len);
+    try std.testing.expectEqual(@as(usize, 12), timestamp(std.testing.io).len);
+}
+
+test "formats time of day with zero padding" {
+    try std.testing.expectEqualStrings("00:00:00.000", &formatTimeOfDay(0, 0));
+    try std.testing.expectEqualStrings("01:01:01.007", &formatTimeOfDay(3661, 7));
+    try std.testing.expectEqualStrings("23:59:59.999", &formatTimeOfDay(86399, 999));
 }
