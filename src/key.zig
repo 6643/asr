@@ -10,7 +10,7 @@ pub fn supportsRightAltBitmap(bitmap_text: []const u8) bool {
     // instead of buffering arbitrarily long bitmaps.
     var words = [2]u64{ 0, 0 };
     var seen: usize = 0;
-    var tokens = std.mem.tokenizeAny(u8, bitmap_text, " \t,");
+    var tokens = std.mem.tokenizeAny(u8, bitmap_text, " \t\r\n,");
     while (tokens.next()) |token| {
         const value = std.fmt.parseInt(u64, token, 16) catch return false;
         words[0] = words[1];
@@ -103,26 +103,63 @@ pub fn findKeyboardDevice(allocator: std.mem.Allocator, io: std.Io, environ: std
     return deviceSearchFailure(saw_denied);
 }
 
-pub fn findKeyboardDeviceInProcInput(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
-    // Prefer full keyboard handler set (kbd + leds + eventX).
+/// Collects every candidate keyboard in file order, skipping duplicates. A
+/// candidate must look like a full keyboard (`kbd` + `leds` + `sysrq` handlers)
+/// and be able to report `KEY_RIGHTALT`, which rules out media keys, power
+/// buttons, video buses and keyboard interfaces that never send real keys.
+pub fn findKeyboardDevicesInProcInput(allocator: std.mem.Allocator, content: []const u8) ![][]u8 {
+    var paths: std.ArrayList([]u8) = .empty;
+    errdefer freeDeviceList(allocator, paths.items);
+
     var blocks = std.mem.splitSequence(u8, content, "\n\n");
     while (blocks.next()) |block| {
-        if (eventPathFromPreferredHandlers(allocator, block)) |path| return path;
+        const handlers = handlersLine(block) orelse continue;
+        if (!hasHandlerToken(handlers, "kbd")) continue;
+        if (!hasHandlerToken(handlers, "leds")) continue;
+        if (!hasHandlerToken(handlers, "sysrq")) continue;
+        const bitmap = keyBitmapLine(block) orelse continue;
+        if (!supportsRightAltBitmap(bitmap)) continue;
+        const path = eventPathFromHandlers(allocator, handlers) orelse continue;
+        if (containsPath(paths.items, path)) {
+            allocator.free(path);
+            continue;
+        }
+        paths.append(allocator, path) catch |err| {
+            allocator.free(path);
+            return err;
+        };
     }
+    return paths.toOwnedSlice(allocator);
+}
 
-    // Fallback: name-based keyboard match.
-    blocks = std.mem.splitSequence(u8, content, "\n\n");
-    while (blocks.next()) |block| {
-        if (!isKeyboardBlock(block)) continue;
-        if (eventPathFromBlock(allocator, block)) |path| return path;
-    }
+/// Frees a list returned by `findKeyboardDevicesInProcInput`.
+pub fn freeDeviceList(allocator: std.mem.Allocator, paths: []const []u8) void {
+    for (paths) |path| allocator.free(path);
+    allocator.free(paths);
+}
 
-    // Last fallback: any kbd handler with eventX.
-    blocks = std.mem.splitSequence(u8, content, "\n\n");
-    while (blocks.next()) |block| {
-        if (eventPathFromKbdHandlers(allocator, block)) |path| return path;
+fn containsPath(paths: []const []u8, needle: []const u8) bool {
+    for (paths) |path| {
+        if (std.mem.eql(u8, path, needle)) return true;
     }
-    return null;
+    return false;
+}
+
+/// `B: KEY=` bitmap line of one `/proc/bus/input/devices` block.
+fn keyBitmapLine(block: []const u8) ?[]const u8 {
+    const prefix = "B: KEY=";
+    const start = std.mem.indexOf(u8, block, prefix) orelse return null;
+    const line_start = start + prefix.len;
+    const rest = block[line_start..];
+    const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    return std.mem.trim(u8, rest[0..line_end], " \t\r");
+}
+
+pub fn findKeyboardDeviceInProcInput(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
+    const devices = findKeyboardDevicesInProcInput(allocator, content) catch return null;
+    defer freeDeviceList(allocator, devices);
+    if (devices.len == 0) return null;
+    return allocator.dupe(u8, devices[0]) catch null;
 }
 
 pub fn readNextEvent(reader: *std.Io.Reader, state: *State, key_code: u16) !Event {
@@ -342,47 +379,6 @@ fn mapReadStreamingError(err: anyerror) DeviceReadError {
     };
 }
 
-fn isKeyboardBlock(block: []const u8) bool {
-    const name = inputName(block) orelse return false;
-    var lower: [256]u8 = undefined;
-    const len = @min(name.len, lower.len);
-    for (name[0..len], 0..) |c, index| {
-        lower[index] = std.ascii.toLower(c);
-    }
-    const value = lower[0..len];
-    if (std.mem.indexOf(u8, value, "keyboard") != null) return true;
-    if (std.mem.indexOf(u8, value, "atkbd") != null) return true;
-    return std.mem.indexOf(u8, value, "kbd") != null;
-}
-
-fn inputName(block: []const u8) ?[]const u8 {
-    const prefix = "N: Name=\"";
-    const start = std.mem.indexOf(u8, block, prefix) orelse return null;
-    const name_start = start + prefix.len;
-    const rest = block[name_start..];
-    const end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
-    return rest[0..end];
-}
-
-fn eventPathFromBlock(allocator: std.mem.Allocator, block: []const u8) ?[]u8 {
-    const handlers = handlersLine(block) orelse return null;
-    return eventPathFromHandlers(allocator, handlers);
-}
-
-fn eventPathFromPreferredHandlers(allocator: std.mem.Allocator, block: []const u8) ?[]u8 {
-    const handlers = handlersLine(block) orelse return null;
-    if (!hasHandlerToken(handlers, "kbd")) return null;
-    if (!hasHandlerToken(handlers, "leds")) return null;
-    if (!hasHandlerToken(handlers, "sysrq")) return null;
-    return eventPathFromHandlers(allocator, handlers);
-}
-
-fn eventPathFromKbdHandlers(allocator: std.mem.Allocator, block: []const u8) ?[]u8 {
-    const handlers = handlersLine(block) orelse return null;
-    if (!hasHandlerToken(handlers, "kbd")) return null;
-    return eventPathFromHandlers(allocator, handlers);
-}
-
 fn handlersLine(block: []const u8) ?[]const u8 {
     const prefix = "H: Handlers=";
     const start = std.mem.indexOf(u8, block, prefix) orelse return null;
@@ -520,11 +516,10 @@ test "waits for release on the same event reader" {
 
 test "finds keyboard event path in proc input devices" {
     const content =
-        \\I: Bus=0011 Vendor=0001 Product=0001 Version=ab41
-        \\N: Name="AT Translated Set 2 keyboard"
-        \\H: Handlers=sysrq kbd event2 leds
-        \\
-    ;
+        "I: Bus=0011 Vendor=0001 Product=0001 Version=ab41\n" ++
+        "N: Name=\"AT Translated Set 2 keyboard\"\n" ++
+        "H: Handlers=sysrq kbd event2 leds\n" ++
+        "B: KEY=" ++ real_keyboard_bitmap ++ "\n";
     const path = findKeyboardDeviceInProcInput(std.testing.allocator, content).?;
     defer std.testing.allocator.free(path);
     try std.testing.expectEqualStrings("/dev/input/event2", path);
@@ -532,15 +527,15 @@ test "finds keyboard event path in proc input devices" {
 
 test "prefers full keyboard handlers over power button" {
     const content =
-        \\I: Bus=0019 Vendor=0000 Product=0001 Version=0000
-        \\N: Name="Power Button"
-        \\H: Handlers=kbd event0
-        \\
-        \\I: Bus=0003 Vendor=09da Product=2268 Version=0111
-        \\N: Name="Input Device"
-        \\H: Handlers=sysrq kbd event2 leds
-        \\
-    ;
+        "I: Bus=0019 Vendor=0000 Product=0001 Version=0000\n" ++
+        "N: Name=\"Power Button\"\n" ++
+        "H: Handlers=kbd event0\n" ++
+        "B: KEY=100000000000000 0\n" ++
+        "\n" ++
+        "I: Bus=0003 Vendor=09da Product=2268 Version=0111\n" ++
+        "N: Name=\"Input Device\"\n" ++
+        "H: Handlers=sysrq kbd event2 leds\n" ++
+        "B: KEY=" ++ real_keyboard_bitmap ++ "\n";
     const path = findKeyboardDeviceInProcInput(std.testing.allocator, content).?;
     defer std.testing.allocator.free(path);
     try std.testing.expectEqualStrings("/dev/input/event2", path);
@@ -625,4 +620,77 @@ test "rejects bitmaps without right alt" {
 
 test "parses comma separated bitmaps too" {
     try std.testing.expect(supportsRightAltBitmap("1000000000007,ff9f207ac14057ff,febeffdfffefffff,fffffffffffffffe"));
+}
+
+test "tolerates the trailing newline sysfs adds" {
+    try std.testing.expect(supportsRightAltBitmap(real_keyboard_bitmap ++ "\n"));
+    try std.testing.expect(!supportsRightAltBitmap("1f0000\n"));
+}
+
+/// 精简的 /proc/bus/input/devices 样本：真键盘两块 + 三个应当被滤掉的块
+/// （Power Button 无 leds/sysrq；Consumer Control 位图无 RightAlt；重复的真键盘块）。
+const synthetic_proc_input =
+    "I: Bus=0003 Vendor=25a7 Product=fa61 Version=0110\n" ++
+    "N: Name=\"Compx 2.4G Receiver\"\n" ++
+    "H: Handlers=sysrq kbd leds event0 \n" ++
+    "B: KEY=1000000000007 ff9f207ac14057ff febeffdfffefffff fffffffffffffffe\n" ++
+    "\n" ++
+    "I: Bus=0003 Vendor=09da Product=2268 Version=0111\n" ++
+    "N: Name=\"SONiX USB Keyboard\"\n" ++
+    "H: Handlers=sysrq kbd leds event5 \n" ++
+    "B: KEY=1000000000007 ff9f207ac14057ff febeffdfffefffff fffffffffffffffe\n" ++
+    "\n" ++
+    "I: Bus=0019 Vendor=0000 Product=0001 Version=0000\n" ++
+    "N: Name=\"Power Button\"\n" ++
+    "H: Handlers=kbd event9 \n" ++
+    "B: KEY=100000000000000 0\n" ++
+    "\n" ++
+    "I: Bus=0003 Vendor=25a7 Product=fa61 Version=0110\n" ++
+    "N: Name=\"Compx 2.4G Receiver Consumer Control\"\n" ++
+    "H: Handlers=sysrq kbd leds event3 \n" ++
+    "B: KEY=733eff 0 0 483ffff17aff32d bfd4444600000000 1 130c730b17c000 267bfad9415fed 9e168000004400 10000002\n" ++
+    "\n" ++
+    "I: Bus=0003 Vendor=25a7 Product=fa61 Version=0110\n" ++
+    "N: Name=\"Compx 2.4G Receiver\"\n" ++
+    "H: Handlers=sysrq kbd leds event0 \n" ++
+    "B: KEY=1000000000007 ff9f207ac14057ff febeffdfffefffff fffffffffffffffe\n";
+
+test "enumerates every capable keyboard in proc order without duplicates" {
+    const devices = try findKeyboardDevicesInProcInput(std.testing.allocator, synthetic_proc_input);
+    defer freeDeviceList(std.testing.allocator, devices);
+
+    try std.testing.expectEqual(@as(usize, 2), devices.len);
+    try std.testing.expectEqualStrings("/dev/input/event0", devices[0]);
+    try std.testing.expectEqualStrings("/dev/input/event5", devices[1]);
+}
+
+test "single device lookup still returns the first candidate" {
+    const path = findKeyboardDeviceInProcInput(std.testing.allocator, synthetic_proc_input).?;
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("/dev/input/event0", path);
+}
+
+test "live candidates agree with sysfs capability bitmaps" {
+    const allocator = std.testing.allocator;
+    const content = try @import("runtime/small_file.zig").readAll(
+        std.testing.io,
+        allocator,
+        "/proc/bus/input/devices",
+        @import("runtime/small_file.zig").max_bytes_default,
+    );
+    defer allocator.free(content);
+
+    const devices = try findKeyboardDevicesInProcInput(allocator, content);
+    defer freeDeviceList(allocator, devices);
+    try std.testing.expect(devices.len > 0);
+
+    // 独立数据源交叉验证：sysfs 的能力位图也必须支持 RightAlt
+    for (devices) |path| {
+        const event_name = std.fs.path.basename(path);
+        const cap_path = try std.fmt.allocPrint(allocator, "/sys/class/input/{s}/device/capabilities/key", .{event_name});
+        defer allocator.free(cap_path);
+        const bitmap = try @import("runtime/small_file.zig").readAll(std.testing.io, allocator, cap_path, 4096);
+        defer allocator.free(bitmap);
+        try std.testing.expect(supportsRightAltBitmap(bitmap));
+    }
 }
