@@ -1,6 +1,27 @@
 const std = @import("std");
 
 pub const right_alt: u16 = 100;
+
+/// Key capability bitmaps print the most significant word first (spaces or
+/// commas). `KEY_RIGHTALT` is code 100, i.e. word 1 counting from the least
+/// significant end, bit 36 inside that word.
+pub fn supportsRightAltBitmap(bitmap_text: []const u8) bool {
+    // Only the two least significant words matter, so keep a rolling pair
+    // instead of buffering arbitrarily long bitmaps.
+    var words = [2]u64{ 0, 0 };
+    var seen: usize = 0;
+    var tokens = std.mem.tokenizeAny(u8, bitmap_text, " \t,");
+    while (tokens.next()) |token| {
+        const value = std.fmt.parseInt(u64, token, 16) catch return false;
+        words[0] = words[1];
+        words[1] = value;
+        seen += 1;
+    }
+    if (seen < 2) return false; // 单个 word 只覆盖 keycode 0..63
+    const word = words[0]; // 倒数第二个 word = word 1
+    const bit: u6 = @intCast(right_alt % 64);
+    return (word >> bit) & 1 == 1;
+}
 pub const input_event_size: usize = 24;
 
 const ev_key: u16 = 1;
@@ -579,4 +600,29 @@ test "hold stop reason prefers release, then shutdown, then the deadline" {
     try std.testing.expectEqual(WaitOutcome.timed_out, holdStopReason(false, false, 1500, 1000).?);
     try std.testing.expect(holdStopReason(false, false, 1000, 0) == null); // 0 = 不限时
     try std.testing.expect(holdStopReason(false, false, 999, 1000) == null);
+}
+
+/// 本机 event0 / event5 的真实位图（最高字在前，末尾 word0 的 bit0 = KEY_RESERVED 为 0）。
+const real_keyboard_bitmap = "1000000000007 ff9f207ac14057ff febeffdfffefffff fffffffffffffffe";
+
+/// 本机 Compx Consumer Control（媒体键，无 RightAlt）。
+const real_consumer_bitmap = "733eff 0 0 483ffff17aff32d bfd4444600000000 1 130c730b17c000 267bfad9415fed 9e168000004400 10000002";
+
+test "accepts bitmaps that can report right alt" {
+    try std.testing.expect(supportsRightAltBitmap(real_keyboard_bitmap));
+    // 方向自检：末字最低位为 0（KEY_RESERVED）
+    const last_word = real_keyboard_bitmap[std.mem.lastIndexOfScalar(u8, real_keyboard_bitmap, ' ').? + 1 ..];
+    try std.testing.expectEqual(@as(u64, 0xfffffffffffffffe), try std.fmt.parseInt(u64, last_word, 16));
+}
+
+test "rejects bitmaps without right alt" {
+    try std.testing.expect(!supportsRightAltBitmap(real_consumer_bitmap));
+    try std.testing.expect(!supportsRightAltBitmap("1f0000")); // 鼠标（单字）
+    try std.testing.expect(!supportsRightAltBitmap("10000 7800000000 e000000000000 0")); // 离线蓝牙键盘
+    try std.testing.expect(!supportsRightAltBitmap(""));
+    try std.testing.expect(!supportsRightAltBitmap("zzz"));
+}
+
+test "parses comma separated bitmaps too" {
+    try std.testing.expect(supportsRightAltBitmap("1000000000007,ff9f207ac14057ff,febeffdfffefffff,fffffffffffffffe"));
 }
