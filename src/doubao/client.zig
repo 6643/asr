@@ -1,6 +1,7 @@
 const std = @import("std");
 const websocket = @import("websocket");
 const config = @import("../config.zig");
+const finish_grace = @import("../runtime/finish_grace.zig");
 const proto = @import("proto.zig");
 
 pub const EventType = enum {
@@ -199,6 +200,9 @@ pub const StreamingSession = struct {
     /// Max time to wait for server final/session_finished after FinishSession.
     pub const finish_timeout_ms: i64 = 5_000;
 
+    /// Extra window for a late final result once `finish_timeout_ms` expired.
+    pub const finish_grace_ms: i64 = finish_grace.default_grace_ms;
+
     pub fn finish(session: *StreamingSession) !StreamFinish {
         if (session.shouldAbortAudio()) {
             session.finish_sent = true;
@@ -210,7 +214,13 @@ pub const StreamingSession = struct {
             session.finish_sent = true;
         }
 
-        return try session.waitForFinish(finish_timeout_ms);
+        const first = try session.waitForFinish(finish_timeout_ms);
+        if (std.meta.activeTag(first) == .none and
+            finish_grace.shouldWaitGrace(finish_grace_ms, session.state.reader_closed, session.state.error_message != null))
+        {
+            return try session.waitForFinish(finish_grace_ms);
+        }
+        return first;
     }
 
     pub fn finishAfterStreamFailure(session: *StreamingSession) StreamFinish {
