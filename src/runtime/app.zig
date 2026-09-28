@@ -8,14 +8,11 @@ const keyboard_set = @import("keyboard.zig");
 const audio_gate = @import("audio_gate.zig");
 const postprocess = @import("postprocess.zig");
 const wayland_im = @import("wayland_im.zig");
+const capture = @import("capture.zig");
 const mic = @import("mic.zig");
 const mute = @import("mute.zig");
-const notify = @import("notify.zig");
 const output = @import("output.zig");
 const shutdown = @import("shutdown.zig");
-const posix_system = std.posix.system;
-
-const max_captured_audio_bytes: usize = 64 * 1024 * 1024;
 
 pub fn installSignalHandlers() void {
     shutdown.installSignalHandlers();
@@ -73,8 +70,8 @@ pub fn run(
     defer if (doubao_creds) |creds| creds.deinit(allocator);
 
     logger.info("app", "ASR started", .{});
-    logger.info(engineLabel(engine_cfg), "engine ready", .{});
-    if (engineKind(engine_cfg) == .doubao) {
+    logger.info(engine.label(engine_cfg), "engine ready", .{});
+    if (engine.kind(engine_cfg) == .doubao) {
         logger.info("doubao", "{s}", .{cfg.device_id});
     }
 
@@ -250,12 +247,12 @@ fn runHotkeyLoop(
         if (event.kind == .release) continue;
         output.keyEvent(logger, .press);
 
-        var callback_ctx = EngineCallbacks{
+        var callback_ctx = capture.EngineCallbacks{
             .pipeline = pipeline,
         };
 
         // Parallel boot: WS handshake overlaps recorder startup + early speech buffer.
-        var session_future_opt = io.concurrent(initSessionWithRetry, .{
+        var session_future_opt = io.concurrent(capture.initSessionWithRetry, .{
             allocator,
             io,
             cfg,
@@ -286,19 +283,19 @@ fn runHotkeyLoop(
         var has_session = false;
         defer if (has_session) session.deinit();
 
-        var stream_state = StreamCaptureState{
+        var stream_state = capture.StreamCaptureState{
             .allocator = allocator,
             .session = null,
             .captured_audio = &captured_audio,
             .gate = &gate,
         };
-        var speaker_guard = SpeakerMuteGuard{
+        var speaker_guard = capture.SpeakerMuteGuard{
             .allocator = allocator,
             .io = io,
             .logger = logger,
         };
         defer speaker_guard.release();
-        var started_state = CaptureStartedState{
+        var started_state = capture.CaptureStartedState{
             .allocator = allocator,
             .io = io,
             .logger = logger,
@@ -313,7 +310,7 @@ fn runHotkeyLoop(
             .callback_ctx = &callback_ctx,
             .debug = debug,
         };
-        var release_state = CaptureReleaseState{
+        var release_state = capture.CaptureReleaseState{
             .logger = logger,
             .speaker_guard = &speaker_guard,
         };
@@ -323,22 +320,22 @@ fn runHotkeyLoop(
         };
         logger.debug("mic", "open", .{});
         const capture_summary = mic.captureStreamUntilKeyRelease(io, event.device.file, &event.device.state, key.right_alt, audio_params, opts.max_hold_ms, .{
-            .on_chunk = onEngineAudioChunk,
+            .on_chunk = capture.onEngineAudioChunk,
             .chunk_ctx = @ptrCast(&stream_state),
-            .on_started = onCaptureStarted,
+            .on_started = capture.onCaptureStarted,
             .started_ctx = @ptrCast(&started_state),
-            .on_stopped = onCaptureStopped,
+            .on_stopped = capture.onCaptureStopped,
             .stopped_ctx = @ptrCast(&release_state),
-            .on_recorder = onCaptureRecorder,
+            .on_recorder = capture.onCaptureRecorder,
             .recorder_ctx = @ptrCast(&started_state),
-            .on_hold_timeout = onHoldTimeout,
+            .on_hold_timeout = capture.onHoldTimeout,
             .hold_timeout_ctx = @ptrCast(&started_state),
         }) catch |err| {
             if (isShutdownRequested()) {
                 logger.info("app", "shutting down", .{});
                 return;
             }
-            logger.err(engineLabel(cfg), "capture failed: {s}", .{@errorName(err)});
+            logger.err(engine.label(cfg), "capture failed: {s}", .{@errorName(err)});
             output.keyWait(logger);
             continue;
         };
@@ -347,26 +344,26 @@ fn runHotkeyLoop(
             return;
         }
         var close_message_buf: [128]u8 = undefined;
-        const close_message = formatMicCloseMessage(&close_message_buf, capture_summary) catch "stopped";
+        const close_message = capture.formatMicCloseMessage(&close_message_buf, capture_summary) catch "stopped";
         logger.debug("mic", "{s}", .{close_message});
 
-        if (noAudioCaptured(capture_summary)) {
+        if (capture.noAudioCaptured(capture_summary)) {
             logger.err("mic", "no_audio_captured: recorder produced 0 bytes; check the microphone and PipeWire", .{});
             output.keyWait(logger);
             continue;
         }
 
         if (!has_session) {
-            logger.err(engineLabel(cfg), "session unavailable", .{});
+            logger.err(engine.label(cfg), "session unavailable", .{});
             output.keyWait(logger);
             continue;
         }
 
         if (stream_state.stream_error) |stream_err| {
-            logger.err(engineLabel(cfg), "stream failed: {s}", .{@errorName(stream_err)});
+            logger.err(engine.label(cfg), "stream failed: {s}", .{@errorName(stream_err)});
             const finish = session.finishAfterStreamFailure();
             if (!handleFinish(allocator, pipeline, finish) and !session.hasFinalEvent()) {
-                if (engineKind(cfg) == .doubao) {
+                if (engine.kind(cfg) == .doubao) {
                     const fallback = doubao.transcribePcmBytes(allocator, io, cfg.doubao, captured_audio.items, .{
                         .pcm_path = "",
                         .debug = debug,
@@ -387,73 +384,13 @@ fn runHotkeyLoop(
         }
 
         const finish = session.finish() catch |err| {
-            logger.err(engineLabel(cfg), "recognize failed: {s}", .{@errorName(err)});
+            logger.err(engine.label(cfg), "recognize failed: {s}", .{@errorName(err)});
             output.keyWait(logger);
             continue;
         };
         _ = handleFinish(allocator, pipeline, finish);
         output.keyWait(logger);
     }
-}
-
-fn initSessionWithRetry(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    cfg: engine.Config,
-    callback_ctx: *const EngineCallbacks,
-    logger: output.Logger,
-    debug: bool,
-) !engine.Session {
-    if (engineKind(cfg) == .baidu) {
-        return engine.Session.init(allocator, io, cfg, .{
-            .debug = debug,
-            .on_interim = onEngineInterim,
-            .interim_ctx = @ptrCast(callback_ctx),
-            .on_final = onEngineFinal,
-            .final_ctx = @ptrCast(callback_ctx),
-        });
-    }
-    var delay_ms: i64 = 1000;
-    var attempt: usize = 0;
-    while (true) {
-        if (isShutdownRequested()) return error.Canceled;
-        if (engine.Session.init(allocator, io, cfg, .{
-            .debug = debug,
-            .on_interim = onEngineInterim,
-            .interim_ctx = @ptrCast(callback_ctx),
-            .on_final = onEngineFinal,
-            .final_ctx = @ptrCast(callback_ctx),
-        })) |session| {
-            return session;
-        } else |err| {
-            attempt += 1;
-            if (err == error.RemoteAsrQuotaExceeded and attempt < 3) {
-                var rand_buf: [8]u8 = undefined;
-                io.random(&rand_buf);
-                const rand_val = std.mem.readInt(u64, &rand_buf, .little);
-                const half_delay = @divTrunc(delay_ms, 2);
-                const jitter: i64 = @as(i64, @intCast(rand_val % @as(u64, @intCast(@max(half_delay, 1)))));
-                const sleep_time = delay_ms + jitter;
-                logger.info("doubao", "concurrency quota exceeded, retry {d}/3 in {d}ms", .{ attempt, sleep_time });
-                shutdown.sleepUntilOr(io, sleep_time);
-                if (isShutdownRequested()) return error.Canceled;
-                delay_ms = @min(delay_ms * 2, 10_000);
-                continue;
-            }
-            return err;
-        }
-    }
-}
-
-fn engineKind(cfg: engine.Config) engine.Kind {
-    return switch (cfg) {
-        .baidu => .baidu,
-        .doubao => .doubao,
-    };
-}
-
-fn engineLabel(cfg: engine.Config) []const u8 {
-    return if (engineKind(cfg) == .baidu) "baidu" else "doubao";
 }
 
 fn handleFinish(
@@ -477,192 +414,4 @@ fn handleFinish(
             return false;
         },
     }
-}
-
-fn onEngineInterim(ctx: ?*const anyopaque, text: []const u8) void {
-    if (text.len == 0) return;
-    const callbacks = @as(*const EngineCallbacks, @ptrCast(@alignCast(ctx orelse return)));
-    callbacks.pipeline.logger.info(callbacks.pipeline.provider, "🎤 {s}", .{text});
-}
-
-fn onEngineFinal(ctx: ?*const anyopaque, text: []const u8) void {
-    if (text.len == 0) return;
-    const callbacks = @as(*const EngineCallbacks, @ptrCast(@alignCast(ctx orelse return)));
-    callbacks.pipeline.submitFinal(text);
-}
-
-fn onEngineAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
-    const state = @as(*StreamCaptureState, @ptrCast(@alignCast(ctx orelse return error.MissingChunkSession)));
-    try state.gate.handleChunk(chunk, @ptrCast(state), sendEngineAudioChunk);
-}
-
-fn sendEngineAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
-    const state = @as(*StreamCaptureState, @ptrCast(@alignCast(ctx orelse return error.MissingChunkSession)));
-    if (state.captured_audio.items.len < max_captured_audio_bytes) {
-        try state.captured_audio.appendSlice(state.allocator, chunk);
-    }
-    if (state.stream_error != null) return;
-    const session = state.session orelse return;
-    session.sendChunk(chunk) catch |err| {
-        state.stream_error = err;
-    };
-}
-
-const StreamCaptureState = struct {
-    allocator: std.mem.Allocator,
-    session: ?*engine.Session,
-    captured_audio: *std.ArrayList(u8),
-    gate: *audio_gate.AudioGate,
-    stream_error: ?anyerror = null,
-};
-
-const EngineCallbacks = struct {
-    pipeline: *postprocess.Pipeline,
-};
-
-const SessionInitResult = @typeInfo(@TypeOf(initSessionWithRetry)).@"fn".return_type.?;
-const SessionFuture = std.Io.Future(SessionInitResult);
-
-fn onHoldTimeout(ctx: ?*anyopaque) void {
-    const state: *const CaptureStartedState = @ptrCast(@alignCast(ctx orelse return));
-    state.logger.info("mic", "max hold reached; stopping", .{});
-}
-
-const CaptureStartedState = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    logger: output.Logger,
-    gate: *audio_gate.AudioGate,
-    speaker_guard: *SpeakerMuteGuard,
-    stream_state: *StreamCaptureState,
-    session: *engine.Session,
-    has_session: *bool,
-    session_future_opt: *?SessionFuture,
-    session_future_taken: *bool,
-    cfg: engine.Config,
-    callback_ctx: *const EngineCallbacks,
-    debug: bool,
-};
-
-const CaptureReleaseState = struct {
-    logger: output.Logger,
-    speaker_guard: *SpeakerMuteGuard,
-};
-
-const SpeakerMuteGuard = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    logger: output.Logger,
-    active: bool = false,
-
-    fn muteAfterPrompt(guard: *SpeakerMuteGuard) void {
-        guard.logger.debug("speaker", "mute", .{});
-        mute.muteSpeaker(guard.allocator, guard.io);
-        guard.active = true;
-    }
-
-    fn release(guard: *SpeakerMuteGuard) void {
-        if (!guard.active) return;
-        guard.logger.debug("speaker", "unmute", .{});
-        mute.unmuteSpeaker(guard.allocator, guard.io);
-        guard.active = false;
-    }
-};
-
-fn playBellTask(allocator: std.mem.Allocator, io: std.Io) void {
-    notify.playMicReadyNotification(allocator, io);
-}
-
-fn resolveSession(state: *CaptureStartedState) !void {
-    if (state.has_session.*) return;
-
-    if (state.session_future_opt.*) |future_value| {
-        var future = future_value;
-        state.session_future_opt.* = null;
-        state.session_future_taken.* = true;
-        state.session.* = try future.await(state.io);
-        state.has_session.* = true;
-    } else {
-        state.session.* = try initSessionWithRetry(
-            state.allocator,
-            state.io,
-            state.cfg,
-            state.callback_ctx,
-            state.logger,
-            state.debug,
-        );
-        state.has_session.* = true;
-    }
-
-    try state.session.start();
-    state.stream_state.session = state.session;
-}
-
-fn onCaptureRecorder(ctx: ?*anyopaque, program: []const u8) void {
-    const state = @as(*CaptureStartedState, @ptrCast(@alignCast(ctx orelse return)));
-    state.logger.debug("mic", "recorder {s}", .{program});
-}
-
-fn onCaptureStarted(ctx: ?*anyopaque) !void {
-    const state = @as(*CaptureStartedState, @ptrCast(@alignCast(ctx orelse return error.MissingCaptureStartedState)));
-
-    if (state.io.concurrent(playBellTask, .{ state.allocator, state.io })) |bell_future_value| {
-        var bell_future = bell_future_value;
-        resolveSession(state) catch |err| {
-            _ = bell_future.await(state.io);
-            state.logger.err(engineLabel(state.cfg), "session failed: {s}", .{@errorName(err)});
-            return err;
-        };
-        _ = bell_future.await(state.io);
-        state.speaker_guard.muteAfterPrompt();
-    } else |_| {
-        playBellTask(state.allocator, state.io);
-        state.speaker_guard.muteAfterPrompt();
-        resolveSession(state) catch |err| {
-            state.logger.err(engineLabel(state.cfg), "session failed: {s}", .{@errorName(err)});
-            return err;
-        };
-    }
-
-    try state.gate.openAndFlush(@ptrCast(state.stream_state), sendEngineAudioChunk);
-    state.logger.info(engineLabel(state.cfg), "🎤", .{});
-}
-
-fn onCaptureStopped(ctx: ?*anyopaque) void {
-    const state = @as(*CaptureReleaseState, @ptrCast(@alignCast(ctx orelse return)));
-    output.keyEvent(state.logger, .release);
-    state.speaker_guard.release();
-}
-
-/// A recorder that produced no bytes at all means the capture path is broken
-/// (no microphone, wrong PipeWire node): say so instead of finishing a silent
-/// session as if nothing happened.
-pub fn noAudioCaptured(summary: mic.StreamSummary) bool {
-    return summary.byte_count == 0;
-}
-
-fn formatMicCloseMessage(buf: []u8, summary: mic.StreamSummary) ![]const u8 {
-    return std.fmt.bufPrint(
-        buf,
-        "stopped: {d} chunks, {d} bytes",
-        .{ summary.chunk_count, summary.byte_count },
-    );
-}
-
-test "formats mic close log as a short capture summary" {
-    var buf: [128]u8 = undefined;
-    const message = try formatMicCloseMessage(&buf, .{
-        .chunk_count = 13,
-        .byte_count = 53194,
-    });
-    try std.testing.expectEqualStrings(
-        "stopped: 13 chunks, 53194 bytes",
-        message,
-    );
-}
-
-test "flags a capture that produced no audio" {
-    try std.testing.expect(noAudioCaptured(.{}));
-    try std.testing.expect(noAudioCaptured(.{ .chunk_count = 3 }));
-    try std.testing.expect(!noAudioCaptured(.{ .chunk_count = 1, .byte_count = 1 }));
 }

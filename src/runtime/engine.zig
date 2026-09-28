@@ -94,6 +94,17 @@ pub const Session = union(Kind) {
     }
 };
 
+pub fn kind(cfg: Config) Kind {
+    return switch (cfg) {
+        .baidu => .baidu,
+        .doubao => .doubao,
+    };
+}
+
+pub fn label(cfg: Config) []const u8 {
+    return if (kind(cfg) == .baidu) "baidu" else "doubao";
+}
+
 fn mapFinish(comptime T: type, value: T) StreamFinish {
     return switch (value) {
         .none => .none,
