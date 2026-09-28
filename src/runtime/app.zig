@@ -353,7 +353,7 @@ fn runHotkeyLoop(
             return;
         }
         var close_message_buf: [128]u8 = undefined;
-        const close_message = formatMicCloseMessage(&close_message_buf, capture_summary) catch "recording already stopped";
+        const close_message = formatMicCloseMessage(&close_message_buf, capture_summary) catch "stopped";
         logger.debug("mic", "{s}", .{close_message});
 
         if (!has_session) {
@@ -750,19 +750,19 @@ fn onCaptureStopped(ctx: ?*anyopaque) void {
 fn formatMicCloseMessage(buf: []u8, summary: mic.StreamSummary) ![]const u8 {
     return std.fmt.bufPrint(
         buf,
-        "recording already stopped; final capture summary chunks={d} bytes={d}",
+        "stopped: {d} chunks, {d} bytes",
         .{ summary.chunk_count, summary.byte_count },
     );
 }
 
-test "formats mic close log as final capture summary after stop" {
+test "formats mic close log as a short capture summary" {
     var buf: [128]u8 = undefined;
     const message = try formatMicCloseMessage(&buf, .{
         .chunk_count = 13,
         .byte_count = 53194,
     });
     try std.testing.expectEqualStrings(
-        "recording already stopped; final capture summary chunks=13 bytes=53194",
+        "stopped: 13 chunks, 53194 bytes",
         message,
     );
 }
