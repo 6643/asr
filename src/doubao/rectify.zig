@@ -111,13 +111,10 @@ fn curlRequest(args: CurlArgs) ?[]u8 {
 
     var child = std.process.spawn(io, .{
         .argv = &.{
-            "curl", "-s", "-X", "POST",
-            "https://ime.oceancloudapi.com/api/v1/rectify_text",
-            "--max-time", max_time,
-            "-H", "content-type: application/json",
-            "-H", sami_hdr,
-            "-H", device_hdr,
-            "-d", body,
+            "curl",                                              "-s",         "-X",     "POST",
+            "https://ime.oceancloudapi.com/api/v1/rectify_text", "--max-time", max_time, "-H",
+            "content-type: application/json",                    "-H",         sami_hdr, "-H",
+            device_hdr,                                          "-d",         body,
         },
         .stdout = .pipe,
         .stderr = .ignore,

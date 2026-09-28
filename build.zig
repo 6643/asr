@@ -51,4 +51,9 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
+
+    const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig" }, .check = true });
+    const check_step = b.step("check", "zig fmt --check plus tests");
+    check_step.dependOn(&fmt_check.step);
+    check_step.dependOn(&run_tests.step);
 }

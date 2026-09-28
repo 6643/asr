@@ -15,7 +15,6 @@ const std = @import("std");
 /// - START:         initialize session with audio params
 /// - HEARTBEAT:     client heartbeat
 /// - FINISH:        end the session
-
 pub const ServerMessageType = enum {
     heartbeat,
     mid_text,
