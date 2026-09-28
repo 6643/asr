@@ -30,6 +30,7 @@ pub fn run(
     io: std.Io,
     environ: std.process.Environ,
     opts: cli.Options,
+    log_file: ?*output.LogFile,
 ) !void {
     installSignalHandlers();
     const debug = opts.debug;
@@ -37,7 +38,7 @@ pub fn run(
         .baidu => .baidu,
         .doubao => .doubao,
     };
-    const logger = output.Logger{ .io = io, .level = if (debug) .debug else .info };
+    const logger = output.Logger{ .io = io, .level = if (debug) .debug else .info, .log_file = log_file };
     if (mute.recoverStaleMute(allocator, io, environ)) {
         logger.info("speaker", "restored mute state after an unclean exit", .{});
     }

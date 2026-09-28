@@ -66,9 +66,17 @@ pub fn main(init: std.process.Init) !void {
         },
         .app => {
             try stdout.flush();
+            var log_file: ?asr.runtime.output.LogFile = null;
+            if (opts.log_file) |path| {
+                log_file = asr.runtime.output.LogFile.open(path) catch {
+                    std.debug.print("asr: cannot open log file {s}\n", .{path});
+                    std.process.exit(2);
+                };
+            }
+            defer if (log_file) |*file| file.deinit();
             // Report failures as one line instead of a Zig error trace: this is
             // the user-facing entry point for compositor and keyboard problems.
-            asr.runtime.app.run(allocator, init.io, init.minimal.environ, opts) catch |err| {
+            asr.runtime.app.run(allocator, init.io, init.minimal.environ, opts, if (log_file) |*file| file else null) catch |err| {
                 std.debug.print("asr: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
             };
