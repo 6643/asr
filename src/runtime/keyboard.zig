@@ -21,7 +21,16 @@ pub const StopReason = enum { shutdown, rescan };
 /// keeps the wait path allocation free and bounds the Select slot buffer.
 pub const max_devices: usize = 8;
 
-pub const Outcome = union(enum) { event: key.Event, stop: StopReason };
+pub const Outcome = union(enum) { event: DeviceEvent, stop: StopReason };
+
+/// A hotkey event together with the keyboard it came from. The device pointer
+/// stays valid while the set is alive; callers must not keep it across a reset
+/// of the device list (removals only happen at safe points and never during a
+/// recording).
+pub const DeviceEvent = struct {
+    kind: key.Event,
+    device: *Device,
+};
 
 /// Supplies the keyboard candidates to re-scan: the app wires this to
 /// `key.findKeyboardDevices`. Errors are logged and ignored so a transient
@@ -164,30 +173,37 @@ pub const Set = struct {
                                 .press => {
                                     if (self.active_handle != null) {
                                         self.logIgnored(index);
+                                        // Keep watching the ignored keyboard.
+                                        addDeviceArm(&select, self.io, &self.devices.items[index], key_code);
                                         continue;
                                     }
                                     self.active_handle = arm.handle;
                                     select.cancelDiscard();
-                                    return .{ .event = .press };
+                                    return .{ .event = .{ .kind = .press, .device = &self.devices.items[index] } };
                                 },
                                 .release => {
                                     const active = self.active_handle orelse {
                                         self.logIgnored(index);
+                                        addDeviceArm(&select, self.io, &self.devices.items[index], key_code);
                                         continue;
                                     };
                                     if (active != arm.handle) {
                                         self.logIgnored(index);
+                                        addDeviceArm(&select, self.io, &self.devices.items[index], key_code);
                                         continue;
                                     }
                                     self.active_handle = null;
                                     select.cancelDiscard();
-                                    return .{ .event = .release };
+                                    return .{ .event = .{ .kind = .release, .device = &self.devices.items[index] } };
                                 },
                             }
                         } else |err| {
                             switch (err) {
-                                // A canceled read is not a dead device: try again.
-                                error.Interrupted => continue,
+                                // A canceled read is not a dead device: watch again.
+                                error.Interrupted => {
+                                    addDeviceArm(&select, self.io, &self.devices.items[index], key_code);
+                                    continue;
+                                },
                                 else => {
                                     const owned_recording = self.active_handle == arm.handle;
                                     self.logRemoved(index, err);
@@ -195,7 +211,7 @@ pub const Set = struct {
                                     if (owned_recording) {
                                         self.active_handle = null;
                                         select.cancelDiscard();
-                                        return .{ .event = .release };
+                                        return .{ .event = .{ .kind = .release, .device = &self.devices.items[index] } };
                                     }
                                     continue;
                                 },
@@ -225,6 +241,20 @@ pub const Set = struct {
             }
             select.cancelDiscard();
         }
+    }
+
+    /// Ends the current recording.
+    ///
+    /// The release is consumed by the capture loop, not by `readNextOrShutdown`,
+    /// so the caller has to say when a recording is over. Every keyboard is
+    /// drained first: presses that arrived while the owner was recording must
+    /// not start a new recording afterwards.
+    pub fn endRecording(self: *Set, key_code: u16) void {
+        for (self.devices.items) |*device| {
+            if (device.dead) continue;
+            drainDevice(device.file, &device.state, key_code, self.logger);
+        }
+        self.active_handle = null;
     }
 
     /// Opens and adds candidates the set does not know yet. Returns true when
@@ -345,6 +375,27 @@ fn addTimerArm(select: *ArmSelect, io: std.Io, is_shutdown: key.ShutdownCheck, i
     select.concurrent(.timer, timerTask, .{ io, is_shutdown, interval_ms }) catch {
         select.async(.timer, timerTask, .{ io, is_shutdown, interval_ms });
     };
+}
+
+/// Reads everything already buffered on one keyboard without blocking: events
+/// that piled up while another keyboard owned the recording.
+fn drainDevice(file: std.Io.File, state: *key.State, key_code: u16, logger: output.Logger) void {
+    const fd = file.handle;
+    const system = std.posix.system;
+    const orig_flags = system.fcntl(fd, system.F.GETFL, @as(usize, 0));
+    if (orig_flags < 0) return;
+    const nonblock_flag = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
+    _ = system.fcntl(fd, system.F.SETFL, @as(usize, @intCast(orig_flags)) | nonblock_flag);
+    var buf: [key.input_event_size]u8 = undefined;
+    var drained: usize = 0;
+    while (true) {
+        const rc = system.read(fd, &buf, buf.len);
+        if (rc <= 0) break;
+        _ = key.update(state, buf[0..@as(usize, @intCast(rc))], key_code);
+        drained += 1;
+    }
+    _ = system.fcntl(fd, system.F.SETFL, @as(usize, @intCast(orig_flags)));
+    if (drained > 0) logger.debug("kbd", "drained {d} buffered events", .{drained});
 }
 
 /// Plays the role of a keyboard device in tests: writing to the returned write
@@ -538,7 +589,7 @@ test "reports a press from any keyboard" {
     b.sendKey(key.right_alt, 1);
 
     const outcome = try set.readNextOrShutdown(key.right_alt, neverShutdown, null, null);
-    try std.testing.expectEqual(key.Event.press, outcome.event);
+    try std.testing.expectEqual(key.Event.press, outcome.event.kind);
 }
 
 test "ignores other keyboards while a recording is owned" {
@@ -559,7 +610,7 @@ test "ignores other keyboards while a recording is owned" {
     // a owns the recording
     a.sendKey(key.right_alt, 1);
     const press = try set.readNextOrShutdown(key.right_alt, neverShutdown, null, null);
-    try std.testing.expectEqual(key.Event.press, press.event);
+    try std.testing.expectEqual(key.Event.press, press.event.kind);
     try std.testing.expectEqual(a.file.handle, set.active_handle.?);
 
     // b presses while a owns the recording: ignored, so the wait keeps blocking
@@ -579,7 +630,7 @@ test "ignores other keyboards while a recording is owned" {
     a.sendKey(key.right_alt, 0);
 
     const release = try set.readNextOrShutdown(key.right_alt, neverShutdown, null, null);
-    try std.testing.expectEqual(key.Event.release, release.event);
+    try std.testing.expectEqual(key.Event.release, release.event.kind);
     try std.testing.expect(set.active_handle == null);
 }
 
@@ -595,12 +646,12 @@ test "a dead keyboard that owns the recording ends it and is dropped" {
 
     a.sendKey(key.right_alt, 1);
     const press = try set.readNextOrShutdown(key.right_alt, neverShutdown, null, null);
-    try std.testing.expectEqual(key.Event.press, press.event);
+    try std.testing.expectEqual(key.Event.press, press.event.kind);
 
     // unplugging a ends the recording instead of hanging in "recording"
     a.unplug();
     const release = try set.readNextOrShutdown(key.right_alt, neverShutdown, null, null);
-    try std.testing.expectEqual(key.Event.release, release.event);
+    try std.testing.expectEqual(key.Event.release, release.event.kind);
     try std.testing.expect(set.active_handle == null);
     try std.testing.expectEqual(@as(usize, 1), set.len());
     try std.testing.expect(!set.hasPath("/fake/a"));

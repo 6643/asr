@@ -4,6 +4,7 @@ const cli = @import("../cli.zig");
 const doubao = @import("../doubao/client.zig");
 const engine = @import("engine.zig");
 const key = @import("../key.zig");
+const keyboard_set = @import("keyboard.zig");
 const audio_gate = @import("audio_gate.zig");
 const postprocess = @import("postprocess.zig");
 const wayland_im = @import("wayland_im.zig");
@@ -41,7 +42,7 @@ pub fn run(
     if (mute.recoverStaleMute(allocator, io, environ)) {
         logger.info("speaker", "restored mute state after an unclean exit", .{});
     }
-    mute.setMarkerPath(allocator, io, environ);
+    mute.setMarkerPath(io, environ);
     var cfg: config.Config = .{};
     var baidu_cfg: config.BaiduConfig = undefined;
     var doubao_creds: ?config.Credentials = null;
@@ -77,11 +78,16 @@ pub fn run(
         logger.info("doubao", "{s}", .{cfg.device_id});
     }
 
-    const keyboard_device = key.findKeyboardDevice(allocator, io, environ) catch |err| {
+    const keyboard_paths = key.findKeyboardDevices(allocator, io, environ) catch |err| {
         logger.err("kbd", "{s}: {s}", .{ @errorName(err), keyFailureHint(err) });
         return err;
     };
-    defer allocator.free(keyboard_device);
+    defer key.freeDeviceList(allocator, keyboard_paths);
+    var keyboards = keyboard_set.Set.openAll(allocator, io, logger, keyboard_paths) catch |err| {
+        logger.err("kbd", "{s}: {s}", .{ @errorName(err), keyFailureHint(err) });
+        return err;
+    };
+    defer keyboards.closeAll();
 
     const client = wayland_im.connect(allocator, io, environ) catch |err| {
         logger.err("wayland", "unavailable: {s}: {s}", .{ @errorName(err), waylandFailureHint(err) });
@@ -123,7 +129,18 @@ pub fn run(
         }
     }
 
-    try runHotkeyLoop(allocator, io, environ, logger, engine_cfg, keyboard_device, pipeline, opts, &wayland_loop.failed);
+    var rescan_ctx = RescanCtx{ .environ = environ };
+    try runHotkeyLoop(allocator, io, logger, engine_cfg, &keyboards, pipeline, opts, &wayland_loop.failed, &rescan_ctx);
+}
+
+/// Re-scan source handed to the keyboard set while it waits.
+const RescanCtx = struct {
+    environ: std.process.Environ,
+};
+
+fn rescanCandidates(ctx: ?*anyopaque, allocator: std.mem.Allocator, io: std.Io) anyerror![][]u8 {
+    const source: *const RescanCtx = @ptrCast(@alignCast(ctx.?));
+    return key.findKeyboardDevices(allocator, io, source.environ);
 }
 
 /// Extra context for a wayland connection failure, shown after the error name.
@@ -190,17 +207,15 @@ fn runWaylandLoop(loop: *WaylandLoop) void {
 fn runHotkeyLoop(
     allocator: std.mem.Allocator,
     io: std.Io,
-    environ: std.process.Environ,
     logger: output.Logger,
     cfg: engine.Config,
-    initial_keyboard_device: []const u8,
+    keyboards: *keyboard_set.Set,
     pipeline: *postprocess.Pipeline,
     opts: cli.Options,
     wayland_failed: *const std.atomic.Value(bool),
+    rescan_ctx: *RescanCtx,
 ) !void {
     const debug = opts.debug;
-    var keyboard = try KeyboardEventStream.open(allocator, io, environ, logger, initial_keyboard_device);
-    defer keyboard.deinit();
 
     output.keyWait(logger);
     while (true) {
@@ -212,30 +227,27 @@ fn runHotkeyLoop(
             logger.info("app", "shutting down", .{});
             return;
         }
-        const event_opt = keyboard.readNextOrShutdown(key.right_alt) catch |err| {
+        const outcome = keyboards.readNextOrShutdown(key.right_alt, isShutdownRequested, rescanCandidates, rescan_ctx) catch |err| {
             if (err == error.Interrupted) continue;
-            switch (classifyKeyboardReadFailure(err)) {
-                .reopen => {
-                    keyboard.reopenAfterReadFailure(err);
-                    if (isShutdownRequested()) {
-                        logger.info("app", "shutting down", .{});
-                        return;
+            logger.err("kbd", "{s}", .{@errorName(err)});
+            return err;
+        };
+        const event = switch (outcome) {
+            .stop => |reason| switch (reason) {
+                // Rescans are handled inside the set; only shutdown surfaces.
+                .rescan => continue,
+                .shutdown => {
+                    if (wayland_failed.load(.acquire)) {
+                        logger.err("wayland", "input method connection lost; exiting", .{});
+                        return error.WaylandDisconnected;
                     }
-                    output.keyWait(logger);
-                    continue;
+                    logger.info("app", "shutting down", .{});
+                    return;
                 },
-                .fail => return err,
-            }
+            },
+            .event => |value| value,
         };
-        const event = event_opt orelse {
-            if (wayland_failed.load(.acquire)) {
-                logger.err("wayland", "input method connection lost; exiting", .{});
-                return error.WaylandDisconnected;
-            }
-            logger.info("app", "shutting down", .{});
-            return;
-        };
-        if (event == .release) continue;
+        if (event.kind == .release) continue;
         output.keyEvent(logger, .press);
 
         var callback_ctx = EngineCallbacks{
@@ -261,7 +273,9 @@ fn runHotkeyLoop(
             }
         };
 
-        defer drainKeyboardEvents(keyboard.file, &keyboard.state, key.right_alt, logger);
+        // The capture loop consumes the release, so tell the set when the
+        // recording is over (and drop presses that piled up meanwhile).
+        defer keyboards.endRecording(key.right_alt);
         var captured_audio: std.ArrayList(u8) = .empty;
         defer captured_audio.deinit(allocator);
         var gate = audio_gate.AudioGate.init(allocator, io);
@@ -308,7 +322,7 @@ fn runHotkeyLoop(
             .doubao => |value| .{ .sample_rate = value.sample_rate, .channels = value.channels, .frame_duration_ms = value.frame_duration_ms },
         };
         logger.debug("mic", "open", .{});
-        const capture_summary = mic.captureStreamUntilKeyRelease(io, keyboard.file, &keyboard.state, key.right_alt, audio_params, opts.max_hold_ms, .{
+        const capture_summary = mic.captureStreamUntilKeyRelease(io, event.device.file, &event.device.state, key.right_alt, audio_params, opts.max_hold_ms, .{
             .on_chunk = onEngineAudioChunk,
             .chunk_ctx = @ptrCast(&stream_state),
             .on_started = onCaptureStarted,
@@ -440,133 +454,6 @@ fn engineKind(cfg: engine.Config) engine.Kind {
 
 fn engineLabel(cfg: engine.Config) []const u8 {
     return if (engineKind(cfg) == .baidu) "baidu" else "doubao";
-}
-
-const KeyboardReadFailureAction = enum {
-    reopen,
-    fail,
-};
-
-fn classifyKeyboardReadFailure(err: anyerror) KeyboardReadFailureAction {
-    return switch (err) {
-        error.KeyboardDeviceDisconnected,
-        error.EndOfStream,
-        error.ReadFailed,
-        => .reopen,
-        else => .fail,
-    };
-}
-
-const KeyboardEventStream = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    environ: std.process.Environ,
-    logger: output.Logger,
-    path: []u8,
-    file: std.Io.File,
-    state: key.State = .{},
-
-    fn open(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        environ: std.process.Environ,
-        logger: output.Logger,
-        initial_path: []const u8,
-    ) !KeyboardEventStream {
-        const owned_path = try allocator.dupe(u8, initial_path);
-        errdefer allocator.free(owned_path);
-
-        const file = openKeyboardFile(io, owned_path) catch |err| {
-            // A device we may not read is a different problem from a missing
-            // one, and the user fixes it differently.
-            const mapped: anyerror = switch (key.classifyDeviceOpenError(err)) {
-                .denied => error.KeyboardPermissionDenied,
-                else => error.KeyboardDeviceNotFound,
-            };
-            logger.err("kbd", "{s}: {s}: {s}", .{ owned_path, @errorName(err), keyFailureHint(mapped) });
-            return mapped;
-        };
-        logger.info("kbd", "{s}", .{owned_path});
-
-        return .{
-            .allocator = allocator,
-            .io = io,
-            .environ = environ,
-            .logger = logger,
-            .path = owned_path,
-            .file = file,
-        };
-    }
-
-    fn deinit(stream: *KeyboardEventStream) void {
-        stream.file.close(stream.io);
-        stream.allocator.free(stream.path);
-    }
-
-    fn readNext(stream: *KeyboardEventStream, key_code: u16) key.DeviceReadError!key.Event {
-        return key.readNextDeviceEvent(stream.io, stream.file, &stream.state, key_code);
-    }
-
-    fn readNextOrShutdown(stream: *KeyboardEventStream, key_code: u16) key.DeviceReadError!?key.Event {
-        return key.waitNextDeviceEventOrShutdown(
-            stream.io,
-            stream.file,
-            &stream.state,
-            key_code,
-            isShutdownRequested,
-        );
-    }
-
-    fn reopenAfterReadFailure(stream: *KeyboardEventStream, read_err: anyerror) void {
-        stream.logger.err("kbd", "read failed: {s}; reopening keyboard device", .{@errorName(read_err)});
-        while (!isShutdownRequested()) {
-            const next_path = key.findKeyboardDevice(stream.allocator, stream.io, stream.environ) catch |err| {
-                stream.logger.err("kbd", "reopen failed: {s}", .{@errorName(err)});
-                shutdown.sleepUntilOr(stream.io, 500);
-                continue;
-            };
-
-            const next_file = openKeyboardFile(stream.io, next_path) catch |err| {
-                stream.logger.err("kbd", "open failed: {s}: {s}", .{ next_path, @errorName(err) });
-                stream.allocator.free(next_path);
-                shutdown.sleepUntilOr(stream.io, 500);
-                continue;
-            };
-
-            stream.file.close(stream.io);
-            stream.allocator.free(stream.path);
-            stream.path = next_path;
-            stream.file = next_file;
-            stream.state = .{};
-            stream.logger.info("kbd", "{s}", .{stream.path});
-            return;
-        }
-    }
-};
-
-fn openKeyboardFile(io: std.Io, path: []const u8) !std.Io.File {
-    return std.Io.Dir.cwd().openFile(io, path, .{});
-}
-
-fn drainKeyboardEvents(file: std.Io.File, state: *key.State, key_code: u16, logger: output.Logger) void {
-    const fd = file.handle;
-    const system = std.posix.system;
-    const orig_flags = system.fcntl(fd, system.F.GETFL, @as(usize, 0));
-    if (orig_flags < 0) return;
-    const nonblock_flag = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
-    _ = system.fcntl(fd, system.F.SETFL, @as(usize, @intCast(orig_flags)) | nonblock_flag);
-    var buf: [key.input_event_size]u8 = undefined;
-    var drained: usize = 0;
-    while (true) {
-        const rc = system.read(fd, &buf, buf.len);
-        if (rc <= 0) break;
-        _ = key.update(state, buf[0..@as(usize, @intCast(rc))], key_code);
-        drained += 1;
-    }
-    _ = system.fcntl(fd, system.F.SETFL, @as(usize, @intCast(orig_flags)));
-    if (drained > 0) {
-        logger.debug("kbd", "drained {d} buffered events", .{drained});
-    }
 }
 
 fn handleFinish(
@@ -772,16 +659,6 @@ test "formats mic close log as a short capture summary" {
         "stopped: 13 chunks, 53194 bytes",
         message,
     );
-}
-
-test "keyboard read failed reopens event reader instead of exiting" {
-    try std.testing.expectEqual(KeyboardReadFailureAction.reopen, classifyKeyboardReadFailure(error.KeyboardDeviceDisconnected));
-    try std.testing.expectEqual(KeyboardReadFailureAction.reopen, classifyKeyboardReadFailure(error.ReadFailed));
-    try std.testing.expectEqual(KeyboardReadFailureAction.fail, classifyKeyboardReadFailure(error.AccessDenied));
-}
-
-test "Interrupted is not classified as reopen" {
-    try std.testing.expectEqual(KeyboardReadFailureAction.fail, classifyKeyboardReadFailure(error.Interrupted));
 }
 
 test "flags a capture that produced no audio" {

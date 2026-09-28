@@ -10,19 +10,23 @@ pub const marker_name = "asr-speaker-muted";
 const MuteState = struct {
     mutex: std.Io.Mutex = .init,
     muted_by_us: bool = false,
-    marker_path: ?[]u8 = null,
+    /// Borrowed slice of `marker_path_buffer`: nothing to free at exit.
+    marker_path: ?[]const u8 = null,
+    marker_path_buffer: [std.fs.max_path_bytes]u8 = undefined,
 };
 
 var state: MuteState = .{};
 
 /// Records where the "we muted the sink" marker lives; without
 /// `$XDG_RUNTIME_DIR` crash recovery is disabled but muting still works.
-pub fn setMarkerPath(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ) void {
+pub fn setMarkerPath(io: std.Io, environ: std.process.Environ) void {
     const runtime_dir = std.process.Environ.getPosix(environ, "XDG_RUNTIME_DIR");
-    const path = markerPathWith(allocator, runtime_dir) orelse return;
+    const path = markerPathWith(&state.marker_path_buffer, runtime_dir) orelse {
+        state.marker_path = null;
+        return;
+    };
     state.mutex.lockUncancelable(io);
     defer state.mutex.unlock(io);
-    if (state.marker_path) |old| allocator.free(old);
     state.marker_path = path;
 }
 
@@ -30,18 +34,18 @@ pub fn setMarkerPath(allocator: std.mem.Allocator, io: std.Io, environ: std.proc
 /// Returns true when a stale marker was found and the sink unmuted.
 pub fn recoverStaleMute(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ) bool {
     const runtime_dir = std.process.Environ.getPosix(environ, "XDG_RUNTIME_DIR");
-    const path = markerPathWith(allocator, runtime_dir) orelse return false;
-    defer allocator.free(path);
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = markerPathWith(&buffer, runtime_dir) orelse return false;
     if (!markerExists(io, path)) return false;
     const unmuted = runMute(allocator, io, false);
     clearMarker(io, path);
     return unmuted;
 }
 
-pub fn markerPathWith(allocator: std.mem.Allocator, runtime_dir: ?[]const u8) ?[]u8 {
+pub fn markerPathWith(buffer: []u8, runtime_dir: ?[]const u8) ?[]const u8 {
     const dir = runtime_dir orelse return null;
     if (dir.len == 0) return null;
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, marker_name }) catch null;
+    return std.fmt.bufPrint(buffer, "{s}/{s}", .{ dir, marker_name }) catch null;
 }
 
 pub fn markerExists(io: std.Io, path: []const u8) bool {
@@ -109,11 +113,11 @@ test "detects muted output regardless of case" {
 }
 
 test "builds the marker path from the runtime dir" {
-    const path = markerPathWith(std.testing.allocator, "/run/user/1000").?;
-    defer std.testing.allocator.free(path);
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = markerPathWith(&buffer, "/run/user/1000").?;
     try std.testing.expectEqualStrings("/run/user/1000/asr-speaker-muted", path);
-    try std.testing.expect(markerPathWith(std.testing.allocator, null) == null);
-    try std.testing.expect(markerPathWith(std.testing.allocator, "") == null);
+    try std.testing.expect(markerPathWith(&buffer, null) == null);
+    try std.testing.expect(markerPathWith(&buffer, "") == null);
 }
 
 test "marker round trip" {
