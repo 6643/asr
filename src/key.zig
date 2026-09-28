@@ -1,4 +1,5 @@
 const std = @import("std");
+const small_file = @import("runtime/small_file.zig");
 
 pub const right_alt: u16 = 100;
 
@@ -75,32 +76,166 @@ pub fn update(state: *State, bytes: []const u8, key_code: u16) ?Event {
     return null;
 }
 
-pub fn findKeyboardDevice(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ) ![]u8 {
-    if (std.process.Environ.getPosix(environ, "ASR_KEYBOARD_DEVICE")) |device| {
-        const trimmed = std.mem.trim(u8, device, " \t\r\n");
-        if (trimmed.len > 0) return allocator.dupe(u8, trimmed);
+/// Every keyboard we can read from, in discovery order. Overrides win: the
+/// single `ASR_KEYBOARD_DEVICE` pin, then the debug list `ASR_KEYBOARD_DEVICES`.
+/// Otherwise `/proc/bus/input/devices` decides; if that yields nothing (for
+/// example a kernel without the proc file), fall back to the by-id/by-path
+/// symlink dirs. Devices we may not read are dropped, but "no keyboard" and
+/// "no permission" stay distinguishable.
+pub fn findKeyboardDevices(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ) ![][]u8 {
+    const single = std.process.Environ.getPosix(environ, "ASR_KEYBOARD_DEVICE");
+    const multi = std.process.Environ.getPosix(environ, "ASR_KEYBOARD_DEVICES");
+    if (try overriddenDevicePaths(allocator, single, multi)) |paths| {
+        // Overrides go through the same validation so a typo or a permission
+        // problem still reports "not found" vs "no permission" instead of
+        // failing later, deep inside the read loop.
+        return dropUnreadableDevices(allocator, io, paths);
     }
 
+    const candidates = try discoverCandidates(allocator, io);
+    return dropUnreadableDevices(allocator, io, candidates);
+}
+
+/// `/proc/bus/input/devices` first (deterministic order), then the symlink dirs.
+fn discoverCandidates(allocator: std.mem.Allocator, io: std.Io) ![][]u8 {
+    const content: ?[]u8 = small_file.readAll(io, allocator, "/proc/bus/input/devices", small_file.max_bytes_default) catch null;
+    const text = content orelse return findKeyboardDevicesFromSymlinkDirs(allocator, io);
+    defer allocator.free(text);
+
+    const from_proc = try findKeyboardDevicesInProcInput(allocator, text);
+    if (from_proc.len > 0) return from_proc;
+    freeDeviceList(allocator, from_proc);
+    return findKeyboardDevicesFromSymlinkDirs(allocator, io);
+}
+
+/// Keeps only devices that can be opened; reports a permission problem when the
+/// only reason nothing is left is that we may not read them.
+fn dropUnreadableDevices(allocator: std.mem.Allocator, io: std.Io, candidates: [][]u8) ![][]u8 {
+    defer allocator.free(candidates);
+
+    var usable: std.ArrayList([]u8) = .empty;
+    errdefer freePathList(allocator, &usable);
     var saw_denied = false;
-    const content = try std.Io.Dir.cwd().readFileAlloc(io, "/proc/bus/input/devices", allocator, .limited(1024 * 1024));
-    defer allocator.free(content);
-    if (findKeyboardDeviceInProcInput(allocator, content)) |path| {
+    for (candidates) |path| {
         switch (openDeviceState(io, path)) {
-            .usable => return path,
-            .denied => saw_denied = true,
-            .missing => {},
+            .usable => usable.append(allocator, path) catch |err| {
+                allocator.free(path);
+                return err;
+            },
+            .denied => {
+                saw_denied = true;
+                allocator.free(path);
+            },
+            .missing => allocator.free(path),
         }
-        allocator.free(path);
     }
-    if (findKeyboardDeviceFromSymlinkDirs(allocator, io)) |path| {
-        switch (openDeviceState(io, path)) {
-            .usable => return path,
-            .denied => saw_denied = true,
-            .missing => {},
+    if (usable.items.len == 0) return deviceSearchFailure(saw_denied);
+    return usable.toOwnedSlice(allocator);
+}
+
+/// Frees the paths held by a list plus the list's own buffer. `freeDeviceList`
+/// only fits slices that own their memory (`toOwnedSlice`/`alloc`); calling it
+/// with `ArrayList.items` would free a sub-range of another allocation.
+fn freePathList(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
+    for (list.items) |path| allocator.free(path);
+    list.deinit(allocator);
+}
+
+/// Single-device view kept for callers that only need one keyboard.
+pub fn findKeyboardDevice(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ) ![]u8 {
+    const devices = try findKeyboardDevices(allocator, io, environ);
+    defer freeDeviceList(allocator, devices);
+    if (devices.len == 0) return error.KeyboardDeviceNotFound;
+    return allocator.dupe(u8, devices[0]);
+}
+
+/// Explicit device overrides: the single pin wins over the colon/comma separated
+/// debug list. Null means "discover automatically".
+pub fn overriddenDevicePaths(allocator: std.mem.Allocator, single: ?[]const u8, multi: ?[]const u8) !?[][]u8 {
+    if (single) |value| {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len > 0) {
+            const paths = try allocator.alloc([]u8, 1);
+            errdefer allocator.free(paths);
+            paths[0] = try allocator.dupe(u8, trimmed);
+            return paths;
         }
-        allocator.free(path);
     }
-    return deviceSearchFailure(saw_denied);
+
+    const list = multi orelse return null;
+    var paths: std.ArrayList([]u8) = .empty;
+    errdefer freePathList(allocator, &paths);
+    var tokens = std.mem.tokenizeAny(u8, list, ":,\n");
+    while (tokens.next()) |token| {
+        const trimmed = std.mem.trim(u8, token, " \t\r");
+        if (trimmed.len == 0) continue;
+        if (containsPath(paths.items, trimmed)) continue;
+        const owned = try allocator.dupe(u8, trimmed);
+        paths.append(allocator, owned) catch |err| {
+            allocator.free(owned);
+            return err;
+        };
+    }
+    if (paths.items.len == 0) {
+        paths.deinit(allocator);
+        return null;
+    }
+    const owned = try paths.toOwnedSlice(allocator);
+    return owned;
+}
+
+pub fn sysfsCapabilitiesPath(allocator: std.mem.Allocator, event_name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "/sys/class/input/{s}/device/capabilities/key", .{event_name});
+}
+
+/// Reads the device's sysfs key bitmap - an independent source from the
+/// `/proc/bus/input/devices` text - and asks whether it can report RightAlt.
+fn deviceSupportsRightAlt(io: std.Io, allocator: std.mem.Allocator, event_name: []const u8) bool {
+    const cap_path = sysfsCapabilitiesPath(allocator, event_name) catch return false;
+    defer allocator.free(cap_path);
+    const bitmap = small_file.readAll(io, allocator, cap_path, 4096) catch return false;
+    defer allocator.free(bitmap);
+    return supportsRightAltBitmap(bitmap);
+}
+
+/// Collects `*-event-kbd` links of one directory, resolving each to
+/// `/dev/input/eventN` and keeping only capable devices.
+pub fn collectCapableKeyboardsInSymlinkDir(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) ![][]u8 {
+    var paths: std.ArrayList([]u8) = .empty;
+    errdefer freePathList(allocator, &paths);
+
+    var dir = if (std.fs.path.isAbsolute(dir_path))
+        std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return paths.toOwnedSlice(allocator)
+    else
+        // Relative paths only happen in tests; production passes /dev/input/...
+        std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return paths.toOwnedSlice(allocator);
+    defer dir.close(io);
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, "-event-kbd")) continue;
+        var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const link_len = dir.readLink(io, entry.name, &link_buf) catch continue;
+        const event_name = eventNameFromLinkTarget(link_buf[0..link_len]) orelse continue;
+        if (!deviceSupportsRightAlt(io, allocator, event_name)) continue;
+        const path = try std.fmt.allocPrint(allocator, "/dev/input/{s}", .{event_name});
+        if (containsPath(paths.items, path)) {
+            allocator.free(path);
+            continue;
+        }
+        paths.append(allocator, path) catch |err| {
+            allocator.free(path);
+            return err;
+        };
+    }
+    return paths.toOwnedSlice(allocator);
+}
+
+/// by-id first: it names real products; by-path only when by-id is empty.
+pub fn findKeyboardDevicesFromSymlinkDirs(allocator: std.mem.Allocator, io: std.Io) ![][]u8 {
+    const by_id = try collectCapableKeyboardsInSymlinkDir(io, allocator, "/dev/input/by-id");
+    if (by_id.len > 0) return by_id;
+    freeDeviceList(allocator, by_id);
+    return collectCapableKeyboardsInSymlinkDir(io, allocator, "/dev/input/by-path");
 }
 
 /// Collects every candidate keyboard in file order, skipping duplicates. A
@@ -109,7 +244,7 @@ pub fn findKeyboardDevice(allocator: std.mem.Allocator, io: std.Io, environ: std
 /// buttons, video buses and keyboard interfaces that never send real keys.
 pub fn findKeyboardDevicesInProcInput(allocator: std.mem.Allocator, content: []const u8) ![][]u8 {
     var paths: std.ArrayList([]u8) = .empty;
-    errdefer freeDeviceList(allocator, paths.items);
+    errdefer freePathList(allocator, &paths);
 
     var blocks = std.mem.splitSequence(u8, content, "\n\n");
     while (blocks.next()) |block| {
@@ -409,30 +544,6 @@ fn hasHandlerToken(handlers: []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn findKeyboardDeviceFromSymlinkDirs(allocator: std.mem.Allocator, io: std.Io) ?[]u8 {
-    if (findKeyboardDeviceInSymlinkDir(allocator, io, "/dev/input/by-id")) |path| return path;
-    return findKeyboardDeviceInSymlinkDir(allocator, io, "/dev/input/by-path");
-}
-
-fn findKeyboardDeviceInSymlinkDir(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    dir_path: []const u8,
-) ?[]u8 {
-    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return null;
-    defer dir.close(io);
-    var iter = dir.iterate();
-    while (iter.next(io) catch return null) |entry| {
-        if (!std.mem.endsWith(u8, entry.name, "-event-kbd")) continue;
-        var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const link_len = dir.readLink(io, entry.name, &link_buf) catch continue;
-        const target = link_buf[0..link_len];
-        const event_name = eventNameFromLinkTarget(target) orelse continue;
-        return std.fmt.allocPrint(allocator, "/dev/input/{s}", .{event_name}) catch null;
-    }
-    return null;
-}
-
 fn eventNameFromLinkTarget(target: []const u8) ?[]const u8 {
     const event_name = blk: {
         if (std.mem.startsWith(u8, target, "/dev/input/event")) break :blk target["/dev/input/".len..];
@@ -459,9 +570,18 @@ pub fn classifyDeviceOpenError(err: anyerror) DeviceOpen {
     };
 }
 
+/// Probes a device without blocking: O_NONBLOCK matters because a FIFO (used by
+/// the test harness as a fake keyboard) would otherwise stall the caller until a
+/// writer shows up. The probe fd is closed immediately, so the flag never leaks
+/// into the fd used for reading.
 pub fn openDeviceState(io: std.Io, path: []const u8) DeviceOpen {
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| return classifyDeviceOpenError(err);
-    file.close(io);
+    _ = io;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
+        .ACCMODE = .RDONLY,
+        .NONBLOCK = true,
+        .CLOEXEC = true,
+    }, 0) catch |err| return classifyDeviceOpenError(err);
+    _ = std.posix.system.close(fd);
     return .usable;
 }
 
@@ -551,6 +671,79 @@ test "normalizes symlink target into event device path" {
     try std.testing.expectEqualStrings("event2", eventNameFromLinkTarget("../event2").?);
     try std.testing.expectEqualStrings("event3", eventNameFromLinkTarget("/dev/input/event3").?);
     try std.testing.expectEqualStrings("event4", eventNameFromLinkTarget("event4").?);
+}
+
+test "builds the sysfs capability path for an event device" {
+    const path = try sysfsCapabilitiesPath(std.testing.allocator, "event5");
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("/sys/class/input/event5/device/capabilities/key", path);
+}
+
+test "device overrides come from the single pin first, then the debug list" {
+    const allocator = std.testing.allocator;
+
+    {
+        const paths = (try overriddenDevicePaths(allocator, " /dev/input/event5 ", null)).?;
+        defer freeDeviceList(allocator, paths);
+        try std.testing.expectEqual(@as(usize, 1), paths.len);
+        try std.testing.expectEqualStrings("/dev/input/event5", paths[0]);
+    }
+    {
+        const paths = (try overriddenDevicePaths(allocator, null, " /tmp/kbdA : : /tmp/kbdB ,/tmp/kbdA")).?;
+        defer freeDeviceList(allocator, paths);
+        try std.testing.expectEqual(@as(usize, 2), paths.len);
+        try std.testing.expectEqualStrings("/tmp/kbdA", paths[0]);
+        try std.testing.expectEqualStrings("/tmp/kbdB", paths[1]);
+    }
+    {
+        const paths = (try overriddenDevicePaths(allocator, "/dev/input/event0", "/tmp/kbdA")).?;
+        defer freeDeviceList(allocator, paths);
+        try std.testing.expectEqualStrings("/dev/input/event0", paths[0]);
+    }
+    try std.testing.expect(try overriddenDevicePaths(allocator, "  ", "") == null);
+}
+
+test "device overrides are validated like discovered devices" {
+    const env: std.process.Environ = .{ .block = .{ .slice = &.{"ASR_KEYBOARD_DEVICES=/tmp/asr-no-such-keyboard"} } };
+    try std.testing.expectError(
+        error.KeyboardDeviceNotFound,
+        findKeyboardDevices(std.testing.allocator, std.testing.io, env),
+    );
+}
+
+test "live discovery only returns readable, capable keyboards" {
+    const allocator = std.testing.allocator;
+    const candidates = try discoverCandidates(allocator, std.testing.io);
+    const devices = try dropUnreadableDevices(allocator, std.testing.io, candidates);
+    defer freeDeviceList(allocator, devices);
+
+    try std.testing.expect(devices.len > 0);
+    for (devices) |path| {
+        try std.testing.expect(std.mem.startsWith(u8, path, "/dev/input/event"));
+        const event_name = std.fs.path.basename(path);
+        try std.testing.expect(deviceSupportsRightAlt(std.testing.io, allocator, event_name));
+    }
+}
+
+test "collects capable keyboards from a symlink dir" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache/tmp", tmp.sub_path[0..], "by-id" });
+    defer std.testing.allocator.free(dir_path);
+    try std.Io.Dir.cwd().createDir(std.testing.io, dir_path, .default_dir);
+    var dir = try std.Io.Dir.cwd().openDir(std.testing.io, dir_path, .{});
+    defer dir.close(std.testing.io);
+
+    // 真实存在的 event5（sysfs 能力位合格）与一个不存在的 event99
+    try dir.symLink(std.testing.io, "../../event5", "usb-Real-event-kbd", .{});
+    try dir.symLink(std.testing.io, "../../event99", "usb-Ghost-event-kbd", .{});
+    try dir.symLink(std.testing.io, "../../event5", "usb-Other-if01", .{}); // 非 -event-kbd 应忽略
+
+    const devices = try collectCapableKeyboardsInSymlinkDir(std.testing.io, std.testing.allocator, dir_path);
+    defer freeDeviceList(std.testing.allocator, devices);
+
+    try std.testing.expectEqual(@as(usize, 1), devices.len);
+    try std.testing.expectEqualStrings("/dev/input/event5", devices[0]);
 }
 
 test "device read error set includes Interrupted for cancel/signal wakeups" {
