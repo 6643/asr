@@ -7,7 +7,6 @@ pub const CaptureOptions = struct {
     sample_rate: u32 = 16000,
     channels: u16 = 1,
     frame_duration_ms: u16 = 100,
-    device: ?[]const u8 = null,
 };
 
 pub const StreamOptions = struct {
@@ -34,9 +33,8 @@ pub fn captureStreamUntilKeyRelease(
     options: CaptureOptions,
     stream: StreamOptions,
 ) !StreamSummary {
-    const spawned = try spawnRecorder(io, options);
-    var child = spawned.child;
-    if (stream.on_recorder) |on_recorder| on_recorder(stream.recorder_ctx, recorders.program(spawned.kind));
+    var child = try spawnRecorder(io, options);
+    if (stream.on_recorder) |on_recorder| on_recorder(stream.recorder_ctx, recorders.program());
     errdefer child.kill(io);
     var stop_requested = std.atomic.Value(bool).init(false);
 
@@ -70,16 +68,15 @@ const StopCallback = struct {
     ctx: ?*anyopaque = null,
 };
 
-fn spawnRecorder(io: std.Io, options: CaptureOptions) !recorders.Spawned {
+fn spawnRecorder(io: std.Io, options: CaptureOptions) !std.process.Child {
     var frame_rate_buf: [16]u8 = undefined;
     const frame_rate = try std.fmt.bufPrint(&frame_rate_buf, "{d}", .{effectiveSampleRate(options)});
     var channels_buf: [8]u8 = undefined;
     const channels = try std.fmt.bufPrint(&channels_buf, "{d}", .{effectiveChannels(options)});
 
-    return recorders.spawnFirst(io, .{
+    return recorders.spawn(io, .{
         .rate = frame_rate,
         .channels = channels,
-        .device = options.device,
     });
 }
 
