@@ -25,7 +25,7 @@ pub fn supportsRightAltBitmap(bitmap_text: []const u8) bool {
 }
 pub const input_event_size: usize = 24;
 
-const ev_key: u16 = 1;
+pub const ev_key: u16 = 1;
 const ev_syn: u16 = 0;
 const syn_report: u16 = 0;
 
