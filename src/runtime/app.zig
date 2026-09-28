@@ -308,7 +308,7 @@ fn runHotkeyLoop(
             .doubao => |value| .{ .sample_rate = value.sample_rate, .channels = value.channels, .frame_duration_ms = value.frame_duration_ms },
         };
         logger.debug("mic", "open", .{});
-        const capture_summary = mic.captureStreamUntilKeyRelease(io, keyboard.file, &keyboard.state, key.right_alt, audio_params, .{
+        const capture_summary = mic.captureStreamUntilKeyRelease(io, keyboard.file, &keyboard.state, key.right_alt, audio_params, opts.max_hold_ms, .{
             .on_chunk = onEngineAudioChunk,
             .chunk_ctx = @ptrCast(&stream_state),
             .on_started = onCaptureStarted,
@@ -317,6 +317,8 @@ fn runHotkeyLoop(
             .stopped_ctx = @ptrCast(&release_state),
             .on_recorder = onCaptureRecorder,
             .recorder_ctx = @ptrCast(&started_state),
+            .on_hold_timeout = onHoldTimeout,
+            .hold_timeout_ctx = @ptrCast(&started_state),
         }) catch |err| {
             if (isShutdownRequested()) {
                 logger.info("app", "shutting down", .{});
@@ -633,6 +635,11 @@ const EngineCallbacks = struct {
 
 const SessionInitResult = @typeInfo(@TypeOf(initSessionWithRetry)).@"fn".return_type.?;
 const SessionFuture = std.Io.Future(SessionInitResult);
+
+fn onHoldTimeout(ctx: ?*anyopaque) void {
+    const state: *const CaptureStartedState = @ptrCast(@alignCast(ctx orelse return));
+    state.logger.info("mic", "max hold reached; stopping", .{});
+}
 
 const CaptureStartedState = struct {
     allocator: std.mem.Allocator,

@@ -18,6 +18,9 @@ pub const StreamOptions = struct {
     stopped_ctx: ?*anyopaque = null,
     on_recorder: ?*const fn (ctx: ?*anyopaque, program: []const u8) void = null,
     recorder_ctx: ?*anyopaque = null,
+    /// Called when the hold cap stopped the capture instead of a key release.
+    on_hold_timeout: ?*const fn (ctx: ?*anyopaque) void = null,
+    hold_timeout_ctx: ?*anyopaque = null,
 };
 
 pub const StreamSummary = struct {
@@ -31,6 +34,7 @@ pub fn captureStreamUntilKeyRelease(
     key_state: *key.State,
     key_code: u16,
     options: CaptureOptions,
+    max_hold_ms: i64,
     stream: StreamOptions,
 ) !StreamSummary {
     var child = try spawnRecorder(io, options);
@@ -53,8 +57,11 @@ pub fn captureStreamUntilKeyRelease(
         };
     }
 
-    // Release or process shutdown ends the hold; other read failures also stop capture.
-    key.waitForDeviceReleaseOrShutdown(io, key_file, key_state, key_code, shutdown.isRequested) catch {};
+    // Release, shutdown, or the hold cap ends the capture; other read failures also stop it.
+    const outcome = key.waitForDeviceReleaseOrShutdown(io, key_file, key_state, key_code, shutdown.isRequested, max_hold_ms) catch WaitOutcomeFallback;
+    if (outcome == .timed_out) {
+        if (stream.on_hold_timeout) |on_hold_timeout| on_hold_timeout(stream.hold_timeout_ctx);
+    }
     stopCaptureAndJoin(io, &stop_requested, stopChild, @ptrCast(&child), joinThread, @ptrCast(&stream_thread), .{
         .fn_ptr = stream.on_stopped,
         .ctx = stream.stopped_ctx,
@@ -62,6 +69,10 @@ pub fn captureStreamUntilKeyRelease(
     if (stream_result.err) |err| return err;
     return stream_result.summary;
 }
+
+/// A read failure while waiting for the release is not a capture failure: the
+/// session still gets whatever audio arrived before it.
+const WaitOutcomeFallback: key.WaitOutcome = .released;
 
 const StopCallback = struct {
     fn_ptr: ?*const fn (ctx: ?*anyopaque) void = null,

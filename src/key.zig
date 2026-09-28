@@ -148,23 +148,62 @@ pub fn waitForDeviceRelease(
     }
 }
 
-/// Wait for key release, or stop early when `is_shutdown` becomes true / read is canceled.
+pub const WaitOutcome = enum {
+    released,
+    shutdown,
+    timed_out,
+};
+
+/// Decides how a hold ends; null means "keep waiting". A release or a shutdown
+/// request always wins over the hold deadline.
+pub fn holdStopReason(released: bool, stop: bool, elapsed_ms: i64, max_hold_ms: i64) ?WaitOutcome {
+    if (released) return .released;
+    if (stop) return .shutdown;
+    if (max_hold_ms > 0 and elapsed_ms >= max_hold_ms) return .timed_out;
+    return null;
+}
+
+/// Wait for key release, or stop early when `is_shutdown` becomes true, the read
+/// is canceled, or the hold exceeds `max_hold_ms` (`<= 0` disables the cap).
 pub fn waitForDeviceReleaseOrShutdown(
     io: std.Io,
     file: std.Io.File,
     state: *State,
     key_code: u16,
     is_shutdown: ShutdownCheck,
-) DeviceReadError!void {
+    max_hold_ms: i64,
+) DeviceReadError!WaitOutcome {
+    const start_ms = std.Io.Clock.real.now(io).toMilliseconds();
     while (true) {
-        const event = try waitNextDeviceEventOrShutdown(io, file, state, key_code, is_shutdown);
-        if (event == null) return; // shutdown
-        if (event.? == .release) return;
+        const deadline = remainingHoldMs(io, start_ms, max_hold_ms);
+        const step = try waitNextStepOrStop(io, file, state, key_code, is_shutdown, deadline);
+        const elapsed = std.Io.Clock.real.now(io).toMilliseconds() - start_ms;
+        const outcome = switch (step) {
+            .event => |event| holdStopReason(event == .release, false, elapsed, max_hold_ms),
+            .stop => |reason| holdStopReason(false, reason == .shutdown, elapsed, max_hold_ms) orelse switch (reason) {
+                .shutdown => WaitOutcome.shutdown,
+                .timed_out => WaitOutcome.timed_out,
+            },
+        };
+        if (outcome) |value| return value;
     }
 }
 
-/// Block until the next target-key event, or return `null` when shutdown is requested.
-/// Races a cancelable keyboard read against a shutdown poller via `Io.Select`.
+/// Milliseconds left before the hold cap, or null when the cap is disabled.
+fn remainingHoldMs(io: std.Io, start_ms: i64, max_hold_ms: i64) ?i64 {
+    if (max_hold_ms <= 0) return null;
+    return max_hold_ms - (std.Io.Clock.real.now(io).toMilliseconds() - start_ms);
+}
+
+const StopReason = enum { shutdown, timed_out };
+
+const NextStep = union(enum) {
+    event: Event,
+    stop: StopReason,
+};
+
+/// Block until the next target-key event, or return `null` when stop is requested
+/// (shutdown or Select cancelation).
 pub fn waitNextDeviceEventOrShutdown(
     io: std.Io,
     file: std.Io.File,
@@ -172,11 +211,26 @@ pub fn waitNextDeviceEventOrShutdown(
     key_code: u16,
     is_shutdown: ShutdownCheck,
 ) DeviceReadError!?Event {
-    if (is_shutdown()) return null;
+    const step = try waitNextStepOrStop(io, file, state, key_code, is_shutdown, null);
+    return switch (step) {
+        .event => |event| event,
+        .stop => null,
+    };
+}
+
+fn waitNextStepOrStop(
+    io: std.Io,
+    file: std.Io.File,
+    state: *State,
+    key_code: u16,
+    is_shutdown: ShutdownCheck,
+    deadline_ms: ?i64,
+) DeviceReadError!NextStep {
+    if (is_shutdown()) return .{ .stop = .shutdown };
 
     const SelectResult = union(enum) {
         key: DeviceReadError!Event,
-        shutdown: void,
+        stop: StopReason,
     };
     var slots: [2]SelectResult = undefined;
     var select = std.Io.Select(SelectResult).init(io, &slots);
@@ -190,21 +244,21 @@ pub fn waitNextDeviceEventOrShutdown(
     select.concurrent(.key, readNextDeviceEventTask, .{key_args}) catch {
         select.async(.key, readNextDeviceEventTask, .{key_args});
     };
-    select.concurrent(.shutdown, pollShutdownTask, .{ io, is_shutdown }) catch {
-        select.async(.shutdown, pollShutdownTask, .{ io, is_shutdown });
+    select.concurrent(.stop, pollStopTask, .{ io, is_shutdown, deadline_ms }) catch {
+        select.async(.stop, pollStopTask, .{ io, is_shutdown, deadline_ms });
     };
 
     const first = select.await() catch {
         // Select itself canceled: treat as shutdown wake.
         select.cancelDiscard();
-        return null;
+        return .{ .stop = .shutdown };
     };
     // Cancel the loser; discard any late key result (no owned resources).
     select.cancelDiscard();
 
     return switch (first) {
-        .key => |result| try result,
-        .shutdown => null,
+        .key => |result| .{ .event = try result },
+        .stop => |reason| .{ .stop = reason },
     };
 }
 
@@ -219,9 +273,14 @@ fn readNextDeviceEventTask(args: ReadNextArgs) DeviceReadError!Event {
     return readNextDeviceEvent(args.io, args.file, args.state, args.key_code);
 }
 
-fn pollShutdownTask(io: std.Io, is_shutdown: ShutdownCheck) void {
-    while (!is_shutdown()) {
-        std.Io.sleep(io, .fromMilliseconds(50), .awake) catch return;
+fn pollStopTask(io: std.Io, is_shutdown: ShutdownCheck, deadline_ms: ?i64) StopReason {
+    const start_ms = std.Io.Clock.real.now(io).toMilliseconds();
+    while (true) {
+        if (is_shutdown()) return .shutdown;
+        if (deadline_ms) |limit| {
+            if (std.Io.Clock.real.now(io).toMilliseconds() - start_ms >= limit) return .timed_out;
+        }
+        std.Io.sleep(io, .fromMilliseconds(25), .awake) catch return .shutdown;
     }
 }
 
@@ -511,4 +570,13 @@ test "unreadable input device is reported as denied" {
 test "device search failure names the permission problem" {
     try std.testing.expectEqual(error.KeyboardPermissionDenied, deviceSearchFailure(true));
     try std.testing.expectEqual(error.KeyboardDeviceNotFound, deviceSearchFailure(false));
+}
+
+test "hold stop reason prefers release, then shutdown, then the deadline" {
+    try std.testing.expectEqual(WaitOutcome.released, holdStopReason(true, false, 0, 1000).?);
+    try std.testing.expectEqual(WaitOutcome.shutdown, holdStopReason(false, true, 0, 1000).?);
+    try std.testing.expectEqual(WaitOutcome.timed_out, holdStopReason(false, false, 1000, 1000).?);
+    try std.testing.expectEqual(WaitOutcome.timed_out, holdStopReason(false, false, 1500, 1000).?);
+    try std.testing.expect(holdStopReason(false, false, 1000, 0) == null); // 0 = 不限时
+    try std.testing.expect(holdStopReason(false, false, 999, 1000) == null);
 }
