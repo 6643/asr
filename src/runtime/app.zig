@@ -126,18 +126,8 @@ pub fn run(
         }
     }
 
-    var rescan_ctx = RescanCtx{ .environ = environ };
+    var rescan_ctx = keyboard_set.DiscoveryCtx{ .environ = environ };
     try runHotkeyLoop(allocator, io, logger, engine_cfg, &keyboards, pipeline, opts, &wayland_loop.failed, &rescan_ctx);
-}
-
-/// Re-scan source handed to the keyboard set while it waits.
-const RescanCtx = struct {
-    environ: std.process.Environ,
-};
-
-fn rescanCandidates(ctx: ?*anyopaque, allocator: std.mem.Allocator, io: std.Io) anyerror![][]u8 {
-    const source: *const RescanCtx = @ptrCast(@alignCast(ctx.?));
-    return key.findKeyboardDevices(allocator, io, source.environ);
 }
 
 /// Extra context for a wayland connection failure, shown after the error name.
@@ -210,7 +200,7 @@ fn runHotkeyLoop(
     pipeline: *postprocess.Pipeline,
     opts: cli.Options,
     wayland_failed: *const std.atomic.Value(bool),
-    rescan_ctx: *RescanCtx,
+    rescan_ctx: *keyboard_set.DiscoveryCtx,
 ) !void {
     const debug = opts.debug;
 
@@ -224,7 +214,7 @@ fn runHotkeyLoop(
             logger.info("app", "shutting down", .{});
             return;
         }
-        const outcome = keyboards.readNextOrShutdown(key.right_alt, isShutdownRequested, rescanCandidates, rescan_ctx) catch |err| {
+        const outcome = keyboards.readNextOrShutdown(key.right_alt, isShutdownRequested, keyboard_set.discoveryCandidates, rescan_ctx) catch |err| {
             if (err == error.Interrupted) continue;
             logger.err("kbd", "{s}", .{@errorName(err)});
             return err;

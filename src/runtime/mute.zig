@@ -84,12 +84,6 @@ pub fn unmuteSpeaker(allocator: std.mem.Allocator, io: std.Io) void {
     }
 }
 
-pub fn resetMuteState(io: std.Io) void {
-    state.mutex.lockUncancelable(io);
-    state.muted_by_us = false;
-    state.mutex.unlock(io);
-}
-
 fn speakerIsMuted(allocator: std.mem.Allocator, io: std.Io) bool {
     const out = cmd.runText(allocator, io, &.{ "wpctl", "get-volume", sink }, 1000) catch return false;
     defer allocator.free(out);

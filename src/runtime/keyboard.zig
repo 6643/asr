@@ -39,6 +39,16 @@ pub const CandidatesFn = *const fn (ctx: ?*anyopaque, allocator: std.mem.Allocat
 
 /// Every keyboard that can trigger a recording. The set owns the device paths
 /// and the open file descriptors; callers only borrow them.
+/// Re-scan source used by the app: the same discovery that ran at startup.
+pub const DiscoveryCtx = struct {
+    environ: std.process.Environ,
+};
+
+pub fn discoveryCandidates(ctx: ?*anyopaque, allocator: std.mem.Allocator, io: std.Io) anyerror!([][]u8) {
+    const source: *const DiscoveryCtx = @ptrCast(@alignCast(ctx.?));
+    return key.findKeyboardDevices(allocator, io, source.environ);
+}
+
 pub const Set = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
