@@ -726,12 +726,16 @@ test "device overrides are validated like discovered devices" {
 
 test "live discovery only returns readable, capable keyboards" {
     const allocator = std.testing.allocator;
+    // CI runners have no keyboards at all: discovery then reports "nothing
+    // usable" and there is nothing live to check. The filtering rules
+    // themselves are covered by the synthetic bitmaps above.
     const candidates = try discoverCandidates(allocator, std.testing.io);
-    const devices = try dropUnreadableDevices(allocator, std.testing.io, candidates);
+    const devices = dropUnreadableDevices(allocator, std.testing.io, candidates) catch |err| switch (err) {
+        error.KeyboardDeviceNotFound, error.KeyboardPermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
     defer freeDeviceList(allocator, devices);
 
-    // CI runners have no keyboards at all; the filtering rules themselves are
-    // covered by the synthetic bitmaps and the injected-probe test below.
     if (devices.len == 0) return error.SkipZigTest;
     for (devices) |path| {
         try std.testing.expect(std.mem.startsWith(u8, path, "/dev/input/event"));
