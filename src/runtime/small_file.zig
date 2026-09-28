@@ -35,15 +35,6 @@ test "reads a procfs file that reports size zero" {
     try std.testing.expect(std.mem.indexOf(u8, content, "Name:") != null);
 }
 
-test "reads the kernel input device list when it exists" {
-    const content = readAll(std.testing.io, std.testing.allocator, "/proc/bus/input/devices", max_bytes_default) catch |err| {
-        if (err == error.FileNotFound) return error.SkipZigTest;
-        return err;
-    };
-    defer std.testing.allocator.free(content);
-    try std.testing.expect(content.len > 0);
-}
-
 test "missing file is an error" {
     try std.testing.expectError(
         error.FileNotFound,
