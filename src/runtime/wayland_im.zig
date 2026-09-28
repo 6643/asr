@@ -336,6 +336,15 @@ fn socketPoll(ctx: ?*anyopaque, timeout_ms: i32) ReadError!bool {
 pub const listen_display_default = "wayland-0";
 pub const setup_timeout_ms: i64 = 2000;
 pub const unavailable_probe_ms: i64 = 200;
+/// How long to wait before the single startup bind retry.
+pub const bind_retry_delay_ms: i64 = 300;
+
+/// A bind can fail transiently when the previous instance has only just exited
+/// and the compositor has not released the seat input method yet (observed with
+/// umbriel after `kill -9`). Everything else is a hard failure.
+pub fn shouldRetryBind(err: anyerror) bool {
+    return err == error.InputMethodUnavailable;
+}
 
 pub const ConnectError = error{
     MissingRuntimeDir,
@@ -906,4 +915,10 @@ test "commit rejects empty and inactive states" {
     try std.testing.expectEqualStrings("ERR no_text_input", client.commit("hi"));
     client.dead = true;
     try std.testing.expectEqualStrings("ERR wayland_unavailable", client.commit("hi"));
+}
+
+test "retries a transient input method bind failure" {
+    try std.testing.expect(shouldRetryBind(error.InputMethodUnavailable));
+    try std.testing.expect(!shouldRetryBind(error.ConnectionFailed));
+    try std.testing.expect(!shouldRetryBind(error.MissingRuntimeDir));
 }

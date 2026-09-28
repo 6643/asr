@@ -86,7 +86,7 @@ pub fn run(
     };
     defer keyboards.closeAll();
 
-    const client = wayland_im.connect(allocator, io, environ) catch |err| {
+    const client = connectWithRetry(allocator, io, environ, logger) catch |err| {
         logger.err("wayland", "unavailable: {s}: {s}", .{ @errorName(err), waylandFailureHint(err) });
         return err;
     };
@@ -128,6 +128,22 @@ pub fn run(
 
     var rescan_ctx = keyboard_set.DiscoveryCtx{ .environ = environ };
     try runHotkeyLoop(allocator, io, logger, engine_cfg, &keyboards, pipeline, opts, &wayland_loop.failed, &rescan_ctx);
+}
+
+/// Connects to the compositor, retrying once: right after an unclean stop the
+/// seat input method may still be held for a moment.
+fn connectWithRetry(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+    logger: output.Logger,
+) wayland_im.ConnectError!*wayland_im.Client {
+    return wayland_im.connect(allocator, io, environ) catch |err| {
+        if (!wayland_im.shouldRetryBind(err)) return err;
+        logger.info("wayland", "retrying bind after {s}", .{@errorName(err)});
+        std.Io.sleep(io, .fromMilliseconds(wayland_im.bind_retry_delay_ms), .awake) catch return err;
+        return wayland_im.connect(allocator, io, environ);
+    };
 }
 
 /// Extra context for a wayland connection failure, shown after the error name.
