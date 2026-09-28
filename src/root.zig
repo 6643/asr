@@ -14,6 +14,7 @@ pub const runtime = struct {
     pub const shutdown = @import("runtime/shutdown.zig");
     pub const engine = @import("runtime/engine.zig");
     pub const finish_grace = @import("runtime/finish_grace.zig");
+    pub const keyboard = @import("runtime/keyboard.zig");
     pub const small_file = @import("runtime/small_file.zig");
 };
 pub const doubao = struct {
@@ -45,6 +46,7 @@ test {
     _ = runtime.shutdown;
     _ = runtime.engine;
     _ = runtime.finish_grace;
+    _ = runtime.keyboard;
     _ = runtime.small_file;
     _ = doubao.proto;
     _ = doubao.client;

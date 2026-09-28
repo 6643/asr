@@ -591,7 +591,7 @@ pub fn deviceSearchFailure(saw_denied: bool) error{ KeyboardDeviceNotFound, Keyb
     return if (saw_denied) error.KeyboardPermissionDenied else error.KeyboardDeviceNotFound;
 }
 
-fn inputEvent(event_type: u16, code: u16, value: u32) [input_event_size]u8 {
+pub fn inputEvent(event_type: u16, code: u16, value: u32) [input_event_size]u8 {
     var out = [_]u8{0} ** input_event_size;
     std.mem.writeInt(u16, out[16..18], event_type, .little);
     std.mem.writeInt(u16, out[18..20], code, .little);
