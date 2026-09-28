@@ -362,19 +362,84 @@ pub fn resolveSocketPath(allocator: std.mem.Allocator, environ: std.process.Envi
     return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ runtime, display });
 }
 
-fn writeAll(client: *Client, bytes: []const u8) ConnectError!void {
+/// How long a commit keeps retrying after the socket reports EAGAIN.
+pub const write_timeout_ms: i64 = 500;
+
+pub const WriteError = error{
+    WouldBlock,
+    WriteFailed,
+};
+
+/// Injectable write side of the socket: `writeFn` returns WouldBlock when the
+/// send buffer is full, `waitFn` blocks until writable again, `elapsedFn`
+/// reports milliseconds since the write started.
+pub const WriteIo = struct {
+    ctx: ?*anyopaque,
+    writeFn: *const fn (ctx: ?*anyopaque, bytes: []const u8) WriteError!usize,
+    waitFn: *const fn (ctx: ?*anyopaque) WriteError!void,
+    elapsedFn: *const fn (ctx: ?*anyopaque) i64,
+};
+
+/// Writes everything or gives up with ConnectionFailed, so a full send buffer
+/// delays text instead of dropping it.
+pub fn writeAllWith(io: WriteIo, bytes: []const u8, timeout_ms: i64) ConnectError!void {
     var written: usize = 0;
     while (written < bytes.len) {
-        const rc = std.posix.system.write(client.stream.socket.handle, bytes.ptr + written, bytes.len - written);
-        switch (std.posix.errno(rc)) {
-            .SUCCESS => {
-                if (rc == 0) return error.ConnectionFailed;
-                written += @intCast(rc);
+        if (io.elapsedFn(io.ctx) >= timeout_ms) return error.ConnectionFailed;
+        const count = io.writeFn(io.ctx, bytes[written..]) catch |err| switch (err) {
+            error.WouldBlock => {
+                io.waitFn(io.ctx) catch return error.ConnectionFailed;
+                continue;
             },
+            error.WriteFailed => return error.ConnectionFailed,
+        };
+        if (count == 0) return error.ConnectionFailed;
+        written += count;
+    }
+}
+
+const WriteCtx = struct {
+    client: *Client,
+    start_ms: i64,
+};
+
+fn writeSocket(ctx: ?*anyopaque, bytes: []const u8) WriteError!usize {
+    const self: *WriteCtx = @ptrCast(@alignCast(ctx.?));
+    while (true) {
+        const rc = std.posix.system.write(self.client.stream.socket.handle, bytes.ptr, bytes.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
             .INTR => continue,
-            else => return error.ConnectionFailed,
+            .AGAIN => return error.WouldBlock,
+            else => return error.WriteFailed,
         }
     }
+}
+
+fn waitWritable(ctx: ?*anyopaque) WriteError!void {
+    const self: *WriteCtx = @ptrCast(@alignCast(ctx.?));
+    const remaining = write_timeout_ms - writeElapsed(ctx);
+    var fds = [_]std.posix.pollfd{.{ .fd = self.client.stream.socket.handle, .events = std.posix.POLL.OUT, .revents = 0 }};
+    const ready = std.posix.poll(&fds, @intCast(@max(remaining, 1))) catch return error.WriteFailed;
+    if (ready < 0) return error.WriteFailed;
+}
+
+fn writeElapsed(ctx: ?*anyopaque) i64 {
+    const self: *WriteCtx = @ptrCast(@alignCast(ctx.?));
+    return std.Io.Clock.real.now(self.client.io).toMilliseconds() - self.start_ms;
+}
+
+fn writeAll(client: *Client, bytes: []const u8) ConnectError!void {
+    var ctx = WriteCtx{
+        .client = client,
+        .start_ms = std.Io.Clock.real.now(client.io).toMilliseconds(),
+    };
+    return writeAllWith(.{
+        .ctx = &ctx,
+        .writeFn = writeSocket,
+        .waitFn = waitWritable,
+        .elapsedFn = writeElapsed,
+    }, bytes, write_timeout_ms);
 }
 
 fn appendBind(
@@ -626,6 +691,70 @@ test "incomplete header keeps the client alive" {
 
     try std.testing.expect(!client.dead);
     try std.testing.expectEqual(@as(usize, 3), client.read_buf.items.len);
+}
+
+/// Fake socket used to drive Client.writeAllWith without a real wayland socket.
+const FakeWriteIo = struct {
+    var calls: usize = 0;
+    var elapsed_ms: i64 = 0;
+    var would_block_times: usize = 0;
+    var bytes_per_write: usize = 0;
+    var zero_writes: bool = false;
+
+    fn reset() void {
+        calls = 0;
+        elapsed_ms = 0;
+        would_block_times = 0;
+        bytes_per_write = 0;
+        zero_writes = false;
+    }
+
+    fn write(ctx: ?*anyopaque, bytes: []const u8) WriteError!usize {
+        _ = ctx;
+        calls += 1;
+        if (calls <= would_block_times) return error.WouldBlock;
+        if (zero_writes) return 0;
+        if (bytes_per_write == 0) return bytes.len;
+        return @min(bytes_per_write, bytes.len);
+    }
+
+    fn wait(ctx: ?*anyopaque) WriteError!void {
+        _ = ctx;
+    }
+
+    fn elapsed(ctx: ?*anyopaque) i64 {
+        _ = ctx;
+        return elapsed_ms;
+    }
+
+    fn io() WriteIo {
+        return .{ .ctx = null, .writeFn = write, .waitFn = wait, .elapsedFn = elapsed };
+    }
+};
+
+test "write retries after would block then finishes the message" {
+    FakeWriteIo.reset();
+    FakeWriteIo.would_block_times = 1;
+    FakeWriteIo.bytes_per_write = 4;
+
+    try writeAllWith(FakeWriteIo.io(), "abcdefgh", write_timeout_ms);
+
+    try std.testing.expectEqual(@as(usize, 3), FakeWriteIo.calls); // EAGAIN, 4 字节, 4 字节
+}
+
+test "write fails when the socket accepts nothing" {
+    FakeWriteIo.reset();
+    FakeWriteIo.zero_writes = true;
+
+    try std.testing.expectError(error.ConnectionFailed, writeAllWith(FakeWriteIo.io(), "abc", write_timeout_ms));
+}
+
+test "write fails once the deadline passes" {
+    FakeWriteIo.reset();
+    FakeWriteIo.would_block_times = std.math.maxInt(usize);
+    FakeWriteIo.elapsed_ms = write_timeout_ms;
+
+    try std.testing.expectError(error.ConnectionFailed, writeAllWith(FakeWriteIo.io(), "abc", write_timeout_ms));
 }
 
 test "done events advance serial and apply pending active state" {
