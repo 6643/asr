@@ -2,7 +2,6 @@ const std = @import("std");
 const config = @import("../config.zig");
 const cli = @import("../cli.zig");
 const doubao = @import("../doubao/client.zig");
-const credentials = @import("../doubao/credentials.zig");
 const engine = @import("engine.zig");
 const key = @import("../key.zig");
 const audio_gate = @import("audio_gate.zig");
