@@ -6,7 +6,6 @@ const credentials = @import("../doubao/credentials.zig");
 const engine = @import("engine.zig");
 const key = @import("../key.zig");
 const audio_gate = @import("audio_gate.zig");
-const ibus = @import("ibus.zig");
 const postprocess = @import("postprocess.zig");
 const wayland_im = @import("wayland_im.zig");
 const mic = @import("mic.zig");
@@ -30,11 +29,14 @@ pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
     environ: std.process.Environ,
-    debug: bool,
-    engine_kind: engine.Kind,
-    wayland: cli.WaylandMode,
+    opts: cli.Options,
 ) !void {
     installSignalHandlers();
+    const debug = opts.debug;
+    const engine_kind: engine.Kind = switch (opts.engine) {
+        .baidu => .baidu,
+        .doubao => .doubao,
+    };
     const logger = output.Logger{ .io = io, .level = if (debug) .debug else .info };
     var cfg: config.Config = .{};
     var baidu_cfg: config.BaiduConfig = undefined;
@@ -48,18 +50,14 @@ pub fn run(
         .doubao => {
             doubao_creds = try config.loadCredentials(allocator, io, cfg.credential_path);
             var creds = &doubao_creds.?;
-            const refresh_ok = blk: {
-                const result = credentials.refreshFile(allocator, io, cfg.credential_path, debug) catch |err| {
-                    logger.err("doubao", "credential refresh failed: {s}; using existing credentials", .{@errorName(err)});
-                    break :blk false;
-                };
-                break :blk credentials.refreshSucceeded(result);
-            };
-            if (refresh_ok) {
-                logger.info("doubao", "credentials refreshed", .{});
-                creds.deinit(allocator);
-                doubao_creds = try config.loadCredentials(allocator, io, cfg.credential_path);
-                creds = &doubao_creds.?;
+            switch (config.refreshDoubaoCredentials(allocator, io, cfg.credential_path, debug)) {
+                .refreshed => {
+                    logger.info("doubao", "credentials refreshed", .{});
+                    creds.deinit(allocator);
+                    doubao_creds = try config.loadCredentials(allocator, io, cfg.credential_path);
+                    creds = &doubao_creds.?;
+                },
+                .failed => |err| logger.err("doubao", "credential refresh failed: {s}; using existing credentials", .{@errorName(err)}),
             }
             cfg = config.withCredentials(cfg, creds.*);
             if (cfg.device_id.len == 0 or cfg.token.len == 0) return error.MissingCredentials;
@@ -75,73 +73,45 @@ pub fn run(
         logger.info("doubao", "{s}", .{cfg.device_id});
     }
 
-    const keyboard_device = try key.findKeyboardDevice(allocator, io, environ);
+    const keyboard_device = key.findKeyboardDevice(allocator, io, environ) catch |err| {
+        logger.err("kbd", "{s}: {s}", .{ @errorName(err), keyFailureHint(err) });
+        return err;
+    };
     defer allocator.free(keyboard_device);
 
-    var service: ?*ibus.gio_ibus.Service = null;
-    defer if (service) |s| {
-        s.stop();
-        allocator.destroy(s);
+    const client = wayland_im.connect(allocator, io, environ) catch |err| {
+        logger.err("wayland", "unavailable: {s}: {s}", .{ @errorName(err), waylandFailureHint(err) });
+        return err;
     };
-    var wayland_client: ?*wayland_im.Client = null;
-    defer if (wayland_client) |c| c.deinit();
+    defer client.deinit();
+    logger.info("wayland", "input method bound", .{});
 
-    const backend: postprocess.CommitBackend = blk: {
-        if (wayland != .disabled) {
-            if (wayland_im.connect(allocator, io, environ)) |client| {
-                wayland_client = client;
-                logger.info("wayland", "input method bound", .{});
-                break :blk .{ .wayland = client };
-            } else |err| {
-                if (wayland == .force) return err;
-                logger.err("wayland", "unavailable: {s}; falling back to IBus", .{@errorName(err)});
-            }
-        }
-        const started = try startIbusBackend(allocator, io, environ, logger);
-        service = started;
-        break :blk .{ .ibus = started };
-    };
-
-    var pipeline = try postprocess.Pipeline.start(allocator, io, logger, backend, &cfg, if (engine_kind == .baidu) "baidu" else "doubao");
+    var pipeline = try postprocess.Pipeline.start(
+        allocator,
+        io,
+        logger,
+        client,
+        &cfg,
+        if (engine_kind == .baidu) "baidu" else "doubao",
+        opts.rectify,
+    );
     defer pipeline.deinit();
 
-    var service_loop = ServiceLoop{
-        .service = service orelse undefined,
-        .io = io,
-        .running = std.atomic.Value(bool).init(false),
-    };
     var wayland_loop = WaylandLoop{
-        .client = wayland_client orelse undefined,
+        .client = client,
         .io = io,
         .logger = logger,
         .running = std.atomic.Value(bool).init(false),
     };
-    var service_future_opt: ?std.Io.Future(void) = null;
     var wayland_future_opt: ?std.Io.Future(void) = null;
-    var service_thread: ?std.Thread = null;
     var wayland_thread: ?std.Thread = null;
-    if (service != null) {
-        service_loop.running.store(true, .release);
-        service_future_opt = io.concurrent(runServiceLoop, .{&service_loop}) catch null;
-        if (service_future_opt == null) {
-            service_thread = try std.Thread.spawn(.{}, runServiceLoop, .{&service_loop});
-        }
-    }
-    if (wayland_client != null) {
-        wayland_loop.running.store(true, .release);
-        wayland_future_opt = io.concurrent(runWaylandLoop, .{&wayland_loop}) catch null;
-        if (wayland_future_opt == null) {
-            wayland_thread = try std.Thread.spawn(.{}, runWaylandLoop, .{&wayland_loop});
-        }
+    wayland_loop.running.store(true, .release);
+    wayland_future_opt = io.concurrent(runWaylandLoop, .{&wayland_loop}) catch null;
+    if (wayland_future_opt == null) {
+        wayland_thread = try std.Thread.spawn(.{}, runWaylandLoop, .{&wayland_loop});
     }
     defer {
-        service_loop.running.store(false, .release);
         wayland_loop.running.store(false, .release);
-        if (service_future_opt) |*f| {
-            _ = f.cancel(io);
-        } else if (service_thread) |t| {
-            t.join();
-        }
         if (wayland_future_opt) |*f| {
             _ = f.cancel(io);
         } else if (wayland_thread) |t| {
@@ -149,45 +119,42 @@ pub fn run(
         }
     }
 
-    if (service) |s| {
-        ibus.switchToAsrInputMethod(allocator, io) catch |err| {
-            logger.err("ibus", "switch failed: {s}", .{@errorName(err)});
-            logger.info("ibus", "Auto-switch unavailable; switch to ASR manually", .{});
-            try runHotkeyLoop(allocator, io, environ, logger, engine_cfg, keyboard_device, pipeline, debug);
-            return;
-        };
-        logger.info("ibus", "Switched to ASR input method", .{});
-        if (!waitForServiceReady(io, s, 4000)) {
-            logger.debug("ibus", "service not ready yet", .{});
-        }
-    }
-
-    try runHotkeyLoop(allocator, io, environ, logger, engine_cfg, keyboard_device, pipeline, debug);
+    try runHotkeyLoop(allocator, io, environ, logger, engine_cfg, keyboard_device, pipeline, opts, &wayland_loop.failed);
 }
 
-fn startIbusBackend(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    environ: std.process.Environ,
-    logger: output.Logger,
-) !*ibus.gio_ibus.Service {
-    const component_path = try ibus.initRuntime(allocator, io, environ);
-    defer allocator.free(component_path);
-    logger.debug("app", "{s}", .{component_path});
-    return try ibus.startService(allocator, io, environ);
+/// Extra context for a wayland connection failure, shown after the error name.
+pub fn waylandFailureHint(err: anyerror) []const u8 {
+    return switch (err) {
+        error.InputMethodUnavailable => "another ASR instance may already hold the seat input method",
+        error.MissingRuntimeDir, error.ConnectionFailed => "check WAYLAND_DISPLAY and that this is a wayland session",
+        error.DisplayError => "the compositor rejected this connection",
+        else => "",
+    };
 }
 
-const ServiceLoop = struct {
-    service: *ibus.gio_ibus.Service,
-    io: std.Io,
-    running: std.atomic.Value(bool),
-};
+/// Extra context for a keyboard discovery failure, shown after the error name.
+pub fn keyFailureHint(err: anyerror) []const u8 {
+    return switch (err) {
+        error.KeyboardPermissionDenied => "add the user to the 'input' group and log in again",
+        error.KeyboardDeviceNotFound => "set ASR_KEYBOARD_DEVICE to pin one",
+        else => "",
+    };
+}
 
-fn runServiceLoop(loop: *ServiceLoop) void {
-    while (loop.running.load(.acquire) and !isShutdownRequested()) {
-        loop.service.iterate();
-        shutdown.sleepUntilOr(loop.io, 10);
-    }
+test "wayland failures explain the likely cause" {
+    try std.testing.expectEqualStrings(
+        "another ASR instance may already hold the seat input method",
+        waylandFailureHint(error.InputMethodUnavailable),
+    );
+    try std.testing.expectEqualStrings("", waylandFailureHint(error.SetupTimeout));
+}
+
+test "keyboard failures explain the likely cause" {
+    try std.testing.expectEqualStrings(
+        "add the user to the 'input' group and log in again",
+        keyFailureHint(error.KeyboardPermissionDenied),
+    );
+    try std.testing.expectEqualStrings("set ASR_KEYBOARD_DEVICE to pin one", keyFailureHint(error.KeyboardDeviceNotFound));
 }
 
 const WaylandLoop = struct {
@@ -195,12 +162,18 @@ const WaylandLoop = struct {
     io: std.Io,
     logger: output.Logger,
     running: std.atomic.Value(bool),
+    /// Set when the connection dies so the hotkey loop can exit with an error
+    /// instead of committing into a dead socket and logging success.
+    failed: std.atomic.Value(bool) = .init(false),
 };
 
 fn runWaylandLoop(loop: *WaylandLoop) void {
     while (loop.running.load(.acquire) and !isShutdownRequested()) {
         loop.client.pump(0) catch |err| {
-            loop.logger.err("wayland", "event dispatch failed: {s}", .{@errorName(err)});
+            loop.logger.err("wayland", "disconnected: {s}", .{@errorName(err)});
+            loop.failed.store(true, .release);
+            // Wake the hotkey loop out of its select so it can exit.
+            shutdown.request();
             return;
         };
         if (loop.client.takeActiveChange()) |active| {
@@ -208,15 +181,6 @@ fn runWaylandLoop(loop: *WaylandLoop) void {
         }
         shutdown.sleepUntilOr(loop.io, 10);
     }
-}
-
-fn waitForServiceReady(io: std.Io, service: *ibus.gio_ibus.Service, timeout_ms: i64) bool {
-    var elapsed: i64 = 0;
-    while (elapsed <= timeout_ms and !isShutdownRequested()) : (elapsed += 50) {
-        if (std.mem.eql(u8, service.status(), "ready")) return true;
-        shutdown.sleepUntilOr(io, 50);
-    }
-    return false;
 }
 
 fn runHotkeyLoop(
@@ -227,14 +191,20 @@ fn runHotkeyLoop(
     cfg: engine.Config,
     initial_keyboard_device: []const u8,
     pipeline: *postprocess.Pipeline,
-    debug: bool,
+    opts: cli.Options,
+    wayland_failed: *const std.atomic.Value(bool),
 ) !void {
+    const debug = opts.debug;
     var keyboard = try KeyboardEventStream.open(allocator, io, environ, logger, initial_keyboard_device);
     defer keyboard.deinit();
 
     output.keyWait(logger);
     while (true) {
         if (isShutdownRequested()) {
+            if (wayland_failed.load(.acquire)) {
+                logger.err("wayland", "input method connection lost; exiting", .{});
+                return error.WaylandDisconnected;
+            }
             logger.info("app", "shutting down", .{});
             return;
         }
@@ -254,6 +224,10 @@ fn runHotkeyLoop(
             }
         };
         const event = event_opt orelse {
+            if (wayland_failed.load(.acquire)) {
+                logger.err("wayland", "input method connection lost; exiting", .{});
+                return error.WaylandDisconnected;
+            }
             logger.info("app", "shutting down", .{});
             return;
         };
@@ -264,7 +238,7 @@ fn runHotkeyLoop(
             .pipeline = pipeline,
         };
 
-        // Parallel boot: WS handshake overlaps arecord + early speech buffer.
+        // Parallel boot: WS handshake overlaps recorder startup + early speech buffer.
         var session_future_opt = io.concurrent(initSessionWithRetry, .{
             allocator,
             io,

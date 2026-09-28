@@ -10,24 +10,14 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(allocator);
     defer allocator.free(args);
-    const opts = asr.cli.optionsFromArgs(args);
+    const opts = asr.cli.optionsFromArgs(args) catch |err| {
+        try stdout.print("asr: {s}\n{s}", .{ @errorName(err), asr.cli.usage_text });
+        try stdout.flush();
+        std.process.exit(2);
+    };
     switch (opts.mode) {
-        .ibus_xml => {
-            try stdout.writeAll(asr.runtime.ibus.component_xml);
-            return;
-        },
-        .ibus_service => {
-            asr.runtime.app.installSignalHandlers();
-            const service = try asr.runtime.ibus.startService(allocator, init.io, init.minimal.environ);
-            defer {
-                service.stop();
-                allocator.destroy(service);
-            }
-            while (!asr.runtime.app.isShutdownRequested()) {
-                service.iterate();
-                // Cancelable slice so Ctrl+C is observed within ~25ms.
-                asr.runtime.shutdown.sleepMs(init.io, 25);
-            }
+        .help => {
+            try stdout.writeAll(asr.cli.usage_text);
             return;
         },
         .once_pcm => |pcm_path| {
@@ -47,17 +37,13 @@ pub fn main(init: std.process.Init) !void {
             var cfg: asr.config.Config = .{};
             var creds = try asr.config.loadCredentials(allocator, init.io, cfg.credential_path);
             defer creds.deinit(allocator);
-            const refresh_ok = blk: {
-                const result = asr.doubao.credentials.refreshFile(allocator, init.io, cfg.credential_path, opts.debug) catch |err| {
-                    std.log.warn("doubao credential refresh failed: {s}; using existing credentials", .{@errorName(err)});
-                    break :blk false;
-                };
-                break :blk asr.doubao.credentials.refreshSucceeded(result);
-            };
-            if (refresh_ok) {
-                std.log.info("doubao credentials refreshed", .{});
-                creds.deinit(allocator);
-                creds = try asr.config.loadCredentials(allocator, init.io, cfg.credential_path);
+            switch (asr.config.refreshDoubaoCredentials(allocator, init.io, cfg.credential_path, opts.debug)) {
+                .refreshed => {
+                    std.log.info("doubao credentials refreshed", .{});
+                    creds.deinit(allocator);
+                    creds = try asr.config.loadCredentials(allocator, init.io, cfg.credential_path);
+                },
+                .failed => |err| std.log.warn("doubao credential refresh failed: {s}; using existing credentials", .{@errorName(err)}),
             }
             cfg = asr.config.withCredentials(cfg, creds);
             if (cfg.device_id.len == 0 or cfg.token.len == 0) return error.MissingCredentials;
@@ -80,10 +66,12 @@ pub fn main(init: std.process.Init) !void {
         },
         .app => {
             try stdout.flush();
-            try asr.runtime.app.run(allocator, init.io, init.minimal.environ, opts.debug, switch (opts.engine) {
-                .baidu => .baidu,
-                .doubao => .doubao,
-            }, opts.wayland);
+            // Report failures as one line instead of a Zig error trace: this is
+            // the user-facing entry point for compositor and keyboard problems.
+            asr.runtime.app.run(allocator, init.io, init.minimal.environ, opts) catch |err| {
+                std.debug.print("asr: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
             return;
         },
     }

@@ -35,7 +35,7 @@ fn buildJsonBody(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
 }
 
 /// HTTP POST via curl argv (no shell). Race the request against a timeout using
-/// Zig 0.16 `Io.Select` so a hung rectify never blocks IBus commit forever.
+/// Zig 0.16 `Io.Select` so a hung rectify never blocks the commit forever.
 fn doHttpRequest(
     allocator: std.mem.Allocator,
     io: std.Io,

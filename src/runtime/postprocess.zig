@@ -1,36 +1,17 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const rectify = @import("../doubao/rectify.zig");
-const ibus = @import("ibus.zig");
 const wayland_im = @import("wayland_im.zig");
 const output = @import("output.zig");
-
-pub const CommitBackend = union(enum) {
-    ibus: *ibus.gio_ibus.Service,
-    wayland: *wayland_im.Client,
-
-    pub fn commit(backend: CommitBackend, text: []const u8) []const u8 {
-        return switch (backend) {
-            .ibus => |service| service.commitStatus(text),
-            .wayland => |client| client.commit(text),
-        };
-    }
-
-    pub fn domain(backend: CommitBackend) []const u8 {
-        return switch (backend) {
-            .ibus => "ibus",
-            .wayland => "wayland",
-        };
-    }
-};
 
 pub const Pipeline = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     logger: output.Logger,
-    backend: CommitBackend,
+    client: *wayland_im.Client,
     cfg: *const config.Config,
     provider: []const u8,
+    rectify_enabled: bool,
     rectify_queue: TextQueue,
     commit_queue: TextQueue,
     rectify_thread: ?std.Thread = null,
@@ -40,18 +21,20 @@ pub const Pipeline = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         logger: output.Logger,
-        backend: CommitBackend,
+        client: *wayland_im.Client,
         cfg: *const config.Config,
         provider: []const u8,
+        rectify_enabled: bool,
     ) !*Pipeline {
         const pipeline = try allocator.create(Pipeline);
         pipeline.* = .{
             .allocator = allocator,
             .io = io,
             .logger = logger,
-            .backend = backend,
+            .client = client,
             .cfg = cfg,
             .provider = provider,
+            .rectify_enabled = rectify_enabled,
             .rectify_queue = TextQueue.init(allocator, io),
             .commit_queue = TextQueue.init(allocator, io),
         };
@@ -83,30 +66,37 @@ pub const Pipeline = struct {
     fn rectifyWorker(ctx: *Pipeline) void {
         while (ctx.rectify_queue.pop()) |text| {
             defer ctx.allocator.free(text);
+            if (!ctx.rectify_enabled or ctx.cfg.sami_token.len == 0 or ctx.cfg.device_id.len == 0) {
+                ctx.logger.info(ctx.provider, "🚀 {s}", .{text});
+                enqueueCommit(ctx, text);
+                continue;
+            }
             const corrected = rectify.rectifyText(ctx.allocator, ctx.io, text, ctx.cfg.sami_token, ctx.cfg.device_id) catch null;
             if (corrected) |c| {
                 defer ctx.allocator.free(c);
                 ctx.logger.info(ctx.provider, "🚀 {s} → {s}", .{ text, c });
-                ctx.commit_queue.enqueueDup(c) catch |err| {
-                    ctx.logger.err("postprocess", "enqueue commit failed: {s}", .{@errorName(err)});
-                };
+                enqueueCommit(ctx, c);
             } else {
                 ctx.logger.info(ctx.provider, "🚀 {s}", .{text});
-                ctx.commit_queue.enqueueDup(text) catch |err| {
-                    ctx.logger.err("postprocess", "enqueue commit failed: {s}", .{@errorName(err)});
-                };
+                enqueueCommit(ctx, text);
             }
         }
+    }
+
+    fn enqueueCommit(ctx: *Pipeline, text: []const u8) void {
+        ctx.commit_queue.enqueueDup(text) catch |err| {
+            ctx.logger.err("postprocess", "enqueue commit failed: {s}", .{@errorName(err)});
+        };
     }
 
     fn commitWorker(ctx: *Pipeline) void {
         while (ctx.commit_queue.pop()) |text| {
             defer ctx.allocator.free(text);
-            const status = ctx.backend.commit(text);
+            const status = ctx.client.commit(text);
             if (std.mem.startsWith(u8, status, "OK ")) {
-                ctx.logger.info(ctx.backend.domain(), "✅", .{});
+                ctx.logger.info("wayland", "✅", .{});
             } else {
-                ctx.logger.err(ctx.backend.domain(), "❌ {s}", .{status});
+                ctx.logger.err("wayland", "❌ {s}", .{status});
             }
         }
     }
@@ -183,9 +173,4 @@ test "queue preserves fifo order" {
 
     try std.testing.expectEqualStrings("one", first.?);
     try std.testing.expectEqualStrings("two", second.?);
-}
-
-test "commit backend reports provider domain" {
-    try std.testing.expectEqualStrings("ibus", (CommitBackend{ .ibus = undefined }).domain());
-    try std.testing.expectEqualStrings("wayland", (CommitBackend{ .wayland = undefined }).domain());
 }

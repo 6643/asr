@@ -1,4 +1,23 @@
 const std = @import("std");
+const credentials = @import("doubao/credentials.zig");
+
+/// Outcome of refreshing the doubao credentials file at startup.
+pub const CredentialRefresh = union(enum) {
+    refreshed,
+    failed: anyerror,
+};
+
+/// Re-fetches the doubao tokens and rewrites the credentials file. The
+/// caller reloads the file when this reports `refreshed`.
+pub fn refreshDoubaoCredentials(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    debug: bool,
+) CredentialRefresh {
+    _ = credentials.refreshFile(allocator, io, path, debug) catch |err| return .{ .failed = err };
+    return .refreshed;
+}
 
 pub const default_websocket_url = "wss://frontier-audio-ime-ws.doubao.com/ocean/api/v1/ws";
 pub const default_aid = "401734";
