@@ -38,6 +38,10 @@ pub fn run(
         .doubao => .doubao,
     };
     const logger = output.Logger{ .io = io, .level = if (debug) .debug else .info };
+    if (mute.recoverStaleMute(allocator, io, environ)) {
+        logger.info("speaker", "restored mute state after an unclean exit", .{});
+    }
+    mute.setMarkerPath(allocator, io, environ);
     var cfg: config.Config = .{};
     var baidu_cfg: config.BaiduConfig = undefined;
     var doubao_creds: ?config.Credentials = null;

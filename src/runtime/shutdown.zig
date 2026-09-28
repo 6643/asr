@@ -21,6 +21,7 @@ pub fn installSignalHandlers() void {
     };
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+    std.posix.sigaction(std.posix.SIG.HUP, &act, null);
 }
 
 fn handleSignal(sig: std.posix.SIG) callconv(.c) void {
