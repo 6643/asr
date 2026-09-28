@@ -1,5 +1,6 @@
 const std = @import("std");
 const key = @import("../key.zig");
+const recorders = @import("recorder.zig");
 const shutdown = @import("shutdown.zig");
 
 pub const CaptureOptions = struct {
@@ -16,6 +17,8 @@ pub const StreamOptions = struct {
     started_ctx: ?*anyopaque = null,
     on_stopped: ?*const fn (ctx: ?*anyopaque) void = null,
     stopped_ctx: ?*anyopaque = null,
+    on_recorder: ?*const fn (ctx: ?*anyopaque, program: []const u8) void = null,
+    recorder_ctx: ?*anyopaque = null,
 };
 
 pub const StreamSummary = struct {
@@ -31,7 +34,9 @@ pub fn captureStreamUntilKeyRelease(
     options: CaptureOptions,
     stream: StreamOptions,
 ) !StreamSummary {
-    var child = try spawnArecord(io, options);
+    const spawned = try spawnRecorder(io, options);
+    var child = spawned.child;
+    if (stream.on_recorder) |on_recorder| on_recorder(stream.recorder_ctx, recorders.program(spawned.kind));
     errdefer child.kill(io);
     var stop_requested = std.atomic.Value(bool).init(false);
 
@@ -65,25 +70,16 @@ const StopCallback = struct {
     ctx: ?*anyopaque = null,
 };
 
-fn spawnArecord(io: std.Io, options: CaptureOptions) !std.process.Child {
+fn spawnRecorder(io: std.Io, options: CaptureOptions) !recorders.Spawned {
     var frame_rate_buf: [16]u8 = undefined;
     const frame_rate = try std.fmt.bufPrint(&frame_rate_buf, "{d}", .{effectiveSampleRate(options)});
     var channels_buf: [8]u8 = undefined;
     const channels = try std.fmt.bufPrint(&channels_buf, "{d}", .{effectiveChannels(options)});
 
-    if (options.device) |device| {
-        return std.process.spawn(io, .{
-            .argv = &[_][]const u8{ "arecord", "-f", "S16_LE", "-r", frame_rate, "-c", channels, "-t", "raw", "-D", device },
-            .stdin = .ignore,
-            .stdout = .pipe,
-            .stderr = .ignore,
-        });
-    }
-    return std.process.spawn(io, .{
-        .argv = &[_][]const u8{ "arecord", "-f", "S16_LE", "-r", frame_rate, "-c", channels, "-t", "raw" },
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .ignore,
+    return recorders.spawnFirst(io, .{
+        .rate = frame_rate,
+        .channels = channels,
+        .device = options.device,
     });
 }
 
@@ -259,4 +255,6 @@ test "stream options default to no started callback" {
     };
     try std.testing.expect(options.on_started == null);
     try std.testing.expect(options.started_ctx == null);
+    try std.testing.expect(options.on_recorder == null);
+    try std.testing.expect(options.recorder_ctx == null);
 }

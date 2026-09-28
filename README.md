@@ -6,10 +6,10 @@
 
 - Linux 桌面: IBus 环境 (Ubuntu 等) 或提供 `zwp_input_method_manager_v2` 的 Wayland 合成器 (niri 等)
 - `zig` 0.16
-- `arecord`
+- `arecord` (`alsa-utils`); 缺失时自动回退到 `pw-record` (`pipewire`)
 - IBus 环境需要: `ibus`, `ibus-daemon`
 - 可选: `pw-play` (提示音), `wpctl` (录音期间静音)
-- 需要可读键盘输入设备 (`/dev/input/event*`)
+- 需要可读键盘输入设备 (`/dev/input/event*`); 加入 `input` 组或配 udev 规则后重新登录即可 (`NixOS`: `users.users.<name>.extraGroups = [ "input" ];`)
 
 ## 配置
 
@@ -89,7 +89,8 @@ zig build -Doptimize=ReleaseSmall
 - 提示音使用 `pw-play /usr/share/sounds/freedesktop/stereo/bell.oga`。
 - 录音期间静音使用 `wpctl set-mute @DEFAULT_AUDIO_SINK@ 1/0`。
 - `pw-play` 或 `wpctl` 不可用时会自动跳过, 不影响识别与 IBus 提交链路。
-- 录音仅走流式路径 (`arecord` stdout → WebSocket), 不再写 `/tmp` 临时 PCM 文件。
+- 录音仅走流式路径 (`arecord`/`pw-record` stdout → WebSocket), 不再写 `/tmp` 临时 PCM 文件。
+- 录音器按 `arecord` → `pw-record` 顺序取第一个可用的二进制; 只对 `FileNotFound` 回退, 其它启动错误直接报错 (`--debug` 下会打印 `[mic] recorder <program>`)。
 - 会话握手前的语音缓冲与 fallback 音频均有 64MiB 上限, 超限后丢弃后续字节, 避免无界增长。
 - `SIGINT` / `SIGTERM` 走协作式关闭: 主循环与重试 sleep 通过 `shutdown.sleepMs` 可取消, 便于尽快退出。
 - IBus 引擎生命周期: 每次 `CreateEngine` 会先注销并释放旧引擎对象; `Destroy` 同样会清掉当前 active engine, 避免 DBus 注册与堆分配只增不减。

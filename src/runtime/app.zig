@@ -337,6 +337,8 @@ fn runHotkeyLoop(
             .started_ctx = @ptrCast(&started_state),
             .on_stopped = onCaptureStopped,
             .stopped_ctx = @ptrCast(&release_state),
+            .on_recorder = onCaptureRecorder,
+            .recorder_ctx = @ptrCast(&started_state),
         }) catch |err| {
             if (isShutdownRequested()) {
                 logger.info("app", "shutting down", .{});
@@ -707,6 +709,11 @@ fn resolveSession(state: *CaptureStartedState) !void {
 
     try state.session.start();
     state.stream_state.session = state.session;
+}
+
+fn onCaptureRecorder(ctx: ?*anyopaque, program: []const u8) void {
+    const state = @as(*CaptureStartedState, @ptrCast(@alignCast(ctx orelse return)));
+    state.logger.debug("mic", "recorder {s}", .{program});
 }
 
 fn onCaptureStarted(ctx: ?*anyopaque) !void {
