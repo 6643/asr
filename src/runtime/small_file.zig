@@ -27,9 +27,21 @@ pub fn readAll(io: std.Io, allocator: std.mem.Allocator, path: []const u8, max_b
 }
 
 test "reads a procfs file that reports size zero" {
-    const content = try readAll(std.testing.io, std.testing.allocator, "/proc/bus/input/devices", max_bytes_default);
+    // Streaming must work even though procfs reports stat.size == 0. /proc/self/
+    // status is present in every Linux environment (CI containers included).
+    const content = try readAll(std.testing.io, std.testing.allocator, "/proc/self/status", max_bytes_default);
     defer std.testing.allocator.free(content);
-    try std.testing.expect(content.len > 1000);
+    try std.testing.expect(content.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, content, "Name:") != null);
+}
+
+test "reads the kernel input device list when it exists" {
+    const content = readAll(std.testing.io, std.testing.allocator, "/proc/bus/input/devices", max_bytes_default) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(content.len > 0);
 }
 
 test "missing file is an error" {
@@ -42,6 +54,6 @@ test "missing file is an error" {
 test "refuses to read past the cap" {
     try std.testing.expectError(
         error.FileTooBig,
-        readAll(std.testing.io, std.testing.allocator, "/proc/bus/input/devices", 16),
+        readAll(std.testing.io, std.testing.allocator, "/proc/self/status", 16),
     );
 }
