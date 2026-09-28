@@ -14,14 +14,6 @@ const mute = @import("mute.zig");
 const output = @import("output.zig");
 const shutdown = @import("shutdown.zig");
 
-pub fn installSignalHandlers() void {
-    shutdown.installSignalHandlers();
-}
-
-pub fn isShutdownRequested() bool {
-    return shutdown.isRequested();
-}
-
 pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -29,7 +21,7 @@ pub fn run(
     opts: cli.Options,
     log_file: ?*output.LogFile,
 ) !void {
-    installSignalHandlers();
+    shutdown.installSignalHandlers();
     const debug = opts.debug;
     const engine_kind: engine.Kind = switch (opts.engine) {
         .baidu => .baidu,
@@ -192,7 +184,7 @@ const WaylandLoop = struct {
 };
 
 fn runWaylandLoop(loop: *WaylandLoop) void {
-    while (loop.running.load(.acquire) and !isShutdownRequested()) {
+    while (loop.running.load(.acquire) and !shutdown.isRequested()) {
         loop.client.pump(0) catch |err| {
             loop.logger.err("wayland", "disconnected: {s}", .{@errorName(err)});
             loop.failed.store(true, .release);
@@ -222,7 +214,7 @@ fn runHotkeyLoop(
 
     output.keyWait(logger);
     while (true) {
-        if (isShutdownRequested()) {
+        if (shutdown.isRequested()) {
             if (wayland_failed.load(.acquire)) {
                 logger.err("wayland", "input method connection lost; exiting", .{});
                 return error.WaylandDisconnected;
@@ -230,7 +222,7 @@ fn runHotkeyLoop(
             logger.info("app", "shutting down", .{});
             return;
         }
-        const outcome = keyboards.readNextOrShutdown(key.right_alt, isShutdownRequested, keyboard_set.discoveryCandidates, rescan_ctx) catch |err| {
+        const outcome = keyboards.readNextOrShutdown(key.right_alt, shutdown.isRequested, keyboard_set.discoveryCandidates, rescan_ctx) catch |err| {
             if (err == error.Interrupted) continue;
             logger.err("kbd", "{s}", .{@errorName(err)});
             return err;
@@ -337,7 +329,7 @@ fn runHotkeyLoop(
             .on_hold_timeout = capture.onHoldTimeout,
             .hold_timeout_ctx = @ptrCast(&started_state),
         }) catch |err| {
-            if (isShutdownRequested()) {
+            if (shutdown.isRequested()) {
                 logger.info("app", "shutting down", .{});
                 return;
             }
@@ -345,7 +337,7 @@ fn runHotkeyLoop(
             output.keyWait(logger);
             continue;
         };
-        if (isShutdownRequested()) {
+        if (shutdown.isRequested()) {
             logger.info("app", "shutting down", .{});
             return;
         }
