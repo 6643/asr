@@ -334,6 +334,12 @@ fn runHotkeyLoop(
         const close_message = formatMicCloseMessage(&close_message_buf, capture_summary) catch "stopped";
         logger.debug("mic", "{s}", .{close_message});
 
+        if (noAudioCaptured(capture_summary)) {
+            logger.err("mic", "no_audio_captured: recorder produced 0 bytes; check the microphone and PipeWire", .{});
+            output.keyWait(logger);
+            continue;
+        }
+
         if (!has_session) {
             logger.err(engineLabel(cfg), "session unavailable", .{});
             output.keyWait(logger);
@@ -734,6 +740,13 @@ fn onCaptureStopped(ctx: ?*anyopaque) void {
     state.speaker_guard.release();
 }
 
+/// A recorder that produced no bytes at all means the capture path is broken
+/// (no microphone, wrong PipeWire node): say so instead of finishing a silent
+/// session as if nothing happened.
+pub fn noAudioCaptured(summary: mic.StreamSummary) bool {
+    return summary.byte_count == 0;
+}
+
 fn formatMicCloseMessage(buf: []u8, summary: mic.StreamSummary) ![]const u8 {
     return std.fmt.bufPrint(
         buf,
@@ -762,4 +775,10 @@ test "keyboard read failed reopens event reader instead of exiting" {
 
 test "Interrupted is not classified as reopen" {
     try std.testing.expectEqual(KeyboardReadFailureAction.fail, classifyKeyboardReadFailure(error.Interrupted));
+}
+
+test "flags a capture that produced no audio" {
+    try std.testing.expect(noAudioCaptured(.{}));
+    try std.testing.expect(noAudioCaptured(.{ .chunk_count = 3 }));
+    try std.testing.expect(!noAudioCaptured(.{ .chunk_count = 1, .byte_count = 1 }));
 }
