@@ -4,6 +4,12 @@ const rectify = @import("../doubao/rectify.zig");
 const wayland_im = @import("wayland_im.zig");
 const output = @import("output.zig");
 
+/// Rectification costs a curl round trip (~1.5s), so it only runs when asked
+/// for and both credentials are present.
+pub fn shouldRectify(enabled: bool, sami_token: []const u8, device_id: []const u8) bool {
+    return enabled and sami_token.len > 0 and device_id.len > 0;
+}
+
 pub const Pipeline = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -66,7 +72,7 @@ pub const Pipeline = struct {
     fn rectifyWorker(ctx: *Pipeline) void {
         while (ctx.rectify_queue.pop()) |text| {
             defer ctx.allocator.free(text);
-            if (!ctx.rectify_enabled or ctx.cfg.sami_token.len == 0 or ctx.cfg.device_id.len == 0) {
+            if (!shouldRectify(ctx.rectify_enabled, ctx.cfg.sami_token, ctx.cfg.device_id)) {
                 ctx.logger.info(ctx.provider, "🚀 {s}", .{text});
                 enqueueCommit(ctx, text);
                 continue;
@@ -173,4 +179,11 @@ test "queue preserves fifo order" {
 
     try std.testing.expectEqualStrings("one", first.?);
     try std.testing.expectEqualStrings("two", second.?);
+}
+
+test "rectify needs the flag and both credentials" {
+    try std.testing.expect(shouldRectify(true, "token", "device"));
+    try std.testing.expect(!shouldRectify(false, "token", "device"));
+    try std.testing.expect(!shouldRectify(true, "", "device"));
+    try std.testing.expect(!shouldRectify(true, "token", ""));
 }
