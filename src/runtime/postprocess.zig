@@ -54,9 +54,14 @@ pub const Pipeline = struct {
     }
 
     pub fn submitFinal(pipeline: *Pipeline, text: []const u8) void {
-        pipeline.rectify_queue.enqueueDup(text) catch |err| {
+        const dropped = pipeline.rectify_queue.enqueueDup(text) catch |err| {
             pipeline.logger.err("postprocess", "queue final text failed: {s}", .{@errorName(err)});
+            return;
         };
+        if (dropped) |item| {
+            defer pipeline.allocator.free(item);
+            pipeline.logger.err("postprocess", "rectify queue full; dropped oldest text", .{});
+        }
     }
 
     pub fn deinit(pipeline: *Pipeline) void {
@@ -90,9 +95,14 @@ pub const Pipeline = struct {
     }
 
     fn enqueueCommit(ctx: *Pipeline, text: []const u8) void {
-        ctx.commit_queue.enqueueDup(text) catch |err| {
+        const dropped = ctx.commit_queue.enqueueDup(text) catch |err| {
             ctx.logger.err("postprocess", "enqueue commit failed: {s}", .{@errorName(err)});
+            return;
         };
+        if (dropped) |item| {
+            defer ctx.allocator.free(item);
+            ctx.logger.err("postprocess", "commit queue full; dropped oldest text", .{});
+        }
     }
 
     fn commitWorker(ctx: *Pipeline) void {
@@ -107,6 +117,10 @@ pub const Pipeline = struct {
         }
     }
 };
+
+/// Unbounded queues would grow without limit if the rectifier or the
+/// compositor got stuck, so each queue keeps at most this many texts.
+pub const max_pending_texts: usize = 64;
 
 const TextQueue = struct {
     allocator: std.mem.Allocator,
@@ -137,14 +151,22 @@ const TextQueue = struct {
         queue.closed = true;
     }
 
-    fn enqueueDup(queue: *TextQueue, text: []const u8) !void {
+    /// Copies `text` into the queue. When the queue is already full the oldest
+    /// entry is removed to make room and handed back to the caller, which owns
+    /// it (free it after logging): the newest speech matters most.
+    fn enqueueDup(queue: *TextQueue, text: []const u8) !?[]u8 {
         const copy = try queue.allocator.dupe(u8, text);
         errdefer queue.allocator.free(copy);
         queue.mutex.lockUncancelable(queue.io);
         defer queue.mutex.unlock(queue.io);
         if (queue.closed) return error.QueueClosed;
+        var dropped: ?[]u8 = null;
+        if (queue.items.items.len >= max_pending_texts) {
+            dropped = queue.items.orderedRemove(0);
+        }
         try queue.items.append(queue.allocator, copy);
         queue.cond.signal(queue.io);
+        return dropped;
     }
 
     fn pop(queue: *TextQueue) ?[]u8 {
@@ -167,8 +189,8 @@ test "queue preserves fifo order" {
     var queue = TextQueue.init(std.testing.allocator, std.testing.io);
     defer queue.deinit();
 
-    try queue.enqueueDup("one");
-    try queue.enqueueDup("two");
+    try std.testing.expect(try queue.enqueueDup("one") == null);
+    try std.testing.expect(try queue.enqueueDup("two") == null);
 
     const first = queue.pop();
     try std.testing.expect(first != null);
@@ -179,6 +201,32 @@ test "queue preserves fifo order" {
 
     try std.testing.expectEqualStrings("one", first.?);
     try std.testing.expectEqualStrings("two", second.?);
+}
+
+test "drops the oldest text when the queue is full" {
+    var queue = TextQueue.init(std.testing.allocator, std.testing.io);
+    defer queue.deinit();
+
+    var index: usize = 0;
+    var buf: [32]u8 = undefined;
+    while (index < max_pending_texts + 6) : (index += 1) {
+        const text = try std.fmt.bufPrint(&buf, "item-{d}", .{index});
+        const dropped = try queue.enqueueDup(text);
+        if (index < max_pending_texts) {
+            try std.testing.expect(dropped == null);
+        } else {
+            defer std.testing.allocator.free(dropped.?);
+            var expected_buf: [32]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&expected_buf, "item-{d}", .{index - max_pending_texts});
+            try std.testing.expectEqualStrings(expected, dropped.?);
+        }
+    }
+
+    try std.testing.expectEqual(max_pending_texts, queue.items.items.len);
+    const first = queue.pop();
+    try std.testing.expect(first != null);
+    defer std.testing.allocator.free(first.?);
+    try std.testing.expectEqualStrings("item-6", first.?);
 }
 
 test "rectify needs the flag and both credentials" {
