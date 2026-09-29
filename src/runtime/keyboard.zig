@@ -483,6 +483,9 @@ test "openAll skips unreadable candidates and logs them" {
     created.close(std.testing.io);
 
     const log_path = "/tmp/asr-keyboard-set.log";
+    // Fresh log per run: these files are appended to, so a stale file from an
+    // earlier run would push the read past the limit below.
+    std.Io.Dir.cwd().deleteFile(std.testing.io, log_path) catch {};
     var log_file = try output.LogFile.open(log_path);
     defer log_file.deinit();
     const logger: output.Logger = .{ .io = std.testing.io, .level = .debug, .log_file = &log_file };
@@ -621,6 +624,9 @@ test "ignores other keyboards while a recording is owned" {
     defer b.unplug();
 
     const log_path = "/tmp/asr-keyboard-owned.log";
+    // Fresh log per run: these files are appended to, so a stale file from an
+    // earlier run would push the read past the limit below.
+    std.Io.Dir.cwd().deleteFile(std.testing.io, log_path) catch {};
     var log_file = try output.LogFile.open(log_path);
     defer log_file.deinit();
     const logger: output.Logger = .{ .io = std.testing.io, .level = .debug, .log_file = &log_file };
@@ -692,6 +698,9 @@ test "rescan adds new keyboards once and ignores failures" {
     created.close(std.testing.io);
 
     const log_path = "/tmp/asr-keyboard-rescan.log";
+    // Fresh log per run: these files are appended to, so a stale file from an
+    // earlier run would push the read past the limit below.
+    std.Io.Dir.cwd().deleteFile(std.testing.io, log_path) catch {};
     var log_file = try output.LogFile.open(log_path);
     defer log_file.deinit();
     const logger: output.Logger = .{ .io = std.testing.io, .level = .debug, .log_file = &log_file };
