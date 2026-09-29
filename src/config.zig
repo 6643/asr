@@ -54,12 +54,6 @@ pub const Config = struct {
     sami_token: []const u8 = "",
 };
 
-pub const AudioParams = struct {
-    sample_rate: u32 = 16000,
-    channels: u16 = 1,
-    frame_duration_ms: u16 = 100,
-};
-
 pub const BaiduConfig = struct {
     url: []const u8 = "",
     sample_rate: u32 = 16000,

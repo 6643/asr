@@ -141,14 +141,6 @@ fn freePathList(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
     list.deinit(allocator);
 }
 
-/// Single-device view kept for callers that only need one keyboard.
-pub fn findKeyboardDevice(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ) ![]u8 {
-    const devices = try findKeyboardDevices(allocator, io, environ);
-    defer freeDeviceList(allocator, devices);
-    if (devices.len == 0) return error.KeyboardDeviceNotFound;
-    return allocator.dupe(u8, devices[0]);
-}
-
 /// Explicit device overrides: the single pin wins over the colon/comma separated
 /// debug list. Null means "discover automatically".
 pub fn overriddenDevicePaths(allocator: std.mem.Allocator, single: ?[]const u8, multi: ?[]const u8) !?[][]u8 {
@@ -342,18 +334,6 @@ pub fn readNextDeviceEvent(
     }
 }
 
-pub fn waitForDeviceRelease(
-    io: std.Io,
-    file: std.Io.File,
-    state: *State,
-    key_code: u16,
-) DeviceReadError!void {
-    while (true) {
-        const event = try readNextDeviceEvent(io, file, state, key_code);
-        if (event == .release) return;
-    }
-}
-
 pub const WaitOutcome = enum {
     released,
     shutdown,
@@ -407,22 +387,6 @@ const NextStep = union(enum) {
     event: Event,
     stop: StopReason,
 };
-
-/// Block until the next target-key event, or return `null` when stop is requested
-/// (shutdown or Select cancelation).
-pub fn waitNextDeviceEventOrShutdown(
-    io: std.Io,
-    file: std.Io.File,
-    state: *State,
-    key_code: u16,
-    is_shutdown: ShutdownCheck,
-) DeviceReadError!?Event {
-    const step = try waitNextStepOrStop(io, file, state, key_code, is_shutdown, null);
-    return switch (step) {
-        .event => |event| event,
-        .stop => null,
-    };
-}
 
 fn waitNextStepOrStop(
     io: std.Io,

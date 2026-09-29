@@ -39,11 +39,6 @@ pub fn sleepUntilOr(io: std.Io, milliseconds: i64) void {
     }
 }
 
-/// Canonical short name for cancelable sleeps used across runtime/main.
-pub fn sleepMs(io: std.Io, milliseconds: i64) void {
-    sleepUntilOr(io, milliseconds);
-}
-
 test "shutdown flag starts clear and can be set" {
     // Do not touch process signal handlers in unit tests; only the atomic API.
     // Note: process-global — reset after so other tests are unaffected if any
