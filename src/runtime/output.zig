@@ -108,7 +108,11 @@ pub fn keyWait(logger: Logger) void {
     logger.debug("kbd", "wait down RightAlt", .{});
 }
 
-pub fn keyEvent(logger: Logger, event: @import("../key.zig").Event) void {
+/// Key phase the app wants to log. Kept here (instead of importing the evdev
+/// key module) so the logger stays a leaf with no runtime dependencies.
+pub const KeyEvent = enum { press, release };
+
+pub fn keyEvent(logger: Logger, event: KeyEvent) void {
     switch (event) {
         .press => logger.info("kbd", "down RightAlt", .{}),
         .release => logger.info("kbd", "up RightAlt", .{}),
