@@ -143,6 +143,17 @@ pub const Set = struct {
     /// it owned the recording the caller still gets a release so a capture can
     /// never be stuck. Rescans add keyboards that appeared later and never
     /// interrupt an active recording.
+    ///
+    /// Arm rules (a `Select` arm runs once and writes into a slot on this
+    /// frame):
+    /// * every return path calls `cancelDiscard` first, so no task outlives the
+    ///   slots buffer;
+    /// * an arm that came back as "ignored" (another keyboard owns the
+    ///   recording) or as `error.Interrupted` must be re-added, otherwise that
+    ///   device never reports again;
+    /// * ownership of a recording ends in `endRecording`, not here: the release
+    ///   itself is consumed by the capture loop, and buffered presses from other
+    ///   keyboards must be drained before the owner is cleared.
     pub fn readNextOrShutdown(
         self: *Set,
         key_code: u16,

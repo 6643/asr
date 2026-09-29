@@ -1,3 +1,16 @@
+//! Callback lifetime contract.
+//!
+//! Every context handed to the engine and capture callbacks (`?*anyopaque`)
+//! borrows the stack frame of the *current* recording in `app.runHotkeyLoop`:
+//! `CaptureStartedState`, `CaptureReleaseState`, `StreamCaptureState` and
+//! `EngineCallbacks` are locals of that loop body. Nothing may keep those
+//! pointers alive after the iteration ends, which is why every future and
+//! thread started here is finished before then: the bell future is awaited, the
+//! session-init future is cancelled (and, when it already produced one, its
+//! session is deinitialised), and `Session.deinit` joins the session read
+//! thread. The pipeline is the one long-lived collaborator; it outlives every
+//! recording. Keep this invariant when adding a task or a callback.
+
 const std = @import("std");
 const doubao = @import("../doubao/client.zig");
 const engine = @import("engine.zig");

@@ -245,6 +245,9 @@ fn runHotkeyLoop(
         if (event.kind == .release) continue;
         output.keyEvent(logger, .press);
 
+        // Everything below borrows this iteration's stack frame; see the
+        // lifetime contract at the top of capture.zig before letting any task
+        // outlive the recording.
         var callback_ctx = capture.EngineCallbacks{
             .pipeline = pipeline,
         };
