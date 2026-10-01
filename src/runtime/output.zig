@@ -76,28 +76,61 @@ pub const Logger = struct {
     }
 };
 
+/// `struct tm` as glibc and musl lay it out; only `tm_gmtoff` is read.
+const c_tm = extern struct {
+    tm_sec: c_int = 0,
+    tm_min: c_int = 0,
+    tm_hour: c_int = 0,
+    tm_mday: c_int = 0,
+    tm_mon: c_int = 0,
+    tm_year: c_int = 0,
+    tm_wday: c_int = 0,
+    tm_yday: c_int = 0,
+    tm_isdst: c_int = 0,
+    tm_gmtoff: c_long = 0,
+    tm_zone: ?[*:0]const u8 = null,
+};
+
+extern "c" fn localtime_r(timep: *const c_long, result: *c_tm) ?*c_tm;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+extern "c" fn tzset() void;
+
 fn timestamp(io: std.Io) [12]u8 {
     const now = std.Io.Clock.real.now(io);
     const raw_seconds = now.toSeconds();
     const raw_milliseconds = now.toMilliseconds();
-    const seconds: u64 = if (raw_seconds < 0) 0 else @intCast(raw_seconds);
+    const seconds: i64 = if (raw_seconds < 0) 0 else raw_seconds;
     const milliseconds: u16 = if (raw_milliseconds < 0)
         0
     else
         @intCast(@mod(raw_milliseconds, 1000));
-    return formatTimeOfDay(seconds, milliseconds);
+    return formatTimeOfDayShifted(seconds, milliseconds, localOffsetSeconds(seconds));
 }
 
-fn formatTimeOfDay(seconds: u64, milliseconds: u16) [12]u8 {
-    const day_secs = (std.time.epoch.EpochSeconds{ .secs = seconds }).getDaySeconds();
+/// The machine's UTC offset at `epoch_seconds`, so log lines carry local wall
+/// clock time. libc applies `TZ` (including DST); 0 (UTC) when it cannot answer.
+fn localOffsetSeconds(epoch_seconds: i64) i32 {
+    var time: c_long = @intCast(epoch_seconds);
+    var result: c_tm = .{};
+    const tm = localtime_r(&time, &result) orelse return 0;
+    return @intCast(tm.tm_gmtoff);
+}
+
+/// `HH:MM:SS.mmm` for `epoch_seconds` in a zone `offset_seconds` east of UTC.
+/// Only the time of day is printed, so the day itself is normalized away.
+fn formatTimeOfDayShifted(epoch_seconds: i64, milliseconds: u16, offset_seconds: i32) [12]u8 {
+    const seconds_in_day: i64 = 24 * 60 * 60;
+    const shifted = @mod(epoch_seconds + @as(i64, offset_seconds), seconds_in_day);
+    const seconds: u64 = @intCast(shifted);
     var out: [12]u8 = undefined;
     _ = std.fmt.bufPrint(
         &out,
         "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}",
         .{
-            day_secs.getHoursIntoDay(),
-            day_secs.getMinutesIntoHour(),
-            day_secs.getSecondsIntoMinute(),
+            seconds / 3600,
+            (seconds % 3600) / 60,
+            seconds % 60,
             milliseconds,
         },
     ) catch unreachable;
@@ -124,9 +157,36 @@ test "formats timestamp" {
 }
 
 test "formats time of day with zero padding" {
-    try std.testing.expectEqualStrings("00:00:00.000", &formatTimeOfDay(0, 0));
-    try std.testing.expectEqualStrings("01:01:01.007", &formatTimeOfDay(3661, 7));
-    try std.testing.expectEqualStrings("23:59:59.999", &formatTimeOfDay(86399, 999));
+    try std.testing.expectEqualStrings("00:00:00.000", &formatTimeOfDayShifted(0, 0, 0));
+    try std.testing.expectEqualStrings("01:01:01.007", &formatTimeOfDayShifted(3661, 7, 0));
+    try std.testing.expectEqualStrings("23:59:59.999", &formatTimeOfDayShifted(86399, 999, 0));
+}
+
+test "shifts the time of day by a local utc offset" {
+    const hour: i32 = 3600;
+    // 1970-01-01T00:00:00Z is 08:00 in UTC+8 and 19:00 the day before in UTC-5.
+    try std.testing.expectEqualStrings("08:00:00.000", &formatTimeOfDayShifted(0, 0, 8 * hour));
+    try std.testing.expectEqualStrings("19:00:00.000", &formatTimeOfDayShifted(0, 0, -5 * hour));
+    // Midnight rolls over the day instead of printing 24:00.
+    try std.testing.expectEqualStrings("00:00:00.500", &formatTimeOfDayShifted(86399, 500, 1));
+    try std.testing.expectEqualStrings("00:59:59.000", &formatTimeOfDayShifted(86399, 0, hour));
+}
+
+test "log timestamps follow the TZ environment" {
+    const saved = std.c.getenv("TZ");
+    // POSIX TZ strings invert the sign: UTC-8 is UTC+8.
+    _ = setenv("TZ", "UTC-8", 1);
+    tzset();
+    defer {
+        if (saved) |value| {
+            _ = setenv("TZ", value, 1);
+        } else {
+            _ = unsetenv("TZ");
+        }
+        tzset();
+    }
+
+    try std.testing.expectEqual(@as(i32, 8 * 3600), localOffsetSeconds(0));
 }
 
 fn tempLogPath(tmp: *std.testing.TmpDir) ![]u8 {
