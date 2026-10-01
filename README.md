@@ -90,7 +90,7 @@ ASR_KEYBOARD_DEVICES=/dev/input/event2:/dev/input/event5 ./zig-out/bin/asr   # �
 
 ## 日志格式
 
-`HH:MM:SS.mmm [domain] message`（**本地时间**，按 `TZ` ，仅时间不含日期）。`--log-file <path>` 以追加方式写入文件；不指定时写到终端。
+`HH:MM:SS.mmm [domain] message`（**本地时间**（按 `TZ`），仅时间不含日期）。`--log-file <path>` 以追加方式写入文件；不指定时写到终端。
 
 ## 说明
 
