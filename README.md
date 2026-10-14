@@ -40,8 +40,6 @@ zig build
 ./zig-out/bin/asr
 ```
 
-CI：`.github/workflows/ci.yml` 在 push / PR 时用 Zig 0.16.0 跑 `zig build check`。
-
 按住 `RightAlt` 开始录音并实时识别，松开后等待最终结果并提交到当前输入焦点。按 `--help` 查看全部选项：
 
 ```
