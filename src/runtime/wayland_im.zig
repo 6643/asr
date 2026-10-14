@@ -887,7 +887,8 @@ test "default display name is used when unset" {
 }
 
 test "nextChunk does not split utf8 characters" {
-    const text = ("a" ** 3999) ++ "你" ++ "b";
+    const repeated: [3999]u8 = @splat('a');
+    const text = &repeated ++ "你" ++ "b";
     const first = nextChunk(text, 0);
     try std.testing.expectEqual(@as(usize, 3999), first.len);
     const second = nextChunk(text, first.len);
@@ -896,8 +897,8 @@ test "nextChunk does not split utf8 characters" {
 }
 
 test "nextChunk keeps exactly 4000 bytes as one chunk" {
-    const text = "a" ** 4000;
-    try std.testing.expectEqual(@as(usize, 4000), nextChunk(text, 0).len);
+    const text: [4000]u8 = @splat('a');
+    try std.testing.expectEqual(@as(usize, 4000), nextChunk(&text, 0).len);
 }
 
 test "buildCommitMessages emits commit_string plus commit per chunk" {

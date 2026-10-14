@@ -110,7 +110,7 @@ pub fn encodeRequest(allocator: std.mem.Allocator, req: Request) ![]u8 {
     if (req.payload.len > 0) try encodeStringField(&out, allocator, req_field_payload, req.payload);
     if (req.audio_data.len > 0) try encodeBytesField(&out, allocator, req_field_audio_data, req.audio_data);
     if (req.request_id.len > 0) try encodeStringField(&out, allocator, req_field_request_id, req.request_id);
-    if (req.frame_state != .unspecified) try encodeVarintField(&out, allocator, req_field_frame_state, @intFromEnum(req.frame_state));
+    if (req.frame_state != .unspecified) try encodeVarintField(&out, allocator, req_field_frame_state, @backingInt(req.frame_state));
 
     return out.toOwnedSlice(allocator);
 }

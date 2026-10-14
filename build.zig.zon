@@ -2,7 +2,7 @@
     .name = .asr_zig,
     .version = "0.0.0",
     .fingerprint = 0x13e8828896577709,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{
         "build.zig",

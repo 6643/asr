@@ -1,13 +1,13 @@
 # ASR (Zig)
 
-当前仓库仅保留 Zig 0.16 实现，且只支持当前 PC 环境：**Wayland 输入法提交 + PipeWire 采集**。
+当前仓库仅保留 Zig 0.17 实现，且只支持当前 PC 环境：**Wayland 输入法提交 + PipeWire 采集**。
 
 ## 依赖
 
 - 提供 `zwp_input_method_manager_v2` 的 Wayland 合成器（本机 umbriel 已支持）
 - `pipewire`：`pw-record`（采集）、可选 `wpctl`（录音期间静音）、可选 `pw-play`（提示音）
 - `curl`（刷新凭证、结果纠错）
-- `zig` 0.16
+- `zig` 0.17
 - 可读的键盘输入设备（`/dev/input/event*`）：加入 `input` 组后重新登录即可
   （`NixOS`: `users.users.<name>.extraGroups = [ "input" ];`）
 

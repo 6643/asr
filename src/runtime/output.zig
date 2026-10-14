@@ -60,7 +60,7 @@ pub const Logger = struct {
     }
 
     pub fn write(logger: Logger, level: Level, domain: []const u8, comptime fmt: []const u8, args: anytype) void {
-        if (@intFromEnum(level) > @intFromEnum(logger.level)) return;
+        if (@backingInt(level) > @backingInt(logger.level)) return;
         var buffer: [1024]u8 = undefined;
         if (logger.log_file) |log_file| {
             const line = std.fmt.bufPrint(&buffer, "{s} [{s}] " ++ fmt ++ "\n", .{ timestamp(logger.io), domain } ++ args) catch return;

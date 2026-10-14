@@ -569,7 +569,7 @@ pub fn deviceSearchFailure(saw_denied: bool) error{ KeyboardDeviceNotFound, Keyb
 }
 
 pub fn inputEvent(event_type: u16, code: u16, value: u32) [input_event_size]u8 {
-    var out = [_]u8{0} ** input_event_size;
+    var out: [input_event_size]u8 = @splat(0);
     std.mem.writeInt(u16, out[16..18], event_type, .little);
     std.mem.writeInt(u16, out[18..20], code, .little);
     std.mem.writeInt(u32, out[20..24], value, .little);
