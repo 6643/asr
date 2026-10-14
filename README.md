@@ -95,12 +95,13 @@ ASR_KEYBOARD_DEVICES=/dev/input/event2:/dev/input/event5 ./zig-out/bin/asr   # �
 ## 说明
 
 - 采集只有 `pw-record`（`--debug` 下会打印 `[mic] recorder pw-record`），参数为 `--rate <采样率> --channels <声道> --format s16 -`。
-- 录音期间会静音默认输出（`wpctl set-mute @DEFAULT_AUDIO_SINK@ 1/0`），避免外放被麦克风收进去：录音前先探测，若输出本来就静音则不动它；静音时写 `$XDG_RUNTIME_DIR/asr-speaker-muted` 标记，正常结束时删除；进程被强杀后下次启动会自动恢复。
+- 录音期间会静音默认输出（`wpctl set-mute @DEFAULT_AUDIO_SINK@ 1/0`，在提示音响完之后），避免外放被麦克风收进去：录音前先探测，若输出本来就静音则不动它（此时提示音也听不到）；静音时写 `$XDG_RUNTIME_DIR/asr-speaker-muted` 标记，正常结束时删除；进程被强杀后下次启动会自动恢复。
 - `wpctl` 不可用时静音链路整体跳过，不影响识别。
-- 提示音在候选路径中取第一个存在的文件（`/run/current-system/sw/share/sounds/freedesktop/stereo/bell.oga` → `/usr/share/sounds/...`），都不存在时静默跳过。可用 `pw-play` 手工验证。
+- 提示音就是“可以说话了”的信号：先等会话 start 成功、且 `pw-record` 送来第一块音频，才播放提示音；响的同时开始把音频送给引擎（提示音本身可能跟着进引擎，纯音通常不出字），响完立即静音外放。提示音之前的音频直接丢弃，不进识别。`--debug` 可看到 `session ready → prompt → mute` 的顺序。
+- 提示音在候选路径中取第一个存在的文件（`/run/current-system/sw/share/sounds/freedesktop/stereo/bell.oga` → `/usr/share/sounds/...`），都不存在时静默跳过（也就没有开始说话的信号了）。可用 `pw-play` 手工验证。
 - 采集到 0 字节时打印 `ERR no_audio_captured` 并跳过本次会话，而不是静默走完。
 - 键盘设备不可读时报 `ERR KeyboardPermissionDenied`，不会伪装成"找不到设备"；一把设备都找不到时报 `ERR KeyboardDeviceNotFound` 并提示用 `ASR_KEYBOARD_DEVICE` 指定。
-- 会话握手前的语音缓冲与 fallback 音频均有 64MiB 上限，超限后丢弃后续字节，避免无界增长。
+- fallback 音频（流失败时补传）有 64MiB 上限，超限后丢弃后续字节，避免无界增长。
 - 默认最长按住 120 秒（`--max-hold-ms 0` 取消限制）；到点按"松手"处理，仍会提交已识别的内容。
 - 最终识别结果经后处理队列异步 rectify（`--no-rectify` 关闭；缺少 token 时自动跳过）后提交，不阻塞热键循环。松手到文本上屏之间最多会多等约 1.5 秒（纠错请求超时）。
 - `SIGINT` / `SIGTERM` / `SIGHUP` 走协作式关闭：主循环与重试 sleep 通过 `shutdown.sleepMs` 可取消，尽快退出并解除静音。

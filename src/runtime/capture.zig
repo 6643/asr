@@ -5,11 +5,11 @@
 //! `CaptureStartedState`, `CaptureReleaseState`, `StreamCaptureState` and
 //! `EngineCallbacks` are locals of that loop body. Nothing may keep those
 //! pointers alive after the iteration ends, which is why every future and
-//! thread started here is finished before then: the bell future is awaited, the
-//! session-init future is cancelled (and, when it already produced one, its
-//! session is deinitialised), and `Session.deinit` joins the session read
-//! thread. The pipeline is the one long-lived collaborator; it outlives every
-//! recording. Keep this invariant when adding a task or a callback.
+//! thread started here is finished before then: the session-init future is
+//! cancelled (and, when it already produced one, its session is deinitialised),
+//! and `Session.deinit` joins the session read thread. The pipeline is the one
+//! long-lived collaborator; it outlives every recording. Keep this invariant
+//! when adding a task or a callback.
 
 const std = @import("std");
 const doubao = @import("../doubao/client.zig");
@@ -24,6 +24,23 @@ const audio_gate = @import("audio_gate.zig");
 
 /// Upper bound on the audio we keep for the post-stream fallback upload.
 pub const max_captured_audio_bytes: usize = 64 * 1024 * 1024;
+
+/// How long to wait for the recorder's first chunk before prompting anyway: a
+/// dead microphone must not stall the hotkey loop.
+pub const mic_ready_timeout_ms: i64 = 1500;
+const mic_ready_poll_ms: i64 = 5;
+
+/// True once the recorder delivered audio; false on timeout or shutdown.
+pub fn waitForFirstChunk(gate: *audio_gate.AudioGate, io: std.Io, timeout_ms: i64) bool {
+    var waited: i64 = 0;
+    while (!gate.sawFirstChunk()) {
+        if (shutdown.isRequested()) return false;
+        if (waited >= timeout_ms) return false;
+        shutdown.sleepUntilOr(io, mic_ready_poll_ms);
+        waited += mic_ready_poll_ms;
+    }
+    return true;
+}
 
 pub fn onEngineInterim(ctx: ?*const anyopaque, text: []const u8) void {
     if (text.len == 0) return;
@@ -142,6 +159,7 @@ fn resolveSession(state: *CaptureStartedState) !void {
 
     try state.session.start();
     state.stream_state.session = state.session;
+    state.logger.debug(engine.label(state.cfg), "session ready", .{});
 }
 
 pub fn onCaptureRecorder(ctx: ?*anyopaque, program: []const u8) void {
@@ -152,25 +170,25 @@ pub fn onCaptureRecorder(ctx: ?*anyopaque, program: []const u8) void {
 pub fn onCaptureStarted(ctx: ?*anyopaque) !void {
     const state = @as(*CaptureStartedState, @ptrCast(@alignCast(ctx orelse return error.MissingCaptureStartedState)));
 
-    if (state.io.concurrent(playBellTask, .{ state.allocator, state.io })) |bell_future_value| {
-        var bell_future = bell_future_value;
-        resolveSession(state) catch |err| {
-            _ = bell_future.await(state.io);
-            state.logger.err(engine.label(state.cfg), "session failed: {s}", .{@errorName(err)});
-            return err;
-        };
-        _ = bell_future.await(state.io);
-        state.speaker_guard.muteAfterPrompt();
-    } else |_| {
-        playBellTask(state.allocator, state.io);
-        state.speaker_guard.muteAfterPrompt();
-        resolveSession(state) catch |err| {
-            state.logger.err(engine.label(state.cfg), "session failed: {s}", .{@errorName(err)});
-            return err;
-        };
+    // The ding is the "you can speak" cue, so it has to wait for the session
+    // and for the recorder: ringing it while the handshake ran is what made it
+    // lie. Audio captured before the cue is dropped, not buffered.
+    resolveSession(state) catch |err| {
+        state.logger.err(engine.label(state.cfg), "session failed: {s}", .{@errorName(err)});
+        return err;
+    };
+    if (shutdown.isRequested()) return error.Canceled;
+    if (!waitForFirstChunk(state.gate, state.io, mic_ready_timeout_ms)) {
+        if (shutdown.isRequested()) return error.Canceled;
+        state.logger.info("mic", "no audio arrived before the prompt", .{});
     }
 
-    try state.gate.openAndFlush(@ptrCast(state.stream_state), sendEngineAudioChunk);
+    // Open first: speech that starts together with the ding must be kept.
+    state.gate.open();
+    state.logger.debug("speaker", "prompt", .{});
+    playBellTask(state.allocator, state.io);
+    state.speaker_guard.muteAfterPrompt();
+
     state.logger.info(engine.label(state.cfg), "🎤", .{});
 }
 
@@ -211,6 +229,22 @@ test "flags a capture that produced no audio" {
     try std.testing.expect(noAudioCaptured(.{}));
     try std.testing.expect(noAudioCaptured(.{ .chunk_count = 3 }));
     try std.testing.expect(!noAudioCaptured(.{ .chunk_count = 1, .byte_count = 1 }));
+}
+
+test "mic ready wait returns as soon as a chunk arrived" {
+    var gate = audio_gate.AudioGate.init(std.testing.io);
+    try gate.handleChunk("first", null, discardChunk);
+    try std.testing.expect(waitForFirstChunk(&gate, std.testing.io, 1000));
+}
+
+test "mic ready wait gives up once the timeout passes" {
+    var gate = audio_gate.AudioGate.init(std.testing.io);
+    try std.testing.expect(!waitForFirstChunk(&gate, std.testing.io, 20));
+}
+
+fn discardChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
+    _ = ctx;
+    _ = chunk;
 }
 pub fn initSessionWithRetry(
     allocator: std.mem.Allocator,

@@ -276,9 +276,7 @@ fn runHotkeyLoop(
         defer keyboards.endRecording(key.right_alt);
         var captured_audio: std.ArrayList(u8) = .empty;
         defer captured_audio.deinit(allocator);
-        var gate = audio_gate.AudioGate.init(allocator, io);
-        defer gate.deinit();
-        gate.beginBuffering();
+        var gate = audio_gate.AudioGate.init(io);
 
         var session: engine.Session = undefined;
         var has_session = false;

@@ -2,122 +2,67 @@ const std = @import("std");
 
 pub const SendFn = *const fn (ctx: ?*anyopaque, chunk: []const u8) anyerror!void;
 
-/// Hard cap for pre-session speech buffer (matches capture fallback budget).
-pub const max_buffered_audio_bytes: usize = 64 * 1024 * 1024;
-
+/// Holds captured audio back until the prompt moment. Every chunk before
+/// `open` is dropped: the wait for the session and the prompt itself must not
+/// reach the engine. `sawFirstChunk` reports that the recorder really is
+/// streaming (PipeWire links the source a moment after the spawn), which is
+/// what makes the prompt a truthful "you can speak" signal.
 pub const AudioGate = struct {
-    allocator: std.mem.Allocator,
     io: std.Io,
     mutex: std.Io.Mutex = .init,
     mode: Mode = .drop,
-    buffered_audio: std.ArrayList(u8) = .empty,
-    max_buffered_bytes: usize = max_buffered_audio_bytes,
+    first_chunk_seen: std.atomic.Value(bool) = .init(false),
 
     const Mode = enum {
         drop,
-        buffer,
         open,
     };
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io) AudioGate {
-        return .{
-            .allocator = allocator,
-            .io = io,
-        };
+    pub fn init(io: std.Io) AudioGate {
+        return .{ .io = io };
     }
 
-    pub fn deinit(gate: *AudioGate) void {
-        gate.buffered_audio.deinit(gate.allocator);
+    pub fn sawFirstChunk(gate: *AudioGate) bool {
+        return gate.first_chunk_seen.load(.acquire);
     }
 
-    pub fn beginBuffering(gate: *AudioGate) void {
-        gate.mutex.lockUncancelable(gate.io);
-        defer gate.mutex.unlock(gate.io);
-        if (gate.mode == .drop) gate.mode = .buffer;
-    }
-
-    pub fn openAndFlush(gate: *AudioGate, ctx: ?*anyopaque, send_fn: SendFn) !void {
+    pub fn open(gate: *AudioGate) void {
         gate.mutex.lockUncancelable(gate.io);
         defer gate.mutex.unlock(gate.io);
         gate.mode = .open;
-        if (gate.buffered_audio.items.len > 0) {
-            try send_fn(ctx, gate.buffered_audio.items);
-            gate.buffered_audio.items.len = 0;
-        }
     }
 
     pub fn handleChunk(gate: *AudioGate, chunk: []const u8, ctx: ?*anyopaque, send_fn: SendFn) !void {
+        gate.first_chunk_seen.store(true, .release);
         gate.mutex.lockUncancelable(gate.io);
         defer gate.mutex.unlock(gate.io);
         switch (gate.mode) {
             .drop => return,
-            .buffer => try appendBuffered(gate, chunk),
             .open => try send_fn(ctx, chunk),
         }
     }
-
-    fn appendBuffered(gate: *AudioGate, chunk: []const u8) !void {
-        const room = if (gate.buffered_audio.items.len >= gate.max_buffered_bytes)
-            @as(usize, 0)
-        else
-            gate.max_buffered_bytes - gate.buffered_audio.items.len;
-        if (room == 0) return;
-        const take = @min(chunk.len, room);
-        try gate.buffered_audio.appendSlice(gate.allocator, chunk[0..take]);
-    }
 };
 
-test "drops prompt audio then flushes buffered speech before live chunks" {
+test "drops chunks until open and then sends them live" {
     const allocator = std.testing.allocator;
     var recorder = Recorder.init(allocator);
     defer recorder.deinit();
 
-    var gate = AudioGate.init(allocator, std.testing.io);
-    defer gate.deinit();
+    var gate = AudioGate.init(std.testing.io);
 
-    try gate.handleChunk("prompt", @ptrCast(&recorder), Recorder.send);
-    gate.beginBuffering();
-    try gate.handleChunk("ni", @ptrCast(&recorder), Recorder.send);
-    try gate.handleChunk("hao", @ptrCast(&recorder), Recorder.send);
-    try gate.openAndFlush(@ptrCast(&recorder), Recorder.send);
-    try gate.handleChunk("!", @ptrCast(&recorder), Recorder.send);
+    try gate.handleChunk("before the prompt", @ptrCast(&recorder), Recorder.send);
+    gate.open();
+    try gate.handleChunk("after the prompt", @ptrCast(&recorder), Recorder.send);
 
-    try std.testing.expectEqualStrings("nihao!", recorder.bytes.items);
+    try std.testing.expectEqualStrings("after the prompt", recorder.bytes.items);
 }
 
-test "buffers speech from the start when open is delayed by session boot" {
-    const allocator = std.testing.allocator;
-    var recorder = Recorder.init(allocator);
-    defer recorder.deinit();
+test "notices the first chunk while still dropping it" {
+    var gate = AudioGate.init(std.testing.io);
 
-    var gate = AudioGate.init(allocator, std.testing.io);
-    defer gate.deinit();
-
-    // Hot path: buffer immediately so session handshake never drops speech.
-    gate.beginBuffering();
-    try gate.handleChunk("early", @ptrCast(&recorder), Recorder.send);
-    try gate.handleChunk("speech", @ptrCast(&recorder), Recorder.send);
-    try gate.openAndFlush(@ptrCast(&recorder), Recorder.send);
-    try gate.handleChunk("!", @ptrCast(&recorder), Recorder.send);
-
-    try std.testing.expectEqualStrings("earlyspeech!", recorder.bytes.items);
-}
-
-test "buffer mode drops bytes once max_buffered_bytes is reached" {
-    const allocator = std.testing.allocator;
-    var recorder = Recorder.init(allocator);
-    defer recorder.deinit();
-
-    var gate = AudioGate.init(allocator, std.testing.io);
-    defer gate.deinit();
-    gate.max_buffered_bytes = 4;
-
-    gate.beginBuffering();
-    try gate.handleChunk("abc", @ptrCast(&recorder), Recorder.send);
-    try gate.handleChunk("def", @ptrCast(&recorder), Recorder.send);
-    try gate.openAndFlush(@ptrCast(&recorder), Recorder.send);
-
-    try std.testing.expectEqualStrings("abcd", recorder.bytes.items);
+    try std.testing.expect(!gate.sawFirstChunk());
+    try gate.handleChunk("early", null, Recorder.discard);
+    try std.testing.expect(gate.sawFirstChunk());
 }
 
 const Recorder = struct {
@@ -135,5 +80,10 @@ const Recorder = struct {
     fn send(ctx: ?*anyopaque, chunk: []const u8) !void {
         const recorder = @as(*Recorder, @ptrCast(@alignCast(ctx orelse return error.MissingRecorder)));
         try recorder.bytes.appendSlice(recorder.allocator, chunk);
+    }
+
+    fn discard(ctx: ?*anyopaque, chunk: []const u8) !void {
+        _ = ctx;
+        _ = chunk;
     }
 };
