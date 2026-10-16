@@ -622,7 +622,7 @@ fn connect(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config) !websoc
     });
     errdefer client.deinit();
     try client.handshake(parsed.path, .{
-        .timeout_ms = 10_000,
+        .timeout_ms = 3_000,
         .headers = headers,
     });
     return client;
