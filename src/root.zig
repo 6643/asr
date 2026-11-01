@@ -1,6 +1,9 @@
+pub const common = @import("common.zig");
 pub const config = @import("config.zig");
 pub const cli = @import("cli.zig");
 pub const key = @import("key.zig");
+pub const streaming_state = @import("streaming_state.zig");
+pub const ws_url = @import("ws_url.zig");
 pub const runtime = struct {
     pub const app = @import("runtime/app.zig");
     pub const audio_gate = @import("runtime/audio_gate.zig");
@@ -31,9 +34,12 @@ pub const baidu = struct {
 };
 
 test {
+    _ = common;
     _ = config;
     _ = cli;
     _ = key;
+    _ = streaming_state;
+    _ = ws_url;
     _ = runtime.app;
     _ = runtime.audio_gate;
     _ = runtime.cmd;

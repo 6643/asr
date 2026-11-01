@@ -38,6 +38,10 @@ pub fn buildArgv(params: Params) Args {
     argv.push(params.channels);
     argv.push("--format");
     argv.push("s16");
+    // Without --raw, pw-record picks a container from the file name/extension
+    // and writes a header into the stream (a 24-byte `dns.` block for stdout),
+    // which the engine would receive as audio. Raw s16 only, no header.
+    argv.push("--raw");
     argv.push("-");
     return argv;
 }
@@ -56,9 +60,18 @@ test "pw-record argv captures raw s16 at the requested rate and channels" {
     const argv = buildArgv(.{ .rate = "16000", .channels = "1" });
     try std.testing.expectEqualSlices(
         []const u8,
-        &[_][]const u8{ "pw-record", "--rate", "16000", "--channels", "1", "--format", "s16", "-" },
+        &[_][]const u8{ "pw-record", "--rate", "16000", "--channels", "1", "--format", "s16", "--raw", "-" },
         argv.slice(),
     );
+}
+
+test "argv never omits --raw: a container header would be read as audio" {
+    const argv = buildArgv(.{ .rate = "48000", .channels = "2" });
+    var found = false;
+    for (argv.slice()) |arg| {
+        if (std.mem.eql(u8, arg, "--raw")) found = true;
+    }
+    try std.testing.expect(found);
 }
 
 test "program is pw-record" {

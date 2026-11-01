@@ -14,7 +14,7 @@
 
 ## 数据流
 
-1. 读取 `config/doubao.json`，解析并校验已有 `device_id` 与 `cdid`。
+1. 读取 `config.json` 的 `doubao` 节，解析并校验已有 `device_id` 与 `cdid`。
 2. 使用固定设备标识请求 ASR settings API，获取新的 ASR token。
 3. 使用同一 `cdid` 请求 SAMI config API，获取新的 SAMI token。
 4. 两个请求成功后，在原 JSON 文档上仅替换 `token` 与 `sami_token`。

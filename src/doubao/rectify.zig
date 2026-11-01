@@ -183,35 +183,59 @@ fn parseAndApply(allocator: std.mem.Allocator, text: []const u8, response_body: 
 
     if (corrections.items.len == 0) return null;
 
-    std.log.info("rectify: {d} corrections found", .{corrections.items.len});
+    std.log.scoped(.rectify).info("{d} corrections found", .{corrections.items.len});
 
-    var result = try allocator.dupe(u8, text);
-    errdefer allocator.free(result);
-
+    // Apply from the end so earlier byte offsets stay valid, and splice through
+    // a writer instead of reallocating the whole string per correction.
     std.mem.sortUnstable(CorrectWordInfo, corrections.items, {}, struct {
         fn lessThan(_: void, a: CorrectWordInfo, b: CorrectWordInfo) bool {
             return a.word_idx_in_text > b.word_idx_in_text;
         }
     }.lessThan);
 
+    var applied: std.ArrayList(AppliedCorrection) = .empty;
+    defer applied.deinit(allocator);
     for (corrections.items) |corr| {
-        const byte_offset = codePointToByteOffset(result, corr.word_idx_in_text) catch continue;
-        if (byte_offset + corr.source_word.len > result.len) continue;
-        if (!std.mem.eql(u8, result[byte_offset..][0..corr.source_word.len], corr.source_word)) {
-            std.log.warn("rectify: source_word '{s}' not found at position {d}, text: '{s}'", .{ corr.source_word, corr.word_idx_in_text, result });
+        const byte_offset = codePointToByteOffset(text, corr.word_idx_in_text) catch continue;
+        if (byte_offset + corr.source_word.len > text.len) continue;
+        if (!std.mem.eql(u8, text[byte_offset..][0..corr.source_word.len], corr.source_word)) {
+            std.log.scoped(.rectify).warn("source_word '{s}' not found at position {d}, text: '{s}'", .{ corr.source_word, corr.word_idx_in_text, text });
             continue;
         }
-        const new_result = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
-            result[0..byte_offset],
-            corr.predict_word,
-            result[byte_offset + corr.source_word.len ..],
-        });
-        allocator.free(result);
-        result = new_result;
+        const correction: AppliedCorrection = .{ .start = byte_offset, .end = byte_offset + corr.source_word.len, .replacement = corr.predict_word };
+        // Corrections are sorted from the end, so an earlier accepted range
+        // starts after this one. Overlapping duplicates would corrupt the
+        // splice; the first accepted correction at a position wins.
+        if (applied.items.len > 0) {
+            const previous = applied.items[applied.items.len - 1];
+            if (correction.end > previous.start) continue;
+        }
+        try applied.append(allocator, correction);
     }
+    if (applied.items.len == 0) return null;
 
-    return result;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var cursor: usize = 0;
+    // `applied` is in descending offset order (the order the corrections
+    // arrived in); the splice walks the text left to right.
+    var index: usize = applied.items.len;
+    while (index > 0) {
+        index -= 1;
+        const corr = applied.items[index];
+        try out.writer.writeAll(text[cursor..corr.start]);
+        try out.writer.writeAll(corr.replacement);
+        cursor = corr.end;
+    }
+    try out.writer.writeAll(text[cursor..]);
+    return try out.toOwnedSlice();
 }
+
+const AppliedCorrection = struct {
+    start: usize,
+    end: usize,
+    replacement: []const u8,
+};
 
 fn codePointToByteOffset(text: []const u8, codepoint_index: usize) !usize {
     var cp_count: usize = 0;
@@ -226,4 +250,22 @@ fn codePointToByteOffset(text: []const u8, codepoint_index: usize) !usize {
 test "request timeout constant is short enough for commit path" {
     try std.testing.expect(request_timeout_ms > 0);
     try std.testing.expect(request_timeout_ms <= 3_000);
+}
+
+test "applies corrections from the end without shifting earlier offsets" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"code":0,"data":{"correct_word_info":[
+        \\{"source_word":"世界","predict_word":"视界","word_idx_in_text":2,"confidence":0.9},
+        \\{"source_word":"你好","predict_word":"您好","word_idx_in_text":0,"confidence":0.9}]}}
+    ;
+    const result = (try parseAndApply(allocator, "你好世界", body)).?;
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("您好视界", result);
+}
+
+test "ignores a correction whose source word is not at the reported index" {
+    const allocator = std.testing.allocator;
+    const body = "{\"code\":0,\"data\":{\"correct_word_info\":[{\"source_word\":\"不存在\",\"predict_word\":\"X\",\"word_idx_in_text\":0,\"confidence\":0.9}]}}";
+    try std.testing.expect(try parseAndApply(allocator, "你好世界", body) == null);
 }

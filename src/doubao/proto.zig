@@ -211,14 +211,37 @@ pub const SessionConfig = struct {
     device_id: []const u8,
     app_name: []const u8 = "com.android.chrome",
     enable_punctuation: bool = true,
+    /// Raw JSON object string from the settings response path
+    /// `data.settings.asr_config.asr_params` (brand words and server-side
+    /// tracking switches). Empty means the session starts without it.
+    asr_params: []const u8 = "",
 };
 
+fn isValidAsrParams(allocator: std.mem.Allocator, params: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, params, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object;
+}
+
 pub fn sessionConfigJson(allocator: std.mem.Allocator, cfg: SessionConfig) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"audio_info\":{{\"channel\":{d},\"format\":\"pcm\",\"sample_rate\":{d}}},\"enable_punctuation\":{},\"enable_speech_rejection\":false,\"extra\":{{\"app_name\":\"{s}\",\"cell_compress_rate\":8,\"did\":\"{s}\",\"enable_asr_threepass\":true,\"enable_asr_twopass\":true,\"input_mode\":\"tool\"}}}}",
-        .{ cfg.channels, cfg.sample_rate, cfg.enable_punctuation, cfg.app_name, cfg.device_id },
+    const embed_params = cfg.asr_params.len > 0 and isValidAsrParams(allocator, cfg.asr_params);
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    const writer = &output.writer;
+
+    try writer.print(
+        "{{\"audio_info\":{{\"channel\":{d},\"format\":\"pcm\",\"sample_rate\":{d}}},\"enable_punctuation\":{},\"enable_speech_rejection\":false",
+        .{ cfg.channels, cfg.sample_rate, cfg.enable_punctuation },
     );
+    if (embed_params) {
+        try writer.print(",\"asr_params\":{s}", .{cfg.asr_params});
+    }
+    try writer.print(
+        ",\"extra\":{{\"app_name\":\"{s}\",\"cell_compress_rate\":8,\"did\":\"{s}\",\"enable_asr_threepass\":true,\"enable_asr_twopass\":true,\"input_mode\":\"tool\"}}}}",
+        .{ cfg.app_name, cfg.device_id },
+    );
+    return try output.toOwnedSlice();
 }
 
 pub fn encodeVarint(allocator: std.mem.Allocator, value: u64) ![]u8 {
@@ -363,6 +386,35 @@ test "builds start session payload" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "StartSession") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\"sample_rate\":16000") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\"did\":\"dev\"") != null);
+}
+
+test "session config embeds asr params when set" {
+    const allocator = std.testing.allocator;
+    const json = try sessionConfigJson(allocator, .{
+        .device_id = "dev",
+        .asr_params = "{\"brand_words\":[\"OpenClaw\"],\"enable_global_tracking\":true}",
+    });
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const params = parsed.value.object.get("asr_params").?;
+    try std.testing.expectEqualStrings("OpenClaw", params.object.get("brand_words").?.array.items[0].string);
+    try std.testing.expect(params.object.get("enable_global_tracking").?.bool);
+}
+
+test "session config omits malformed asr params" {
+    const allocator = std.testing.allocator;
+    const json = try sessionConfigJson(allocator, .{ .device_id = "dev", .asr_params = "not-json" });
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "asr_params") == null);
+}
+
+test "session config omits empty asr params" {
+    const allocator = std.testing.allocator;
+    const json = try sessionConfigJson(allocator, .{ .device_id = "dev" });
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "asr_params") == null);
 }
 
 test "parses final text from results array" {

@@ -1,15 +1,13 @@
-//! Callback lifetime contract.
+//! Per-recording state and the callbacks the capture loop drives.
 //!
-//! Every context handed to the engine and capture callbacks (`?*anyopaque`)
-//! borrows the stack frame of the *current* recording in `app.runHotkeyLoop`:
-//! `CaptureStartedState`, `CaptureReleaseState`, `StreamCaptureState` and
-//! `EngineCallbacks` are locals of that loop body. Nothing may keep those
-//! pointers alive after the iteration ends, which is why every future and
-//! thread started here is finished before then: the session-init future is
-//! cancelled (and, when it already produced one, its session is deinitialised),
-//! and `Session.deinit` joins the session read thread. The pipeline is the one
-//! long-lived collaborator; it outlives every recording. Keep this invariant
-//! when adding a task or a callback.
+//! Lifetime contract: one `Recording` is created per hotkey press and lives on
+//! the stack frame of that iteration of `app.runHotkeyLoop`. Every
+//! `?*anyopaque` context handed to the engine and capture callbacks is the
+//! same pointer, cast back to `*Recording`, so nothing can outlive the frame
+//! by accident. The session-init future and the session read thread are both
+//! finished in `Recording.deinit`, which runs as the iteration's `defer` —
+//! before anything else can reuse the frame. The pipeline is the one
+//! long-lived collaborator; it outlives every recording.
 
 const std = @import("std");
 const doubao = @import("../doubao/client.zig");
@@ -28,7 +26,10 @@ pub const max_captured_audio_bytes: usize = 64 * 1024 * 1024;
 /// How long to wait for the recorder's first chunk before prompting anyway: a
 /// dead microphone must not stall the hotkey loop.
 pub const mic_ready_timeout_ms: i64 = 1500;
-const mic_ready_poll_ms: i64 = 5;
+/// The chunk arrival itself is signalled by an atomic flag, so this only sets
+/// how late the prompt can notice it. 20ms is below human perception and cuts
+/// idle wakeups fourfold compared with a 5ms spin.
+const mic_ready_poll_ms: i64 = 20;
 
 /// True once the recorder delivered audio; false on timeout or shutdown.
 pub fn waitForFirstChunk(gate: *audio_gate.AudioGate, io: std.Io, timeout_ms: i64) bool {
@@ -42,160 +43,208 @@ pub fn waitForFirstChunk(gate: *audio_gate.AudioGate, io: std.Io, timeout_ms: i6
     return true;
 }
 
+const SessionInitResult = @typeInfo(@TypeOf(initSessionWithRetry)).@"fn".return_type.?;
+const SessionFuture = std.Io.Future(SessionInitResult);
+
+pub const Recording = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    logger: output.Logger,
+    pipeline: *postprocess.Pipeline,
+    cfg: engine.Config,
+    debug: bool,
+
+    /// Audio kept for the fallback upload when the stream dies mid-recording.
+    captured_audio: std.ArrayList(u8) = .empty,
+    gate: audio_gate.AudioGate,
+    /// Set by the engine callbacks once the session start was accepted.
+    session: engine.Session = undefined,
+    has_session: bool = false,
+    session_future_opt: ?SessionFuture = null,
+    session_future_taken: bool = false,
+    /// First send failure; the fallback path uses it to decide what to do.
+    stream_error: ?anyerror = null,
+    speaker_muted: bool = false,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        logger: output.Logger,
+        pipeline: *postprocess.Pipeline,
+        cfg: engine.Config,
+        debug: bool,
+    ) Recording {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .logger = logger,
+            .pipeline = pipeline,
+            .cfg = cfg,
+            .debug = debug,
+            .gate = audio_gate.AudioGate.init(io),
+        };
+    }
+
+    /// Starts the websocket handshake while the recorder is still starting, so
+    /// the two latencies overlap. `Recording.deinit` guarantees the future is
+    /// finished (or cancelled) before the frame goes away.
+    pub fn startSessionAsync(recording: *Recording) void {
+        recording.session_future_opt = recording.io.concurrent(initSessionWithRetry, .{
+            recording.allocator,
+            recording.io,
+            recording.cfg,
+            @as(*const anyopaque, @ptrCast(recording)),
+            recording.logger,
+            recording.debug,
+        }) catch null;
+    }
+
+    pub fn deinit(recording: *Recording) void {
+        if (recording.session_future_opt) |*future| {
+            if (!recording.session_future_taken) {
+                if (future.cancel(recording.io)) |owned| {
+                    var session = owned;
+                    session.deinit();
+                } else |_| {}
+            }
+            recording.session_future_opt = null;
+        }
+        if (recording.has_session) recording.session.deinit();
+        recording.captured_audio.deinit(recording.allocator);
+        recording.releaseSpeaker();
+    }
+
+    /// Options for `mic.captureStreamUntilKeyRelease`. Every context is this
+    /// recording, so the callbacks cannot inherit a stale earlier frame.
+    pub fn micOptions(recording: *Recording) mic.StreamOptions {
+        return .{
+            .on_chunk = onEngineAudioChunk,
+            .chunk_ctx = @ptrCast(recording),
+            .on_started = onCaptureStarted,
+            .started_ctx = @ptrCast(recording),
+            .on_stopped = onCaptureStopped,
+            .stopped_ctx = @ptrCast(recording),
+            .on_recorder = onCaptureRecorder,
+            .recorder_ctx = @ptrCast(recording),
+            .on_hold_timeout = onHoldTimeout,
+            .hold_timeout_ctx = @ptrCast(recording),
+        };
+    }
+
+    fn fromCtx(ctx: ?*anyopaque) ?*Recording {
+        return @ptrCast(@alignCast(ctx orelse return null));
+    }
+
+    fn fromConstCtx(ctx: ?*const anyopaque) ?*Recording {
+        return @ptrCast(@alignCast(@constCast(ctx) orelse return null));
+    }
+
+    fn muteSpeaker(recording: *Recording) void {
+        recording.logger.debug("speaker", "mute", .{});
+        mute.muteSpeaker(recording.allocator, recording.io);
+        recording.speaker_muted = true;
+    }
+
+    fn releaseSpeaker(recording: *Recording) void {
+        if (!recording.speaker_muted) return;
+        recording.logger.debug("speaker", "unmute", .{});
+        mute.unmuteSpeaker(recording.allocator, recording.io);
+        recording.speaker_muted = false;
+    }
+
+    fn resolveSession(recording: *Recording) !void {
+        if (recording.has_session) return;
+
+        if (recording.session_future_opt) |future_value| {
+            var future = future_value;
+            recording.session_future_opt = null;
+            recording.session_future_taken = true;
+            recording.session = try future.await(recording.io);
+            recording.has_session = true;
+        } else {
+            recording.session = try initSessionWithRetry(
+                recording.allocator,
+                recording.io,
+                recording.cfg,
+                @ptrCast(recording),
+                recording.logger,
+                recording.debug,
+            );
+            recording.has_session = true;
+        }
+
+        try recording.session.start();
+    }
+};
+
 pub fn onEngineInterim(ctx: ?*const anyopaque, text: []const u8) void {
     if (text.len == 0) return;
-    const callbacks = @as(*const EngineCallbacks, @ptrCast(@alignCast(ctx orelse return)));
-    callbacks.pipeline.logger.info(callbacks.pipeline.provider, "🎤 {s}", .{text});
+    const recording = Recording.fromConstCtx(ctx) orelse return;
+    recording.pipeline.logger.info(recording.pipeline.provider, "🎤 {s}", .{text});
 }
 
 pub fn onEngineFinal(ctx: ?*const anyopaque, text: []const u8) void {
     if (text.len == 0) return;
-    const callbacks = @as(*const EngineCallbacks, @ptrCast(@alignCast(ctx orelse return)));
-    callbacks.pipeline.submitFinal(text);
+    const recording = Recording.fromConstCtx(ctx) orelse return;
+    recording.pipeline.submitFinal(text);
 }
 
 pub fn onEngineAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
-    const state = @as(*StreamCaptureState, @ptrCast(@alignCast(ctx orelse return error.MissingChunkSession)));
-    try state.gate.handleChunk(chunk, @ptrCast(state), sendEngineAudioChunk);
+    const recording = Recording.fromCtx(ctx) orelse return error.MissingChunkSession;
+    try recording.gate.handleChunk(chunk, @ptrCast(recording), sendEngineAudioChunk);
 }
 
 fn sendEngineAudioChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
-    const state = @as(*StreamCaptureState, @ptrCast(@alignCast(ctx orelse return error.MissingChunkSession)));
-    if (state.captured_audio.items.len < max_captured_audio_bytes) {
-        try state.captured_audio.appendSlice(state.allocator, chunk);
+    const recording = Recording.fromCtx(ctx) orelse return error.MissingChunkSession;
+    if (recording.captured_audio.items.len < max_captured_audio_bytes) {
+        try recording.captured_audio.appendSlice(recording.allocator, chunk);
     }
-    if (state.stream_error != null) return;
-    const session = state.session orelse return;
-    session.sendChunk(chunk) catch |err| {
-        state.stream_error = err;
+    if (recording.stream_error != null) return;
+    if (!recording.has_session) return;
+    recording.session.sendChunk(chunk) catch |err| {
+        recording.stream_error = err;
     };
 }
 
-pub const StreamCaptureState = struct {
-    allocator: std.mem.Allocator,
-    session: ?*engine.Session,
-    captured_audio: *std.ArrayList(u8),
-    gate: *audio_gate.AudioGate,
-    stream_error: ?anyerror = null,
-};
-
-pub const EngineCallbacks = struct {
-    pipeline: *postprocess.Pipeline,
-};
-
-const SessionInitResult = @typeInfo(@TypeOf(initSessionWithRetry)).@"fn".return_type.?;
-pub const SessionFuture = std.Io.Future(SessionInitResult);
+pub fn onCaptureRecorder(ctx: ?*anyopaque, program: []const u8) void {
+    const recording = Recording.fromCtx(ctx) orelse return;
+    recording.logger.debug("mic", "recorder {s}", .{program});
+}
 
 pub fn onHoldTimeout(ctx: ?*anyopaque) void {
-    const state: *const CaptureStartedState = @ptrCast(@alignCast(ctx orelse return));
-    state.logger.info("mic", "max hold reached; stopping", .{});
-}
-
-pub const CaptureStartedState = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    logger: output.Logger,
-    gate: *audio_gate.AudioGate,
-    speaker_guard: *SpeakerMuteGuard,
-    stream_state: *StreamCaptureState,
-    session: *engine.Session,
-    has_session: *bool,
-    session_future_opt: *?SessionFuture,
-    session_future_taken: *bool,
-    cfg: engine.Config,
-    callback_ctx: *const EngineCallbacks,
-    debug: bool,
-};
-
-pub const CaptureReleaseState = struct {
-    logger: output.Logger,
-    speaker_guard: *SpeakerMuteGuard,
-};
-
-pub const SpeakerMuteGuard = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    logger: output.Logger,
-    active: bool = false,
-
-    pub fn muteAfterPrompt(guard: *SpeakerMuteGuard) void {
-        guard.logger.debug("speaker", "mute", .{});
-        mute.muteSpeaker(guard.allocator, guard.io);
-        guard.active = true;
-    }
-
-    pub fn release(guard: *SpeakerMuteGuard) void {
-        if (!guard.active) return;
-        guard.logger.debug("speaker", "unmute", .{});
-        mute.unmuteSpeaker(guard.allocator, guard.io);
-        guard.active = false;
-    }
-};
-
-fn playBellTask(allocator: std.mem.Allocator, io: std.Io) void {
-    notify.playMicReadyNotification(allocator, io);
-}
-
-fn resolveSession(state: *CaptureStartedState) !void {
-    if (state.has_session.*) return;
-
-    if (state.session_future_opt.*) |future_value| {
-        var future = future_value;
-        state.session_future_opt.* = null;
-        state.session_future_taken.* = true;
-        state.session.* = try future.await(state.io);
-        state.has_session.* = true;
-    } else {
-        state.session.* = try initSessionWithRetry(
-            state.allocator,
-            state.io,
-            state.cfg,
-            state.callback_ctx,
-            state.logger,
-            state.debug,
-        );
-        state.has_session.* = true;
-    }
-
-    try state.session.start();
-    state.stream_state.session = state.session;
-    state.logger.debug(engine.label(state.cfg), "session ready", .{});
-}
-
-pub fn onCaptureRecorder(ctx: ?*anyopaque, program: []const u8) void {
-    const state = @as(*CaptureStartedState, @ptrCast(@alignCast(ctx orelse return)));
-    state.logger.debug("mic", "recorder {s}", .{program});
+    const recording = Recording.fromCtx(ctx) orelse return;
+    recording.logger.info("mic", "max hold reached; stopping", .{});
 }
 
 pub fn onCaptureStarted(ctx: ?*anyopaque) !void {
-    const state = @as(*CaptureStartedState, @ptrCast(@alignCast(ctx orelse return error.MissingCaptureStartedState)));
+    const recording = Recording.fromCtx(ctx) orelse return error.MissingCaptureStartedState;
 
     // The ding is the "you can speak" cue, so it has to wait for the session
     // and for the recorder: ringing it while the handshake ran is what made it
     // lie. Audio captured before the cue is dropped, not buffered.
-    resolveSession(state) catch |err| {
-        state.logger.err(engine.label(state.cfg), "session failed: {s}", .{@errorName(err)});
+    recording.resolveSession() catch |err| {
+        recording.logger.err(engine.label(recording.cfg), "session failed: {s}", .{@errorName(err)});
         return err;
     };
     if (shutdown.isRequested()) return error.Canceled;
-    if (!waitForFirstChunk(state.gate, state.io, mic_ready_timeout_ms)) {
+    if (!waitForFirstChunk(&recording.gate, recording.io, mic_ready_timeout_ms)) {
         if (shutdown.isRequested()) return error.Canceled;
-        state.logger.info("mic", "no audio arrived before the prompt", .{});
+        recording.logger.info("mic", "no audio arrived before the prompt", .{});
     }
 
     // Open first: speech that starts together with the ding must be kept.
-    state.gate.open();
-    state.logger.debug("speaker", "prompt", .{});
-    playBellTask(state.allocator, state.io);
-    state.speaker_guard.muteAfterPrompt();
+    recording.gate.open();
+    recording.logger.debug("speaker", "prompt", .{});
+    notify.playMicReadyNotification(recording.allocator, recording.io);
+    recording.muteSpeaker();
 
-    state.logger.info(engine.label(state.cfg), "🎤", .{});
+    recording.logger.info(engine.label(recording.cfg), "🎤", .{});
 }
 
 pub fn onCaptureStopped(ctx: ?*anyopaque) void {
-    const state = @as(*CaptureReleaseState, @ptrCast(@alignCast(ctx orelse return)));
-    output.keyEvent(state.logger, .release);
-    state.speaker_guard.release();
+    const recording = Recording.fromCtx(ctx) orelse return;
+    output.keyEvent(recording.logger, .release);
+    recording.releaseSpeaker();
 }
 
 /// A recorder that produced no bytes at all means the capture path is broken
@@ -246,11 +295,57 @@ fn discardChunk(ctx: ?*anyopaque, chunk: []const u8) !void {
     _ = ctx;
     _ = chunk;
 }
+
+test "recording init builds every callback context from one pointer" {
+    const logger: output.Logger = .{ .io = std.testing.io, .level = .err };
+    var pipeline: postprocess.Pipeline = undefined;
+    var recording = Recording.init(
+        std.testing.allocator,
+        std.testing.io,
+        logger,
+        &pipeline,
+        .{ .baidu = .{} },
+        false,
+    );
+    const options = recording.micOptions();
+    const self_ptr: *Recording = @ptrCast(@alignCast(options.started_ctx.?));
+    try std.testing.expectEqual(@intFromPtr(&recording), @intFromPtr(self_ptr));
+    try std.testing.expectEqual(@intFromPtr(&recording), @intFromPtr(@as(*Recording, @ptrCast(@alignCast(options.chunk_ctx.?)))));
+    try std.testing.expectEqual(@intFromPtr(&recording), @intFromPtr(@as(*Recording, @ptrCast(@alignCast(options.stopped_ctx.?)))));
+    recording.captured_audio.deinit(recording.allocator);
+    recording.gate = audio_gate.AudioGate.init(std.testing.io);
+}
+
+test "captured audio stays under the fallback cap" {
+    const logger: output.Logger = .{ .io = std.testing.io, .level = .err };
+    var pipeline: postprocess.Pipeline = undefined;
+    var recording = Recording.init(
+        std.testing.allocator,
+        std.testing.io,
+        logger,
+        &pipeline,
+        .{ .baidu = .{} },
+        false,
+    );
+    defer recording.captured_audio.deinit(recording.allocator);
+
+    // Gate open, no session: the send is skipped but the fallback copy kept.
+    recording.gate.open();
+    var iter: usize = 0;
+    const chunk_len = 4096;
+    while (iter < max_captured_audio_bytes / chunk_len + 2) : (iter += 1) {
+        var chunk: [chunk_len]u8 = undefined;
+        try onEngineAudioChunk(@ptrCast(&recording), &chunk);
+    }
+    try std.testing.expect(recording.captured_audio.items.len <= max_captured_audio_bytes);
+    try std.testing.expect(recording.stream_error == null);
+}
+
 pub fn initSessionWithRetry(
     allocator: std.mem.Allocator,
     io: std.Io,
     cfg: engine.Config,
-    callback_ctx: *const EngineCallbacks,
+    callback_ctx: *const anyopaque,
     logger: output.Logger,
     debug: bool,
 ) !engine.Session {
@@ -258,9 +353,9 @@ pub fn initSessionWithRetry(
         return engine.Session.init(allocator, io, cfg, .{
             .debug = debug,
             .on_interim = onEngineInterim,
-            .interim_ctx = @ptrCast(callback_ctx),
+            .interim_ctx = callback_ctx,
             .on_final = onEngineFinal,
-            .final_ctx = @ptrCast(callback_ctx),
+            .final_ctx = callback_ctx,
         });
     }
     var delay_ms: i64 = 1000;
@@ -270,9 +365,9 @@ pub fn initSessionWithRetry(
         if (engine.Session.init(allocator, io, cfg, .{
             .debug = debug,
             .on_interim = onEngineInterim,
-            .interim_ctx = @ptrCast(callback_ctx),
+            .interim_ctx = callback_ctx,
             .on_final = onEngineFinal,
-            .final_ctx = @ptrCast(callback_ctx),
+            .final_ctx = callback_ctx,
         })) |session| {
             return session;
         } else |err| {

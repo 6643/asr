@@ -39,7 +39,7 @@ Zig 0.16.0（无新增依赖；只允许 `std` 与现有内核接口）。目标
 - 拆分任务（T8–T10）是**纯搬移**：日志文案、`pub` 面、行为一字不变；搬完真机日志与搬前逐行对照。
 - 每任务收尾：`zig build test --summary all` 全绿 + `zig build` 成功（T12 之后统一用 `zig build check` 作为收尾命令）。
 - 真机验证手法：FIFO + perl 注入（`/tmp/fakekbd`、`/tmp/hold*.pl`）、`ASR_KEYBOARD_DEVICE`/`ASR_KEYBOARD_DEVICES` 指向 FIFO、`pgrep -x asr` 精确清理、日志经 `| cat > file` 落盘（否则子进程持 stdout 会挂住）。
-- 绝不 `git add -A`；工作区里 `ai-proxy.log`、`baidu.png`、`config/doubao.json`、`.tmp-*` 是用户自己的改动，不进任何提交。
+- 绝不 `git add -A`；工作区里 `ai-proxy.log`、`baidu.png`、`config.json`、`.tmp-*` 是用户自己的改动，不进任何提交。
 - 提交信息风格：`fix:`/`feat:`/`refactor:`/`test:`/`build:`/`docs:` + 一行小写英文。
 
 ## Review Focus（最容易出错的 5 点）

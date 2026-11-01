@@ -9,25 +9,34 @@
 - `curl`（刷新凭证、结果纠错）
 - `zig` 0.17
 - 可读的键盘输入设备（`/dev/input/event*`）：加入 `input` 组后重新登录即可
-  （`NixOS`: `users.users.<name>.extraGroups = [ "input" ];`）
 
 没有备用后端、也没有备用录音器：缺依赖时会直接报错退出。
 
 ## 配置
 
-默认使用 Doubao，凭证与参数读取 `config/doubao.json`（每次启动刷新 token 并写回该文件）。
+配置文件按以下顺序查找，取第一个存在的：`$ASR_CONFIG`、可执行文件目录的 `../../config.json`、当前目录的 `config.json`、当前目录上一级的 `config.json`。加载与写回用的是同一个文件。
 
-使用 `--baidu` 切换到 Baidu，读取 `config/baidu.json`：
+默认使用 Doubao，凭证与参数读取 `config.json` 的 `doubao` 节（每次启动刷新 token 并写回该节）。
+
+使用 `--baidu` 切换到 Baidu，读取 `config.json` 的 `baidu` 节：
 
 ```json
 {
-  "url": "wss://vse.baidu.com/ws_api",
-  "sample_rate": 16000,
-  "channels": 1,
-  "frame_duration_ms": 100,
-  "user": "baidu_pc",
-  "dev_key": "com.baidu.searchbox.fangyan",
-  "dev_pid": 8068
+  "baidu": {
+    "url": "wss://vse.baidu.com/ws_api",
+    "sample_rate": 16000,
+    "channels": 1,
+    "frame_duration_ms": 100,
+    "user": "baidu_pc",
+    "dev_key": "com.baidu.searchbox.fangyan",
+    "dev_pid": 8068
+  },
+  "doubao": {
+    "device_id": "...",
+    "cdid": "...",
+    "token": "...",
+    "sami_token": "..."
+  }
 }
 ```
 
@@ -35,7 +44,7 @@
 
 ```bash
 zig build test     # 单元测试
-zig build check    # zig fmt --check + 测试（CI 跑的就是这一条）
+zig build check    # zig fmt --check + 测试
 zig build
 ./zig-out/bin/asr
 ```
@@ -88,11 +97,11 @@ ASR_KEYBOARD_DEVICES=/dev/input/event2:/dev/input/event5 ./zig-out/bin/asr   # �
 
 ## 日志格式
 
-`HH:MM:SS.mmm [domain] message`（**本地时间**（按 `TZ`），仅时间不含日期）。`--log-file <path>` 以追加方式写入文件；不指定时写到终端。
+`HH:MM:SS.mmm [domain] message`（**本地时间**（按 `TZ`），仅时间不含日期）。`--log-file <path>` 以追加方式写入文件；不指定时写到终端。引擎与 API 层的 `std.log` 也走同一个 sink 和格式，所以 `--log-file` 包含整次运行的日志（包括 `rectify`、凭证刷新、`interim` 等）。超过 1 KiB 的单行不会被截断。
 
 ## 说明
 
-- 采集只有 `pw-record`（`--debug` 下会打印 `[mic] recorder pw-record`），参数为 `--rate <采样率> --channels <声道> --format s16 -`。
+- 采集只有 `pw-record`（`--debug` 下会打印 `[mic] recorder pw-record`），参数为 `--rate <采样率> --channels <声道> --format s16 --raw -`。`--raw` 不能省：不带它时 `pw-record` 会按容器写文件头（stdout 上是 24 字节 `dns.` 块），这段头会被当成音频送进引擎。
 - 录音期间会静音默认输出（`wpctl set-mute @DEFAULT_AUDIO_SINK@ 1/0`，在提示音响完之后），避免外放被麦克风收进去：录音前先探测，若输出本来就静音则不动它（此时提示音也听不到）；静音时写 `$XDG_RUNTIME_DIR/asr-speaker-muted` 标记，正常结束时删除；进程被强杀后下次启动会自动恢复。
 - `wpctl` 不可用时静音链路整体跳过，不影响识别。
 - 提示音就是“可以说话了”的信号：先等会话 start 成功、且 `pw-record` 送来第一块音频，才播放提示音；响的同时开始把音频送给引擎（提示音本身可能跟着进引擎，纯音通常不出字），响完立即静音外放。提示音之前的音频直接丢弃，不进识别。`--debug` 可看到 `session ready → prompt → mute` 的顺序。
@@ -101,8 +110,8 @@ ASR_KEYBOARD_DEVICES=/dev/input/event2:/dev/input/event5 ./zig-out/bin/asr   # �
 - 键盘设备不可读时报 `ERR KeyboardPermissionDenied`，不会伪装成"找不到设备"；一把设备都找不到时报 `ERR KeyboardDeviceNotFound` 并提示用 `ASR_KEYBOARD_DEVICE` 指定。
 - fallback 音频（流失败时补传）有 64MiB 上限，超限后丢弃后续字节，避免无界增长。
 - 默认最长按住 120 秒（`--max-hold-ms 0` 取消限制）；到点按"松手"处理，仍会提交已识别的内容。
-- 最终识别结果经后处理队列异步 rectify（`--no-rectify` 关闭；缺少 token 时自动跳过）后提交，不阻塞热键循环。松手到文本上屏之间最多会多等约 1.5 秒（纠错请求超时）。
-- `SIGINT` / `SIGTERM` / `SIGHUP` 走协作式关闭：主循环与重试 sleep 通过 `shutdown.sleepMs` 可取消，尽快退出并解除静音。
+- 最终识别结果经后处理队列异步 rectify（`--no-rectify` 关闭，`--once-pcm` 同样生效；缺少 token 时自动跳过）后提交，不阻塞热键循环。松手到文本上屏之间最多会多等约 1.5 秒（纠错请求超时）。
+- `SIGINT` / `SIGTERM` / `SIGHUP` 走协作式关闭：主循环与重试 sleep 通过 `shutdown.sleepUntilOr` 可取消，尽快退出并解除静音。
 - `postprocess` 直接持有 `src/runtime/wayland_im.zig` 的输入法客户端（纯 `std.posix` socket，无 libwayland 依赖）。
 
 ## 发布构建

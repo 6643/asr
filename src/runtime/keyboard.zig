@@ -374,6 +374,11 @@ fn deviceArmTask(args: DeviceArmArgs) DeviceArm {
     };
 }
 
+/// How often the rescan/shutdown timer arm re-checks. The rescan interval is
+/// seconds, so a coarse poll keeps an idle app from waking up 40 times a
+/// second; the worst-case extra shutdown latency is this value.
+const timer_poll_ms: i64 = 250;
+
 /// Resolves to `.shutdown` as soon as shutdown is requested, `.rescan` every
 /// `interval_ms` so the caller can look for new keyboards.
 fn timerTask(io: std.Io, is_shutdown: key.ShutdownCheck, interval_ms: i64) StopReason {
@@ -381,7 +386,7 @@ fn timerTask(io: std.Io, is_shutdown: key.ShutdownCheck, interval_ms: i64) StopR
     while (true) {
         if (is_shutdown()) return .shutdown;
         if (std.Io.Clock.real.now(io).toMilliseconds() - start_ms >= interval_ms) return .rescan;
-        std.Io.sleep(io, .fromMilliseconds(25), .awake) catch return .shutdown;
+        std.Io.sleep(io, .fromMilliseconds(timer_poll_ms), .awake) catch return .shutdown;
     }
 }
 

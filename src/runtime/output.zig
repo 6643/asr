@@ -22,18 +22,7 @@ pub const LogFile = struct {
     }
 
     pub fn writeLine(log_file: *LogFile, line: []const u8) void {
-        var written: usize = 0;
-        while (written < line.len) {
-            const rc = std.posix.system.write(log_file.fd, line.ptr + written, line.len - written);
-            switch (std.posix.errno(rc)) {
-                .SUCCESS => {
-                    if (rc == 0) return;
-                    written += @intCast(rc);
-                },
-                .INTR => continue,
-                else => return,
-            }
-        }
+        writeFully(log_file.fd, line);
     }
 
     pub fn deinit(log_file: *LogFile) void {
@@ -41,10 +30,31 @@ pub const LogFile = struct {
     }
 };
 
+/// Writes every byte or gives up; a log line must never be truncated just
+/// because it is longer than a fixed stack buffer.
+fn writeFully(fd: std.posix.fd_t, bytes: []const u8) void {
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const rc = std.posix.system.write(fd, bytes.ptr + written, bytes.len - written);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return;
+                written += @intCast(rc);
+            },
+            .INTR => continue,
+            else => return,
+        }
+    }
+}
+
 pub const Logger = struct {
     io: std.Io,
+    /// Only used to format a line that does not fit the stack buffer, so a
+    /// long transcript is logged whole instead of being dropped. Falls back to
+    /// the page allocator when the caller has none at hand.
+    allocator: ?std.mem.Allocator = null,
     level: Level = .info,
-    /// When set, every line goes here instead of stdout/stderr.
+    /// When set, every line goes here instead of stdout.
     log_file: ?*LogFile = null,
 
     pub fn info(logger: Logger, domain: []const u8, comptime fmt: []const u8, args: anytype) void {
@@ -59,22 +69,110 @@ pub const Logger = struct {
         logger.write(.err, domain, fmt, args);
     }
 
+    pub fn warn(logger: Logger, domain: []const u8, comptime fmt: []const u8, args: anytype) void {
+        logger.write(.warn, domain, fmt, args);
+    }
+
     pub fn write(logger: Logger, level: Level, domain: []const u8, comptime fmt: []const u8, args: anytype) void {
         if (@backingInt(level) > @backingInt(logger.level)) return;
-        var buffer: [1024]u8 = undefined;
-        if (logger.log_file) |log_file| {
-            const line = std.fmt.bufPrint(&buffer, "{s} [{s}] " ++ fmt ++ "\n", .{ timestamp(logger.io), domain } ++ args) catch return;
-            log_file.writeLine(line);
-            return;
-        }
-        var file_writer = if (level == .err)
-            std.Io.File.stderr().writer(logger.io, &buffer)
-        else
-            std.Io.File.stdout().writer(logger.io, &buffer);
-        file_writer.interface.print("{s} [{s}] " ++ fmt ++ "\n", .{ timestamp(logger.io), domain } ++ args) catch {};
-        file_writer.interface.flush() catch {};
+        const allocator = logger.allocator orelse std.heap.page_allocator;
+        writeLine(allocator, logger.io, logger.log_file, level, domain, fmt, args);
     }
 };
+
+pub const max_stack_line_bytes: usize = 1024;
+
+fn writeLine(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    log_file: ?*LogFile,
+    level: Level,
+    domain: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
+    var buffer: [max_stack_line_bytes]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "{s} [{s}] " ++ fmt ++ "\n", .{ timestamp(io), domain } ++ args) catch {
+        writeAllocatedLine(allocator, log_file, io, level, domain, fmt, args) catch return;
+        return;
+    };
+    emit(log_file, level, line);
+}
+
+fn writeAllocatedLine(
+    allocator: std.mem.Allocator,
+    log_file: ?*LogFile,
+    io: std.Io,
+    level: Level,
+    domain: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    const line = try std.fmt.allocPrint(allocator, "{s} [{s}] " ++ fmt ++ "\n", .{ timestamp(io), domain } ++ args);
+    defer allocator.free(line);
+    emit(log_file, level, line);
+}
+
+fn emit(log_file: ?*LogFile, level: Level, line: []const u8) void {
+    if (log_file) |file| {
+        file.writeLine(line);
+        return;
+    }
+    // Failures go to stderr, everything else to stdout, so a shell redirect of
+    // the normal stream still shows errors.
+    const file = if (level == .err) std.Io.File.stderr() else std.Io.File.stdout();
+    writeFully(file.handle, line);
+}
+
+// ── std.log bridge ──
+//
+// Engine and API modules use `std.log.scoped(.doubao)` so they do not need a
+// Logger plumbed through every call. The hook below routes those lines into
+// the same sink and format as the explicit API, which keeps `--log-file`
+// complete and the timestamps consistent.
+
+var global_allocator: ?std.mem.Allocator = null;
+/// Until `installGlobalLogger` runs, log through the debug io: the first
+/// lines of a run must still be formatted, not crash on an undefined io.
+var global_io: std.Io = std.Options.debug_io;
+var global_level: Level = .info;
+var global_log_file: ?*LogFile = null;
+
+/// Points `std.log` at the same destination as the `Logger` the caller builds.
+/// Called once at startup, before any module logs.
+pub fn installGlobalLogger(allocator: std.mem.Allocator, io: std.Io, level: Level, log_file: ?*LogFile) void {
+    global_allocator = allocator;
+    global_io = io;
+    global_level = level;
+    global_log_file = log_file;
+}
+
+fn globalLevel(level: std.log.Level) Level {
+    return switch (level) {
+        .err => .err,
+        .warn => .warn,
+        .info => .info,
+        .debug => .debug,
+    };
+}
+
+fn globalDomain(comptime scope: @EnumLiteral()) []const u8 {
+    return if (scope == .default) "std" else @tagName(scope);
+}
+
+/// `std.log` hook, installed through `std_options` in `main.zig`.
+/// `std.log` hook, installed through `std_options` in `main.zig`.
+pub fn globalLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
+    const mapped = comptime globalLevel(level);
+    if (@backingInt(mapped) > @backingInt(global_level)) return;
+    const allocator = global_allocator orelse std.heap.page_allocator;
+    writeLine(allocator, global_io, global_log_file, mapped, comptime globalDomain(scope), fmt, args);
+}
 
 /// `struct tm` as glibc and musl lay it out; only `tm_gmtoff` is read.
 const c_tm = extern struct {
@@ -218,7 +316,7 @@ test "logger writes to the log file instead of the terminal" {
     defer std.testing.allocator.free(path);
 
     var log_file = try LogFile.open(path);
-    const logger = Logger{ .io = std.testing.io, .level = .debug, .log_file = &log_file };
+    const logger = Logger{ .io = std.testing.io, .allocator = std.testing.allocator, .level = .debug, .log_file = &log_file };
     logger.info("app", "hello {d}", .{7});
     logger.debug("app", "ignored at info level? no, debug is on", .{});
     log_file.deinit();
@@ -227,4 +325,23 @@ test "logger writes to the log file instead of the terminal" {
     defer std.testing.allocator.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "[app] hello 7\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "[app] ignored at info level? no, debug is on\n") != null);
+}
+
+test "over-long lines are logged whole instead of dropped" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tempLogPath(&tmp);
+    defer std.testing.allocator.free(path);
+
+    const long = try std.testing.allocator.alloc(u8, max_stack_line_bytes * 3);
+    defer std.testing.allocator.free(long);
+    @memset(long, 'x');
+    var log_file = try LogFile.open(path);
+    const logger = Logger{ .io = std.testing.io, .allocator = std.testing.allocator, .level = .info, .log_file = &log_file };
+    logger.info("app", "{s}", .{long});
+    log_file.deinit();
+
+    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(16 * 1024));
+    defer std.testing.allocator.free(contents);
+    try std.testing.expect(std.mem.indexOf(u8, contents, long) != null);
 }

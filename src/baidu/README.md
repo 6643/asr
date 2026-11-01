@@ -156,20 +156,22 @@ wss://vse.baidu.com/ws_api?sn=<random-uuid>
 
 ### 配置
 
-配置文件路径：`config/baidu.json`
+配置文件路径：`config.json` 的 `baidu` 节
 
 ```json
 {
-  "url": "wss://vse.baidu.com/ws_api",
-  "sample_rate": 16000,
-  "channels": 1,
-  "frame_duration_ms": 100,
-  "user": "baidu_pc",
-  "dev_key": "com.baidu.searchbox.fangyan",
-  "dev_pid": 8068,
-  "vad_type": 1,
-  "vad_mode": 0,
-  "enable_punctuation": true
+  "baidu": {
+    "url": "wss://vse.baidu.com/ws_api",
+    "sample_rate": 16000,
+    "channels": 1,
+    "frame_duration_ms": 100,
+    "user": "baidu_pc",
+    "dev_key": "com.baidu.searchbox.fangyan",
+    "dev_pid": 8068,
+    "vad_type": 1,
+    "vad_mode": 0,
+    "enable_punctuation": true
+  }
 }
 ```
 
@@ -186,7 +188,7 @@ const config = @import("config.zig");
 
 const allocator = ...;
 const io = ...;
-const baidu_cfg = try config.loadBaiduConfig(allocator, io, "config/baidu.json");
+const baidu_cfg = try config.loadBaiduConfig(allocator, io, "config.json");
 
 // 创建会话（同时建立 WebSocket 连接并发送 START）
 var session = try baidu.StreamingSession.init(allocator, io, baidu_cfg, .{
@@ -239,14 +241,14 @@ if (result) |text| {
 | 握手流程 | StartTask → StartSession → 音频 | START 一条消息搞定 |
 | 认证 | 需要 token（定期刷新） | **无需认证，开箱即用** |
 | 结果格式 | 嵌套 JSON（results 数组） | 简洁 JSON（type + result） |
-| 心跳 | 无 | HEARTBEAT 支持 |
+| 心跳 | 无 | HEARTBEAT（协议支持, 客户端未主动发送） |
 | VAD | 客户端+服务端 | 服务端 VAD |
 | 标点恢复 | ✅ | ✅ |
 | 中间结果 | ✅ | ✅ (MID_TEXT) |
 
 ## 已知限制
 
-- 目前 Baidu 引擎仅作为独立模块提供，尚未集成到 `app.zig` 主循环中
-- 需要通过 CLI 参数 `--baidu` 或配置文件切换引擎（待实现）
+- 已集成到 `app.zig` 主循环，用 `--baidu` 切换
 - 无自动凭证刷新机制（Baidu 接口不需要 token，故不需要）
-- 音频后处理（rectify/纠错）尚未对接
+- 音频后处理（rectify/纠错）只走 Doubao 路径，Baidu 结果直接提交
+- 客户端不发送 HEARTBEAT：当前最长按住 120 秒，连接期间不需要保活；若将来放开按住上限，需要在读线程里按 `proto.buildHeartbeatMessage` 定时发送

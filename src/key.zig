@@ -295,28 +295,6 @@ fn keyBitmapLine(block: []const u8) ?[]const u8 {
     return std.mem.trim(u8, rest[0..line_end], " \t\r");
 }
 
-pub fn findKeyboardDeviceInProcInput(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
-    const devices = findKeyboardDevicesInProcInput(allocator, content) catch return null;
-    defer freeDeviceList(allocator, devices);
-    if (devices.len == 0) return null;
-    return allocator.dupe(u8, devices[0]) catch null;
-}
-
-pub fn readNextEvent(reader: *std.Io.Reader, state: *State, key_code: u16) !Event {
-    var buf: [input_event_size]u8 = undefined;
-    while (true) {
-        try reader.readSliceAll(&buf);
-        if (update(state, &buf, key_code)) |event| return event;
-    }
-}
-
-pub fn waitForRelease(reader: *std.Io.Reader, state: *State, key_code: u16) !void {
-    while (true) {
-        const event = try readNextEvent(reader, state, key_code);
-        if (event == .release) return;
-    }
-}
-
 /// Predicate polled by Select arms that race against keyboard I/O.
 pub const ShutdownCheck = *const fn () bool;
 
@@ -597,29 +575,16 @@ test "emits pending state on syn report" {
     try std.testing.expectEqual(Event.press, update(&state, &syn, right_alt).?);
 }
 
-test "waits for release on the same event reader" {
-    const down = inputEvent(ev_key, right_alt, 1);
-    const other = inputEvent(ev_key, right_alt + 1, 1);
-    const up = inputEvent(ev_key, right_alt, 0);
-    const bytes = down ++ other ++ up;
-
-    var reader: std.Io.Reader = .fixed(&bytes);
-    var state: State = .{};
-
-    try std.testing.expectEqual(Event.press, try readNextEvent(&reader, &state, right_alt));
-    try waitForRelease(&reader, &state, right_alt);
-    try std.testing.expectEqual(@as(u32, 0), state.key_state);
-}
-
 test "finds keyboard event path in proc input devices" {
     const content =
         "I: Bus=0011 Vendor=0001 Product=0001 Version=ab41\n" ++
         "N: Name=\"AT Translated Set 2 keyboard\"\n" ++
         "H: Handlers=sysrq kbd event2 leds\n" ++
         "B: KEY=" ++ real_keyboard_bitmap ++ "\n";
-    const path = findKeyboardDeviceInProcInput(std.testing.allocator, content).?;
-    defer std.testing.allocator.free(path);
-    try std.testing.expectEqualStrings("/dev/input/event2", path);
+    const paths = try findKeyboardDevicesInProcInput(std.testing.allocator, content);
+    defer freeDeviceList(std.testing.allocator, paths);
+    try std.testing.expectEqual(@as(usize, 1), paths.len);
+    try std.testing.expectEqualStrings("/dev/input/event2", paths[0]);
 }
 
 test "prefers full keyboard handlers over power button" {
@@ -633,9 +598,10 @@ test "prefers full keyboard handlers over power button" {
         "N: Name=\"Input Device\"\n" ++
         "H: Handlers=sysrq kbd event2 leds\n" ++
         "B: KEY=" ++ real_keyboard_bitmap ++ "\n";
-    const path = findKeyboardDeviceInProcInput(std.testing.allocator, content).?;
-    defer std.testing.allocator.free(path);
-    try std.testing.expectEqualStrings("/dev/input/event2", path);
+    const paths = try findKeyboardDevicesInProcInput(std.testing.allocator, content);
+    defer freeDeviceList(std.testing.allocator, paths);
+    try std.testing.expectEqual(@as(usize, 1), paths.len);
+    try std.testing.expectEqualStrings("/dev/input/event2", paths[0]);
 }
 
 test "extracts event path from handlers line" {
@@ -850,12 +816,6 @@ test "enumerates every capable keyboard in proc order without duplicates" {
     try std.testing.expectEqual(@as(usize, 2), devices.len);
     try std.testing.expectEqualStrings("/dev/input/event0", devices[0]);
     try std.testing.expectEqualStrings("/dev/input/event5", devices[1]);
-}
-
-test "single device lookup still returns the first candidate" {
-    const path = findKeyboardDeviceInProcInput(std.testing.allocator, synthetic_proc_input).?;
-    defer std.testing.allocator.free(path);
-    try std.testing.expectEqualStrings("/dev/input/event0", path);
 }
 
 test "live candidates agree with sysfs capability bitmaps" {

@@ -5,7 +5,6 @@ const doubao = @import("../doubao/client.zig");
 const engine = @import("engine.zig");
 const key = @import("../key.zig");
 const keyboard_set = @import("keyboard.zig");
-const audio_gate = @import("audio_gate.zig");
 const postprocess = @import("postprocess.zig");
 const wayland_im = @import("wayland_im.zig");
 const capture = @import("capture.zig");
@@ -19,6 +18,7 @@ pub fn run(
     io: std.Io,
     environ: std.process.Environ,
     opts: cli.Options,
+    credential_path: []const u8,
     log_file: ?*output.LogFile,
 ) !void {
     shutdown.installSignalHandlers();
@@ -27,18 +27,18 @@ pub fn run(
         .baidu => .baidu,
         .doubao => .doubao,
     };
-    const logger = output.Logger{ .io = io, .level = if (debug) .debug else .info, .log_file = log_file };
+    const logger = output.Logger{ .io = io, .allocator = allocator, .level = if (debug) .debug else .info, .log_file = log_file };
     if (mute.recoverStaleMute(allocator, io, environ)) {
         logger.info("speaker", "restored mute state after an unclean exit", .{});
     }
     mute.setMarkerPath(io, environ);
-    var cfg: config.Config = .{};
+    var cfg: config.Config = .{ .credential_path = credential_path };
     var baidu_cfg: config.BaiduConfig = undefined;
     var doubao_creds: ?config.Credentials = null;
     var engine_cfg: engine.Config = undefined;
     switch (engine_kind) {
         .baidu => {
-            baidu_cfg = try config.loadBaiduConfig(allocator, io, config.default_baidu_credential_path);
+            baidu_cfg = try config.loadBaiduConfig(allocator, io, credential_path);
             engine_cfg = .{ .baidu = baidu_cfg };
         },
         .doubao => {
@@ -185,7 +185,11 @@ const WaylandLoop = struct {
 
 fn runWaylandLoop(loop: *WaylandLoop) void {
     while (loop.running.load(.acquire) and !shutdown.isRequested()) {
-        loop.client.pump(0) catch |err| {
+        // Block in poll for the next batch of compositor messages instead of
+        // spinning at 100 Hz: an idle recording app has nothing to do, and the
+        // only state this thread publishes is "activated/deactivated" logging
+        // plus the client's active flag, which tolerates 100ms of latency.
+        loop.client.pump(wayland_poll_ms) catch |err| {
             loop.logger.err("wayland", "disconnected: {s}", .{@errorName(err)});
             loop.failed.store(true, .release);
             // Wake the hotkey loop out of its select so it can exit.
@@ -195,9 +199,12 @@ fn runWaylandLoop(loop: *WaylandLoop) void {
         if (loop.client.takeActiveChange()) |active| {
             loop.logger.debug("wayland", "{s}", .{if (active) "activated" else "deactivated"});
         }
-        shutdown.sleepUntilOr(loop.io, 10);
     }
 }
+
+/// Upper bound on how long the poll thread sleeps, and therefore on how late
+/// a shutdown request is noticed.
+const wayland_poll_ms: i32 = 100;
 
 fn runHotkeyLoop(
     allocator: std.mem.Allocator,
@@ -245,91 +252,25 @@ fn runHotkeyLoop(
         if (event.kind == .release) continue;
         output.keyEvent(logger, .press);
 
-        // Everything below borrows this iteration's stack frame; see the
-        // lifetime contract at the top of capture.zig before letting any task
-        // outlive the recording.
-        var callback_ctx = capture.EngineCallbacks{
-            .pipeline = pipeline,
-        };
+        // Everything below borrows this iteration's stack frame. `Recording`
+        // owns the session future, the session and the mute guard, so its
+        // `deinit` (below) is the single point that ends them, in order, before
+        // the frame can be reused. See the contract at the top of capture.zig.
+        var recording = capture.Recording.init(allocator, io, logger, pipeline, cfg, debug);
+        defer recording.deinit();
 
         // Parallel boot: WS handshake overlaps recorder startup + early speech buffer.
-        var session_future_opt = io.concurrent(capture.initSessionWithRetry, .{
-            allocator,
-            io,
-            cfg,
-            &callback_ctx,
-            logger,
-            debug,
-        }) catch null;
-        var session_future_taken = false;
-        defer if (session_future_opt) |*f| {
-            if (!session_future_taken) {
-                if (f.cancel(io)) |owned| {
-                    var s = owned;
-                    s.deinit();
-                } else |_| {}
-            }
-        };
-
+        recording.startSessionAsync();
         // The capture loop consumes the release, so tell the set when the
         // recording is over (and drop presses that piled up meanwhile).
         defer keyboards.endRecording(key.right_alt);
-        var captured_audio: std.ArrayList(u8) = .empty;
-        defer captured_audio.deinit(allocator);
-        var gate = audio_gate.AudioGate.init(io);
 
-        var session: engine.Session = undefined;
-        var has_session = false;
-        defer if (has_session) session.deinit();
-
-        var stream_state = capture.StreamCaptureState{
-            .allocator = allocator,
-            .session = null,
-            .captured_audio = &captured_audio,
-            .gate = &gate,
-        };
-        var speaker_guard = capture.SpeakerMuteGuard{
-            .allocator = allocator,
-            .io = io,
-            .logger = logger,
-        };
-        defer speaker_guard.release();
-        var started_state = capture.CaptureStartedState{
-            .allocator = allocator,
-            .io = io,
-            .logger = logger,
-            .gate = &gate,
-            .speaker_guard = &speaker_guard,
-            .stream_state = &stream_state,
-            .session = &session,
-            .has_session = &has_session,
-            .session_future_opt = &session_future_opt,
-            .session_future_taken = &session_future_taken,
-            .cfg = cfg,
-            .callback_ctx = &callback_ctx,
-            .debug = debug,
-        };
-        var release_state = capture.CaptureReleaseState{
-            .logger = logger,
-            .speaker_guard = &speaker_guard,
-        };
         const audio_params: mic.CaptureOptions = switch (cfg) {
             .baidu => |value| .{ .sample_rate = value.sample_rate, .channels = value.channels, .frame_duration_ms = value.frame_duration_ms },
             .doubao => |value| .{ .sample_rate = value.sample_rate, .channels = value.channels, .frame_duration_ms = value.frame_duration_ms },
         };
         logger.debug("mic", "open", .{});
-        const capture_summary = mic.captureStreamUntilKeyRelease(io, event.device.file, &event.device.state, key.right_alt, audio_params, opts.max_hold_ms, .{
-            .on_chunk = capture.onEngineAudioChunk,
-            .chunk_ctx = @ptrCast(&stream_state),
-            .on_started = capture.onCaptureStarted,
-            .started_ctx = @ptrCast(&started_state),
-            .on_stopped = capture.onCaptureStopped,
-            .stopped_ctx = @ptrCast(&release_state),
-            .on_recorder = capture.onCaptureRecorder,
-            .recorder_ctx = @ptrCast(&started_state),
-            .on_hold_timeout = capture.onHoldTimeout,
-            .hold_timeout_ctx = @ptrCast(&started_state),
-        }) catch |err| {
+        const capture_summary = mic.captureStreamUntilKeyRelease(io, event.device.file, &event.device.state, key.right_alt, audio_params, opts.max_hold_ms, recording.micOptions()) catch |err| {
             if (shutdown.isRequested()) {
                 logger.info("app", "shutting down", .{});
                 return;
@@ -352,18 +293,18 @@ fn runHotkeyLoop(
             continue;
         }
 
-        if (!has_session) {
+        if (!recording.has_session) {
             logger.err(engine.label(cfg), "session unavailable", .{});
             output.keyWait(logger);
             continue;
         }
 
-        if (stream_state.stream_error) |stream_err| {
+        if (recording.stream_error) |stream_err| {
             logger.err(engine.label(cfg), "stream failed: {s}", .{@errorName(stream_err)});
-            const finish = session.finishAfterStreamFailure();
-            if (!handleFinish(allocator, pipeline, finish) and !session.hasFinalEvent()) {
+            const finish = recording.session.finishAfterStreamFailure();
+            if (!handleFinish(allocator, pipeline, finish) and !recording.session.hasFinalEvent()) {
                 if (engine.kind(cfg) == .doubao) {
-                    const fallback = doubao.transcribePcmBytes(allocator, io, cfg.doubao, captured_audio.items, .{
+                    const fallback = doubao.transcribePcmBytes(allocator, io, cfg.doubao, recording.captured_audio.items, .{
                         .pcm_path = "",
                         .debug = debug,
                     }) catch |err| {
@@ -382,7 +323,7 @@ fn runHotkeyLoop(
             continue;
         }
 
-        const finish = session.finish() catch |err| {
+        const finish = recording.session.finish() catch |err| {
             logger.err(engine.label(cfg), "recognize failed: {s}", .{@errorName(err)});
             output.keyWait(logger);
             continue;

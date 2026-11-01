@@ -39,7 +39,7 @@ wss://frontier-audio-ime-ws.doubao.com/ocean/api/v1/ws
 
 ```
 Host: frontier-audio-ime-ws.doubao.com
-User-Agent: com.bytedance.android.doubaoime/100102018 ...
+User-Agent: com.bytedance.android.doubaoime/100501006 ...
 proto-version: v2
 x-custom-keepalive: true
 X-Device-Id: <device_id>
@@ -84,8 +84,8 @@ POST https://is.snssdk.com/service/settings/v3/
     &channel=official
     &aid=401734
     &app_name=oime
-    &version_code=100102018
-    &version_name=1.1.2
+    &version_code=100501006
+    &version_name=1.5.1
     &device_id=<随机设备 ID>
 
 Header: Content-Type: application/json
@@ -93,7 +93,7 @@ Header: x-ss-stub: <MD5("body=null") 大写十六进制>
 
 Body: body=null
 
-→ 返回 JSON，解析路径: data.settings.asr_config.app_key
+→ 返回 JSON，解析路径: data.settings.asr_config.app_key（并保存 asr_params）
 ```
 
 ### 步骤 2：获取 SAMI Token
@@ -108,8 +108,8 @@ POST https://ime.oceancloudapi.com/api/v1/user/get_config
     &channel=official
     &aid=401734
     &app_name=oime
-    &version_code=100102018
-    &version_name=1.1.2
+    &version_code=100501006
+    &version_name=1.5.1
     &device_type=Pixel 7 Pro
     &device_brand=google
     &language=zh
@@ -117,7 +117,7 @@ POST https://ime.oceancloudapi.com/api/v1/user/get_config
     &os_version=16
 
 Header: Content-Type: application/json
-Header: app_version: 1.1.2
+Header: app_version: 1.5.1
 Header: app_id: 401734
 Header: os_type: Android
 Header: x-ss-stub: <SHA256(body) 大写十六进制>
@@ -134,7 +134,8 @@ Body: {"sami_app_key":"SYlxZr6LnvBaIVmF"}
     "device_id": "随机16位数字",
     "token": "asr_app_key",
     "cdid": "随机设备标识",
-    "sami_token": "sami会话token"
+    "sami_token": "sami会话token",
+    "asr_params": "settings 下发的原始 JSON 字符串（品牌词/追踪开关）"
 }
 ```
 
@@ -319,6 +320,10 @@ pub const FrameState = enum(u64) {
     },
     "enable_punctuation": true,
     "enable_speech_rejection": false,
+    "asr_params": {
+        "brand_words": ["...", "..."],
+        "enable_global_tracking": true
+    },
     "extra": {
         "app_name": "com.android.chrome",
         "cell_compress_rate": 8,
@@ -329,6 +334,11 @@ pub const FrameState = enum(u64) {
     }
 }
 ```
+
+`asr_params` 来自 settings 接口的 `asr_config.asr_params`，以原始 JSON 对象逐字注入
+（仅当内容是合法 JSON 对象；凭据文件中缺失时省略），包含品牌词表与全局追踪开关。
+线上 A/B 实测：该字段在当前服务端未观测到对识别结果的即时影响，保留转发以对齐
+v1.5.1 客户端行为。
 
 ---
 

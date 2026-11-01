@@ -30,13 +30,13 @@ StreamingSession
 │   ├── 缓冲音频 → 拼帧 → 发送
 │   └── 互斥锁保护写操作
 │
-├── 状态机 (StreamingResultState)
+├── 状态机 (streaming_state.Waiter / State, 两个引擎共用)
 │   ├── pending（等待中）
 │   ├── final（已收到最终结果）
 │   ├── session_finished（会话结束）
 │   └── err（错误）
 │
-└── 等待机制 (waitForFinish)
+└── 等待机制 (streaming_state.Waiter.waitForFinish)
     ├── Io.Select 竞态
     ├── 条件变量等待状态变更
     └── 超时回退
@@ -89,7 +89,8 @@ parseResponse()
 静态常量（硬编码）：
 ├── aid = "401734"
 ├── app_name = "oime"
-├── app_version = "1.1.2"
+├── app_version = "1.5.1"
+├── version_code = "100501006"
 ├── sami_app_key = "SYlxZr6LnvBaIVmF"
 ├── user_agent（模拟 Android Pixel 7 Pro）
 └── 认证 URL（is.snssdk.com / oceancloudapi.com）
@@ -98,7 +99,8 @@ parseResponse()
 ├── device_id ← 随机 16 字节
 ├── cdid ← 随机设备标识
 ├── token ← 从 settings API 获取
-└── sami_token ← 从 config API 获取
+├── sami_token ← 从 config API 获取
+└── asr_params ← 从 settings API 的 asr_config 获取（品牌词/追踪开关）
 ```
 
 **x-ss-stub 机制：** 字节跳动内部 API 的请求完整性校验
@@ -154,8 +156,8 @@ parseResponse()
 | 原语 | 用途 |
 |------|------|
 | `write_mutex` | 保护 WebSocket 写操作（防止 sendChunk 和 sendFinishRequest 冲突） |
-| `state_mutex` | 保护共享状态（StreamingResultState） |
-| `state_cond` | 状态变更通知（读线程 → 主线程） |
+| `waiter.mutex` | 保护共享状态（`streaming_state.State`，两个引擎共用） |
+| `waiter.cond` | 状态变更通知（读线程 → 主线程） |
 | `stop_requested` | 原子标志，通知读线程退出 |
 
 ---
@@ -196,7 +198,7 @@ finish()
 
 ## 状态机设计
 
-### StreamingResultState
+### streaming_state.State（`src/streaming_state.zig`，Doubao/Baidu 共用）
 
 ```
                          收到 final

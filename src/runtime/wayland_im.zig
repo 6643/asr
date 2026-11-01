@@ -149,7 +149,9 @@ pub const Client = struct {
     active_changed: bool = false,
     pending_active: bool = false,
     sync_done: bool = false,
-    dead: bool = false,
+    /// Written by the poll thread and read by the commit thread; atomic so the
+    /// "stop committing into a dead socket" check cannot race.
+    dead: std.atomic.Value(bool) = .init(false),
     read_buf: std.ArrayList(u8) = .empty,
 
     pub fn allocId(self: *Client) u32 {
@@ -164,7 +166,7 @@ pub const Client = struct {
 
         if (object_id == 1) {
             if (opcode == 0) {
-                self.dead = true;
+                self.dead.store(true, .release);
                 return error.DisplayError;
             }
             return; // delete_id
@@ -190,7 +192,7 @@ pub const Client = struct {
                     if (self.pending_active != self.active) self.active_changed = true;
                     self.active = self.pending_active;
                 },
-                6 => self.dead = true,
+                6 => self.dead.store(true, .release),
                 else => {},
             }
             return;
@@ -224,7 +226,7 @@ pub const Client = struct {
 
     pub fn pumpWith(self: *Client, io: ReadIo, timeout_ms: i32) ConnectError!void {
         const ready = io.pollFn(io.ctx, timeout_ms) catch {
-            self.dead = true;
+            self.dead.store(true, .release);
             return error.ConnectionFailed;
         };
         if (!ready) return;
@@ -234,16 +236,16 @@ pub const Client = struct {
             const count = io.readFn(io.ctx, &buf) catch |err| switch (err) {
                 error.WouldBlock => break,
                 error.ReadFailed => {
-                    self.dead = true;
+                    self.dead.store(true, .release);
                     return error.ConnectionFailed;
                 },
             };
             if (count == 0) {
-                self.dead = true;
+                self.dead.store(true, .release);
                 return error.ConnectionFailed;
             }
             self.read_buf.appendSlice(self.allocator, buf[0..count]) catch {
-                self.dead = true;
+                self.dead.store(true, .release);
                 return error.ConnectionFailed;
             };
         }
@@ -256,13 +258,13 @@ pub const Client = struct {
     pub fn drainMessages(self: *Client) ConnectError!void {
         while (true) {
             if (self.read_buf.items.len > max_read_buffer_bytes) {
-                self.dead = true;
+                self.dead.store(true, .release);
                 return error.ConnectionFailed;
             }
             switch (classifyMessage(&self.read_buf)) {
                 .incomplete => return,
                 .malformed => {
-                    self.dead = true;
+                    self.dead.store(true, .release);
                     return error.MalformedMessage;
                 },
                 .message => |message| {
@@ -277,19 +279,19 @@ pub const Client = struct {
         if (std.mem.trim(u8, text, " \t\r\n").len == 0) return "ERR empty_response";
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.dead) return "ERR wayland_unavailable";
+        if (self.dead.load(.acquire)) return "ERR wayland_unavailable";
         if (!self.active) return "ERR no_text_input";
         const bytes = buildCommitMessages(self.allocator, self.im_id, self.done_count, text) catch return "ERR alloc_failed";
         defer self.allocator.free(bytes);
         writeAll(self, bytes) catch {
-            self.dead = true;
+            self.dead.store(true, .release);
             return "ERR wayland_unavailable";
         };
         return "OK committed";
     }
 
     pub fn deinit(self: *Client) void {
-        if (!self.dead) {
+        if (!self.dead.load(.acquire)) {
             var out: std.ArrayList(u8) = .empty;
             defer out.deinit(self.allocator);
             appendMessage(self.allocator, &out, self.im_id, 6, &.{}) catch {};
@@ -523,10 +525,10 @@ pub fn connect(allocator: std.mem.Allocator, io: std.Io, environ: std.process.En
     try writeAll(client, out.items);
 
     elapsed = 0;
-    while (!client.dead and client.done_count == 0 and elapsed <= unavailable_probe_ms) : (elapsed += 10) {
+    while (!client.dead.load(.acquire) and client.done_count == 0 and elapsed <= unavailable_probe_ms) : (elapsed += 10) {
         try client.pump(10);
     }
-    if (client.dead) return error.InputMethodUnavailable;
+    if (client.dead.load(.acquire)) return error.InputMethodUnavailable;
     return client;
 }
 
@@ -644,7 +646,7 @@ test "pump applies messages read from the socket" {
 
     try std.testing.expect(client.isActive());
     try std.testing.expectEqual(@as(usize, 0), client.read_buf.items.len);
-    try std.testing.expect(!client.dead);
+    try std.testing.expect(!client.dead.load(.acquire));
 }
 
 test "pump marks client dead when poll fails" {
@@ -655,7 +657,7 @@ test "pump marks client dead when poll fails" {
 
     try std.testing.expectError(error.ConnectionFailed, client.pumpWith(FakeReadIo.io(), 0));
 
-    try std.testing.expect(client.dead);
+    try std.testing.expect(client.dead.load(.acquire));
 }
 
 test "pump marks client dead on eof" {
@@ -666,7 +668,7 @@ test "pump marks client dead on eof" {
 
     try std.testing.expectError(error.ConnectionFailed, client.pumpWith(FakeReadIo.io(), 0));
 
-    try std.testing.expect(client.dead);
+    try std.testing.expect(client.dead.load(.acquire));
 }
 
 test "malformed header marks client dead" {
@@ -678,7 +680,7 @@ test "malformed header marks client dead" {
 
     try std.testing.expectError(error.MalformedMessage, client.drainMessages());
 
-    try std.testing.expect(client.dead);
+    try std.testing.expect(client.dead.load(.acquire));
 }
 
 test "read buffer over the cap marks client dead" {
@@ -688,7 +690,7 @@ test "read buffer over the cap marks client dead" {
 
     try std.testing.expectError(error.ConnectionFailed, client.drainMessages());
 
-    try std.testing.expect(client.dead);
+    try std.testing.expect(client.dead.load(.acquire));
 }
 
 test "incomplete header keeps the client alive" {
@@ -698,7 +700,7 @@ test "incomplete header keeps the client alive" {
 
     try client.drainMessages();
 
-    try std.testing.expect(!client.dead);
+    try std.testing.expect(!client.dead.load(.acquire));
     try std.testing.expectEqual(@as(usize, 3), client.read_buf.items.len);
 }
 
@@ -782,14 +784,14 @@ test "done events advance serial and apply pending active state" {
 test "unavailable marks client dead" {
     var client = testClient();
     try client.applyMessage(6, 6, &.{});
-    try std.testing.expect(client.dead);
+    try std.testing.expect(client.dead.load(.acquire));
 }
 
 test "display error is reported and marks dead" {
     var client = testClient();
     const payload = [_]u8{ 0, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 'o', 'o', 'p', 's', 0, 0, 0, 0 };
     try std.testing.expectError(error.DisplayError, client.applyMessage(1, 0, &payload));
-    try std.testing.expect(client.dead);
+    try std.testing.expect(client.dead.load(.acquire));
 }
 
 test "registry globals record seat and manager names" {
@@ -914,7 +916,7 @@ test "commit rejects empty and inactive states" {
     var client = testClient();
     try std.testing.expectEqualStrings("ERR empty_response", client.commit("   "));
     try std.testing.expectEqualStrings("ERR no_text_input", client.commit("hi"));
-    client.dead = true;
+    client.dead.store(true, .release);
     try std.testing.expectEqualStrings("ERR wayland_unavailable", client.commit("hi"));
 }
 

@@ -14,7 +14,7 @@
 
 - 只支持当前环境：Wayland 合成器（`zwp_input_method_manager_v2`）+ PipeWire（`pw-record`、`wpctl`、`pw-play`）；不新增依赖，只用 `std.posix` 与现有 `std.Io`。
 - 提交后端唯一；提交失败**只记日志**（用户决定，不做剪贴板/通知兜底）。
-- 凭证继续读写 `config/doubao.json`（用户决定，不迁 XDG state）。
+- 凭证继续读写 `config.json` 的 `doubao` 节（用户决定，不迁 XDG state）。
 - 录音期间静音**保留**；只新增"崩溃/被强杀后恢复静音"。
 - 保留 `doubao`/`baidu` 两个识别引擎与 `--once-pcm`。
 - 状态字符串沿用 `"OK …"` / `"ERR …"` 前缀；日志 domain 保持 `app`/`kbd`/`mic`/`speaker`/`wayland`/`doubao`/`baidu`/`postprocess`。

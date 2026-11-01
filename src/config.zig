@@ -22,22 +22,65 @@ pub fn refreshDoubaoCredentials(
 pub const default_websocket_url = "wss://frontier-audio-ime-ws.doubao.com/ocean/api/v1/ws";
 pub const default_aid = "401734";
 pub const default_user_agent =
-    "com.bytedance.android.doubaoime/100102018 (Linux; U; Android 16; en_US; Pixel 7 Pro; Build/BP2A.250605.031.A2; Cronet/TTNetVersion:94cf429a 2025-11-17 QuicVersion:1f89f732 2025-05-08)";
-pub const default_credential_path = "config/doubao.json";
-pub const default_baidu_credential_path = "config/baidu.json";
+    "com.bytedance.android.doubaoime/100501006 (Linux; U; Android 16; en_US; Pixel 7 Pro; Build/BP2A.250605.031.A2; Cronet/TTNetVersion:94cf429a 2025-11-17 QuicVersion:1f89f732 2025-05-08)";
+pub const default_credential_path = "config.json";
 pub const default_baidu_ws_url = "wss://vse.baidu.com/ws_api";
+
+pub fn executableConfigPath(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ) ![]u8 {
+    if (std.process.Environ.getPosix(environ, "ASR_CONFIG")) |path| {
+        return allocator.dupe(u8, path);
+    }
+
+    const executable_dir = std.process.executableDirPathAlloc(io, allocator) catch {
+        return allocator.dupe(u8, default_credential_path);
+    };
+    defer allocator.free(executable_dir);
+    return std.fs.path.join(allocator, &.{ executable_dir, "../../config.json" });
+}
+
+/// Resolves which config file to use: `path` first, then `config.json` and
+/// `../config.json` in the working directory. Resolution happens once at the
+/// boundary, so the file that is loaded is also the file the credential
+/// refresh writes back to.
+pub fn resolveConfigPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    const candidates = [_][]const u8{ path, default_credential_path, "../" ++ default_credential_path };
+    for (candidates) |candidate| {
+        const file = std.Io.Dir.cwd().openFile(io, candidate, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => |e| return e,
+        };
+        file.close(io);
+        return allocator.dupe(u8, candidate);
+    }
+    return error.FileNotFound;
+}
+
+fn readConfigFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
+}
+
+/// Reads an integer field, rejecting values that do not fit the destination
+/// type. A malformed config must fail as an error, never as an integer cast
+/// panic in the middle of startup.
+fn intField(value: std.json.Value, comptime T: type) !T {
+    if (value != .integer) return error.InvalidConfigValue;
+    return std.math.cast(T, value.integer) orelse error.InvalidConfigValue;
+}
 
 pub const Credentials = struct {
     device_id: []const u8 = "",
     token: []const u8 = "",
     cdid: []const u8 = "",
     sami_token: []const u8 = "",
+    /// Raw `asr_params` JSON string captured by the credential refresh.
+    asr_params: []const u8 = "",
 
     pub fn deinit(creds: Credentials, allocator: std.mem.Allocator) void {
         if (creds.device_id.len > 0) allocator.free(creds.device_id);
         if (creds.token.len > 0) allocator.free(creds.token);
         if (creds.cdid.len > 0) allocator.free(creds.cdid);
         if (creds.sami_token.len > 0) allocator.free(creds.sami_token);
+        if (creds.asr_params.len > 0) allocator.free(creds.asr_params);
     }
 };
 
@@ -52,6 +95,7 @@ pub const Config = struct {
     device_id: []const u8 = "",
     token: []const u8 = "",
     sami_token: []const u8 = "",
+    asr_params: []const u8 = "",
 };
 
 pub const BaiduConfig = struct {
@@ -81,6 +125,7 @@ pub fn withCredentials(base: Config, creds: Credentials) Config {
     if (cfg.device_id.len == 0) cfg.device_id = creds.device_id;
     if (cfg.token.len == 0) cfg.token = creds.token;
     if (cfg.sami_token.len == 0) cfg.sami_token = creds.sami_token;
+    if (cfg.asr_params.len == 0) cfg.asr_params = creds.asr_params;
     return cfg;
 }
 
@@ -117,21 +162,19 @@ pub fn wsUrl(allocator: std.mem.Allocator, cfg: Config) ![]u8 {
 pub fn parseCredentials(allocator: std.mem.Allocator, bytes: []const u8) !Credentials {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
-    const obj = parsed.value.object;
+    const obj = try configSection(&parsed.value, "doubao");
     var creds: Credentials = .{};
     errdefer creds.deinit(allocator);
     creds.device_id = try dupeJsonString(allocator, obj.get("device_id"));
     creds.token = try dupeJsonString(allocator, obj.get("token"));
     creds.cdid = try dupeJsonString(allocator, obj.get("cdid"));
     creds.sami_token = try dupeJsonString(allocator, obj.get("sami_token"));
+    creds.asr_params = try dupeJsonString(allocator, obj.get("asr_params"));
     return creds;
 }
 
 pub fn loadCredentials(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Credentials {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => try std.Io.Dir.cwd().readFileAlloc(io, "../config/doubao.json", allocator, .limited(1024 * 1024)),
-        else => |e| return e,
-    };
+    const bytes = try readConfigFile(allocator, io, path);
     defer allocator.free(bytes);
     return parseCredentials(allocator, bytes);
 }
@@ -143,30 +186,26 @@ fn dupeJsonString(allocator: std.mem.Allocator, value: ?std.json.Value) ![]const
 }
 
 pub fn loadBaiduConfig(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !BaiduConfig {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => try std.Io.Dir.cwd().readFileAlloc(io, "../config/baidu.json", allocator, .limited(1024 * 1024)),
-        else => |e| return e,
-    };
+    const bytes = try readConfigFile(allocator, io, path);
     defer allocator.free(bytes);
+    return parseBaiduConfig(allocator, bytes);
+}
+
+pub fn parseBaiduConfig(allocator: std.mem.Allocator, bytes: []const u8) !BaiduConfig {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
-    const obj = parsed.value.object;
+    const obj = try configSection(&parsed.value, "baidu");
     var cfg: BaiduConfig = .{};
+    errdefer cfg.deinit(allocator);
     if (obj.get("url")) |v| {
         if (v == .string and v.string.len > 0) {
             cfg.url = try allocator.dupe(u8, v.string);
             cfg.owns_url = true;
         }
     }
-    if (obj.get("sample_rate")) |v| {
-        if (v == .integer) cfg.sample_rate = @intCast(v.integer);
-    }
-    if (obj.get("channels")) |v| {
-        if (v == .integer) cfg.channels = @intCast(v.integer);
-    }
-    if (obj.get("frame_duration_ms")) |v| {
-        if (v == .integer) cfg.frame_duration_ms = @intCast(v.integer);
-    }
+    if (obj.get("sample_rate")) |v| cfg.sample_rate = try intField(v, u32);
+    if (obj.get("channels")) |v| cfg.channels = try intField(v, u16);
+    if (obj.get("frame_duration_ms")) |v| cfg.frame_duration_ms = try intField(v, u16);
     if (obj.get("user")) |v| {
         if (v == .string and v.string.len > 0) {
             cfg.user = try allocator.dupe(u8, v.string);
@@ -179,32 +218,27 @@ pub fn loadBaiduConfig(allocator: std.mem.Allocator, io: std.Io, path: []const u
             cfg.owns_dev_key = true;
         }
     }
-    if (obj.get("dev_pid")) |v| {
-        if (v == .integer) cfg.dev_pid = @intCast(v.integer);
-    }
-    if (obj.get("vad_type")) |v| {
-        if (v == .integer) cfg.vad_type = @intCast(v.integer);
-    }
-    if (obj.get("vad_mode")) |v| {
-        if (v == .integer) cfg.vad_mode = @intCast(v.integer);
-    }
+    if (obj.get("dev_pid")) |v| cfg.dev_pid = try intField(v, u32);
+    if (obj.get("vad_type")) |v| cfg.vad_type = try intField(v, u32);
+    if (obj.get("vad_mode")) |v| cfg.vad_mode = try intField(v, u32);
     if (obj.get("enable_punctuation")) |v| {
-        if (v == .bool) cfg.enable_punctuation = v.bool;
+        if (v != .bool) return error.InvalidConfigValue;
+        cfg.enable_punctuation = v.bool;
     }
     return cfg;
+}
+
+fn configSection(value: *std.json.Value, name: []const u8) !std.json.ObjectMap {
+    if (value.* != .object) return error.InvalidConfigJson;
+    const section = value.object.get(name) orelse return value.object;
+    if (section != .object) return error.InvalidConfigSection;
+    return section.object;
 }
 
 fn hostFromUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
     const uri = try std.Uri.parse(url);
     const component = uri.host orelse return error.MissingHost;
-    const host_raw = try component.toRawMaybeAlloc(allocator);
-    // toRawMaybeAlloc may return a pointer into `url` (not allocated)
-    // or a newly heap-allocated string (percent-decoded). Only free if allocated.
-    const ptr = @intFromPtr(host_raw.ptr);
-    const url_start = @intFromPtr(url.ptr);
-    const is_into_url = ptr >= url_start and ptr < url_start + url.len;
-    defer if (!is_into_url) allocator.free(host_raw);
-    return allocator.dupe(u8, host_raw);
+    return allocator.dupe(u8, component.percent_encoded);
 }
 
 test "uses default audio frame size" {
@@ -213,12 +247,51 @@ test "uses default audio frame size" {
 
 test "parses credentials json" {
     const allocator = std.testing.allocator;
-    const creds = try parseCredentials(allocator, "{\"device_id\":\"dev\",\"token\":\"tok\",\"cdid\":\"cid\",\"sami_token\":\"sami\"}");
+    const creds = try parseCredentials(allocator, "{\"device_id\":\"dev\",\"token\":\"tok\",\"cdid\":\"cid\",\"sami_token\":\"sami\",\"asr_params\":\"{\\\"brand_words\\\":[]}\"}");
     defer creds.deinit(allocator);
 
     try std.testing.expectEqualStrings("dev", creds.device_id);
     try std.testing.expectEqualStrings("tok", creds.token);
     try std.testing.expectEqualStrings("cid", creds.cdid);
+    try std.testing.expectEqualStrings("{\"brand_words\":[]}", creds.asr_params);
+}
+
+test "parses credentials json without asr params" {
+    const allocator = std.testing.allocator;
+    const creds = try parseCredentials(allocator, "{\"device_id\":\"dev\",\"token\":\"tok\"}");
+    defer creds.deinit(allocator);
+
+    try std.testing.expect(creds.asr_params.len == 0);
+}
+
+test "rejects out-of-range numeric fields instead of panicking" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidConfigValue,
+        parseBaiduConfig(allocator, "{\"baidu\":{\"sample_rate\":-1}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidConfigValue,
+        parseBaiduConfig(allocator, "{\"baidu\":{\"channels\":70000}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidConfigValue,
+        parseBaiduConfig(allocator, "{\"baidu\":{\"dev_pid\":\"8068\"}}"),
+    );
+}
+
+test "parses a baidu config section" {
+    const allocator = std.testing.allocator;
+    var cfg = try parseBaiduConfig(allocator, "{\"baidu\":{\"sample_rate\":16000,\"channels\":1}}");
+    defer cfg.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 16000), cfg.sample_rate);
+    try std.testing.expectEqual(@as(u16, 1), cfg.channels);
+}
+
+test "with credentials fills asr params" {
+    const creds: Credentials = .{ .asr_params = "{\"brand_words\":[]}" };
+    const cfg = withCredentials(.{}, creds);
+    try std.testing.expectEqualStrings("{\"brand_words\":[]}", cfg.asr_params);
 }
 
 test "credentials deinit frees partial fields without double free on empty" {
@@ -236,7 +309,7 @@ test "builds websocket headers" {
     const allocator = std.testing.allocator;
     const h = try headers(allocator, .{});
     defer allocator.free(h);
-    try std.testing.expect(std.mem.indexOf(u8, h, "User-Agent: com.bytedance.android.doubaoime/100102018") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h, "User-Agent: com.bytedance.android.doubaoime/100501006") != null);
     try std.testing.expect(std.mem.indexOf(u8, h, "proto-version: v2") != null);
 }
 

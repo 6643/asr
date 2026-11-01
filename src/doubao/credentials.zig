@@ -4,9 +4,11 @@ const asr_settings_url = "https://is.snssdk.com/service/settings/v3/";
 const sami_config_url = "https://ime.oceancloudapi.com/api/v1/user/get_config";
 const aid = "401734";
 const app_name = "oime";
-const app_version = "1.1.2";
+const app_version = "1.5.1";
+const version_code = "100501006";
 const user_agent =
-    "com.bytedance.android.doubaoime/100102018 (Linux; U; Android 16; en_US; Pixel 7 Pro; Build/BP2A.250605.031.A2; Cronet/TTNetVersion:94cf429a 2025-11-17 QuicVersion:1f89f732 2025-05-08)";
+    "com.bytedance.android.doubaoime/100501006 (Linux; U; Android 16; en_US; Pixel 7 Pro; Build/BP2A.250605.031.A2; Cronet/TTNetVersion:94cf429a 2025-11-17 QuicVersion:1f89f732 2025-05-08)";
+const sami_app_version_header = "app_version: " ++ app_version;
 const sami_app_key = "SYlxZr6LnvBaIVmF";
 const request_timeout_seconds = "15";
 
@@ -30,12 +32,46 @@ pub const RefreshIds = struct {
 pub fn extractCredentialRefreshIds(allocator: std.mem.Allocator, source: []const u8) !RefreshIds {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, source, .{});
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidCredentialJson;
+    const object = try credentialObject(&parsed.value);
 
-    const device_id = try duplicateObjectString(allocator, parsed.value.object, "device_id");
+    const device_id = try duplicateObjectString(allocator, object.*, "device_id");
     errdefer allocator.free(device_id);
-    const cdid = try duplicateObjectString(allocator, parsed.value.object, "cdid");
+    const cdid = try duplicateObjectString(allocator, object.*, "cdid");
     return .{ .device_id = device_id, .cdid = cdid };
+}
+
+pub const AsrConfig = struct {
+    app_key: []const u8,
+    /// Raw `asr_params` JSON string offered by the settings response, or
+    /// empty when the server does not provide one.
+    asr_params: []const u8,
+
+    pub fn deinit(cfg: AsrConfig, allocator: std.mem.Allocator) void {
+        allocator.free(cfg.app_key);
+        if (cfg.asr_params.len > 0) allocator.free(cfg.asr_params);
+    }
+};
+
+pub fn parseAsrConfig(allocator: std.mem.Allocator, body: []const u8) !AsrConfig {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    var current = parsed.value;
+    for ([_][]const u8{ "data", "settings", "asr_config" }) |field| {
+        if (current != .object) return error.InvalidCredentialResponse;
+        current = current.object.get(field) orelse return error.InvalidCredentialResponse;
+    }
+    if (current != .object) return error.InvalidCredentialResponse;
+    const app_key_value = current.object.get("app_key") orelse return error.InvalidCredentialResponse;
+    if (app_key_value != .string or app_key_value.string.len == 0) return error.InvalidCredentialResponse;
+    const app_key = try allocator.dupe(u8, app_key_value.string);
+    errdefer allocator.free(app_key);
+    var asr_params: []const u8 = "";
+    if (current.object.get("asr_params")) |params_value| {
+        if (params_value == .string and params_value.string.len > 0) {
+            asr_params = try allocator.dupe(u8, params_value.string);
+        }
+    }
+    return .{ .app_key = app_key, .asr_params = asr_params };
 }
 
 pub fn updateCredentialJson(
@@ -43,6 +79,7 @@ pub fn updateCredentialJson(
     source: []const u8,
     token: []const u8,
     sami_token: []const u8,
+    asr_params: []const u8,
 ) ![]u8 {
     if (token.len == 0 or sami_token.len == 0) return error.EmptyCredentialToken;
 
@@ -50,10 +87,11 @@ pub fn updateCredentialJson(
     defer arena.deinit();
     const json_allocator = arena.allocator();
     var value = try std.json.parseFromSliceLeaky(std.json.Value, json_allocator, source, .{});
-    if (value != .object) return error.InvalidCredentialJson;
+    const object = try credentialObject(&value);
 
-    try putOwnedString(json_allocator, &value.object, "token", token);
-    try putOwnedString(json_allocator, &value.object, "sami_token", sami_token);
+    try putOwnedString(json_allocator, object, "token", token);
+    try putOwnedString(json_allocator, object, "sami_token", sami_token);
+    if (asr_params.len > 0) try putOwnedString(json_allocator, object, "asr_params", asr_params);
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
@@ -66,8 +104,18 @@ fn combineRefreshTokens(
     source: []const u8,
     token: []const u8,
     sami_token: []const u8,
+    asr_params: []const u8,
 ) ![]u8 {
-    return updateCredentialJson(allocator, source, token, sami_token);
+    return updateCredentialJson(allocator, source, token, sami_token, asr_params);
+}
+
+fn credentialObject(value: *std.json.Value) !*std.json.ObjectMap {
+    if (value.* != .object) return error.InvalidCredentialJson;
+    if (value.object.getPtr("doubao")) |section| {
+        if (section.* != .object) return error.InvalidCredentialJson;
+        return &section.object;
+    }
+    return &value.object;
 }
 
 pub fn refreshFile(
@@ -82,12 +130,12 @@ pub fn refreshFile(
     const ids = try extractCredentialRefreshIds(allocator, source);
     defer ids.deinit(allocator);
 
-    const token = try fetchAsrToken(allocator, io, ids.device_id, ids.cdid, debug);
-    defer allocator.free(token);
+    const asr_config = try fetchAsrConfig(allocator, io, ids.device_id, ids.cdid, debug);
+    defer asr_config.deinit(allocator);
     const sami_token = try fetchSamiToken(allocator, io, ids.cdid, debug);
     defer allocator.free(sami_token);
 
-    const updated = try combineRefreshTokens(allocator, source, token, sami_token);
+    const updated = try combineRefreshTokens(allocator, source, asr_config.app_key, sami_token, asr_config.asr_params);
     defer allocator.free(updated);
     try writeAtomic(io, path, updated);
     return .updated;
@@ -102,18 +150,18 @@ const HttpResponse = struct {
     }
 };
 
-fn fetchAsrToken(
+fn fetchAsrConfig(
     allocator: std.mem.Allocator,
     io: std.Io,
     device_id: []const u8,
     cdid: []const u8,
     debug: bool,
-) ![]u8 {
+) !AsrConfig {
     const body = "body=null";
     const url = try std.fmt.allocPrint(
         allocator,
-        "{s}?device_platform=android&os=android&ssmix=a&_rticket={d}&cdid={s}&channel=official&aid={s}&app_name={s}&version_code=100102018&version_name={s}&device_id={s}",
-        .{ asr_settings_url, std.Io.Timestamp.now(io, .real).toMilliseconds(), cdid, aid, app_name, app_version, device_id },
+        "{s}?device_platform=android&os=android&ssmix=a&_rticket={d}&cdid={s}&channel=official&aid={s}&app_name={s}&version_code={s}&version_name={s}&device_id={s}",
+        .{ asr_settings_url, std.Io.Timestamp.now(io, .real).toMilliseconds(), cdid, aid, app_name, version_code, app_version, device_id },
     );
     defer allocator.free(url);
 
@@ -128,10 +176,10 @@ fn fetchAsrToken(
     });
     defer response.deinit(allocator);
     if (response.status != 200) {
-        if (debug) std.log.warn("credential refresh ASR request status={d}", .{response.status});
+        if (debug) std.log.scoped(.credentials).warn("ASR request status={d}", .{response.status});
         return error.CredentialRefreshAsrHttpFailed;
     }
-    return try parseTokenField(allocator, response.body, &.{ "data", "settings", "asr_config", "app_key" });
+    return try parseAsrConfig(allocator, response.body);
 }
 
 fn fetchSamiToken(
@@ -143,8 +191,8 @@ fn fetchSamiToken(
     const body = "{\"sami_app_key\":\"SYlxZr6LnvBaIVmF\"}";
     const url = try std.fmt.allocPrint(
         allocator,
-        "{s}?device_platform=android&os=android&ssmix=a&_rticket={d}&cdid={s}&channel=official&aid={s}&app_name={s}&version_code=100102018&version_name={s}&manifest_version_code=100102018&update_version_code=100102018&resolution=1080*2400&dpi=420&device_type=Pixel%%207%%20Pro&device_brand=google&language=zh&os_api=34&os_version=16&ac=wifi",
-        .{ sami_config_url, std.Io.Timestamp.now(io, .real).toMilliseconds(), cdid, aid, app_name, app_version },
+        "{s}?device_platform=android&os=android&ssmix=a&_rticket={d}&cdid={s}&channel=official&aid={s}&app_name={s}&version_code={s}&version_name={s}&manifest_version_code={s}&update_version_code={s}&resolution=1080*2400&dpi=420&device_type=Pixel%%207%%20Pro&device_brand=google&language=zh&os_api=34&os_version=16&ac=wifi",
+        .{ sami_config_url, std.Io.Timestamp.now(io, .real).toMilliseconds(), cdid, aid, app_name, version_code, app_version, version_code, version_code },
     );
     defer allocator.free(url);
 
@@ -155,14 +203,14 @@ fn fetchSamiToken(
 
     var response = try curlPost(allocator, io, url, body, &.{
         "Content-Type: application/json",
-        "app_version: 1.1.2",
+        sami_app_version_header,
         "app_id: 401734",
         "os_type: Android",
         stub_header,
     });
     defer response.deinit(allocator);
     if (response.status != 200) {
-        if (debug) std.log.warn("credential refresh SAMI request status={d}", .{response.status});
+        if (debug) std.log.scoped(.credentials).warn("SAMI request status={d}", .{response.status});
         return error.CredentialRefreshSamiHttpFailed;
     }
     return try parseTokenField(allocator, response.body, &.{ "data", "sami_token" });
@@ -286,7 +334,7 @@ fn putOwnedString(
 test "updates only token fields and preserves other credential fields" {
     const source =
         "{\"device_id\":\"dev\",\"install_id\":\"install\",\"cdid\":\"cid\",\"unknown\":42,\"token\":\"old\",\"sami_token\":\"old-sami\"}";
-    const updated = try updateCredentialJson(std.testing.allocator, source, "new", "new-sami");
+    const updated = try updateCredentialJson(std.testing.allocator, source, "new", "new-sami", "");
     defer std.testing.allocator.free(updated);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, updated, .{});
     defer parsed.deinit();
@@ -297,6 +345,49 @@ test "updates only token fields and preserves other credential fields" {
     try std.testing.expectEqualStrings("new-sami", parsed.value.object.get("sami_token").?.string);
 }
 
+test "updates asr params in credential json" {
+    const source = "{\"device_id\":\"dev\",\"token\":\"old\",\"sami_token\":\"old-sami\",\"asr_params\":\"{\\\"brand_words\\\":[]}\"}";
+    const updated = try updateCredentialJson(
+        std.testing.allocator,
+        source,
+        "new",
+        "new-sami",
+        "{\"brand_words\":[\"OpenClaw\"]}",
+    );
+    defer std.testing.allocator.free(updated);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, updated, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"brand_words\":[\"OpenClaw\"]}",
+        parsed.value.object.get("asr_params").?.string,
+    );
+}
+
+test "keeps stored asr params when refresh does not provide them" {
+    const source = "{\"device_id\":\"dev\",\"token\":\"old\",\"sami_token\":\"old-sami\",\"asr_params\":\"{\\\"brand_words\\\":[]}\"}";
+    const updated = try updateCredentialJson(std.testing.allocator, source, "new", "new-sami", "");
+    defer std.testing.allocator.free(updated);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, updated, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("{\"brand_words\":[]}", parsed.value.object.get("asr_params").?.string);
+}
+
+test "parses asr config with asr params" {
+    const body = "{\"data\":{\"settings\":{\"asr_config\":{\"app_key\":\"key-1\",\"asr_params\":\"{\\\"brand_words\\\":[\\\"OpenClaw\\\"]}\"}}}}";
+    const cfg = try parseAsrConfig(std.testing.allocator, body);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("key-1", cfg.app_key);
+    try std.testing.expectEqualStrings("{\"brand_words\":[\"OpenClaw\"]}", cfg.asr_params);
+}
+
+test "parses asr config without asr params" {
+    const body = "{\"data\":{\"settings\":{\"asr_config\":{\"app_key\":\"key-1\"}}}}";
+    const cfg = try parseAsrConfig(std.testing.allocator, body);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("key-1", cfg.app_key);
+    try std.testing.expect(cfg.asr_params.len == 0);
+}
+
 test "extracts fixed refresh identifiers" {
     const ids = try extractCredentialRefreshIds(std.testing.allocator, "{\"device_id\":\"dev\",\"cdid\":\"cid\"}");
     defer ids.deinit(std.testing.allocator);
@@ -304,11 +395,23 @@ test "extracts fixed refresh identifiers" {
     try std.testing.expectEqualStrings("cid", ids.cdid);
 }
 
+test "updates only doubao section in combined config" {
+    const source =
+        "{\"baidu\":{\"url\":\"baidu\"},\"doubao\":{\"device_id\":\"dev\",\"cdid\":\"cid\",\"token\":\"old\",\"sami_token\":\"old-sami\"}}";
+    const updated = try updateCredentialJson(std.testing.allocator, source, "new", "new-sami", "");
+    defer std.testing.allocator.free(updated);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, updated, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("baidu", parsed.value.object.get("baidu").?.object.get("url").?.string);
+    try std.testing.expectEqualStrings("new", parsed.value.object.get("doubao").?.object.get("token").?.string);
+    try std.testing.expectEqualStrings("new-sami", parsed.value.object.get("doubao").?.object.get("sami_token").?.string);
+}
+
 test "does not build refreshed credentials when either token is empty" {
     const source = "{\"device_id\":\"dev\",\"cdid\":\"cid\",\"token\":\"old\",\"sami_token\":\"old-sami\"}";
     try std.testing.expectError(
         error.EmptyCredentialToken,
-        combineRefreshTokens(std.testing.allocator, source, "new", ""),
+        combineRefreshTokens(std.testing.allocator, source, "new", "", ""),
     );
 }
 
