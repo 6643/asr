@@ -8,13 +8,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .root_source_file = b.path("vendor/websocket/src/websocket.zig"),
+        .root_source_file = b.path("src/websocket/websocket.zig"),
     });
-    {
-        const options = b.addOptions();
-        options.addOption(bool, "websocket_blocking", false);
-        websocket_mod.addOptions("build", options);
-    }
 
     const mod = b.addModule("asr_zig", .{
         .root_source_file = b.path("src/root.zig"),

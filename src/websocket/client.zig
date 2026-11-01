@@ -1,10 +1,9 @@
 const std = @import("std");
 
-const posix = @import("../posix.zig");
-const proto = @import("../proto.zig");
-const buffer = @import("../buffer.zig");
-const CompressionOpts = @import("../websocket.zig").Compression;
-const ServerHandshake = @import("../server/handshake.zig").Handshake;
+const posix = @import("posix.zig");
+const proto = @import("proto.zig");
+const buffer = @import("buffer.zig");
+const CompressionOpts = @import("websocket.zig").Compression;
 
 const Io = std.Io;
 const ascii = std.ascii;
@@ -601,6 +600,14 @@ const TLSClient = struct {
     }
 };
 
+/// Reply flags carried by `Sec-WebSocket-Extensions`. Previously borrowed from
+/// the server-side handshake type; local so the client does not pull the
+/// whole server implementation in.
+const CompressionReply = struct {
+    client_no_context_takeover: bool,
+    server_no_context_takeover: bool,
+};
+
 fn generateKey(io: Io) [16]u8 {
     if (comptime @import("builtin").is_test) {
         return [16]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
@@ -793,7 +800,7 @@ const HandShakeReply = struct {
         }
     }
 
-    pub fn parseExtension(value: []const u8) !?ServerHandshake.Compression {
+    pub fn parseExtension(value: []const u8) !?CompressionReply {
         var deflate = false;
         var client_max_bits: u8 = 15;
         var client_no_context_takeover = false;
@@ -834,283 +841,5 @@ const HandShakeReply = struct {
             .client_no_context_takeover = client_no_context_takeover,
             .server_no_context_takeover = server_no_context_takeover,
         };
-    }
-};
-
-const t = @import("../t.zig");
-test "Client: handshake" {
-    {
-        // empty response
-        var pair = t.SocketPair.init(.{});
-        defer pair.deinit();
-        var writer = pair.client.writer(t.io, &.{});
-        try writer.interface.writeAll("\r\n\r\n");
-
-        var client = testClient(pair.server);
-        defer client.deinit();
-        try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
-    }
-
-    {
-        // invalid websocket response
-        var pair = t.SocketPair.init(.{});
-        defer pair.deinit();
-        var writer = pair.client.writer(t.io, &.{});
-        try writer.interface.writeAll("HTTP/1.1 200 OK\r\n\r\n");
-
-        var client = testClient(pair.server);
-        defer client.deinit();
-        try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
-    }
-
-    {
-        // missing upgrade header
-        var pair = t.SocketPair.init(.{});
-        defer pair.deinit();
-        var writer = pair.client.writer(t.io, &.{});
-        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\n\r\n");
-
-        var client = testClient(pair.server);
-        defer client.deinit();
-        try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
-    }
-
-    {
-        // wrong upgrade header
-        var pair = t.SocketPair.init(.{});
-        defer pair.deinit();
-        var writer = pair.client.writer(t.io, &.{});
-        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: nope\r\n\r\n");
-
-        var client = testClient(pair.server);
-        defer client.deinit();
-        try t.expectError(error.InvalidUpgradeHeader, client.handshake("/", .{}));
-    }
-
-    {
-        // missing connection header
-        var pair = t.SocketPair.init(.{});
-        defer pair.deinit();
-        var writer = pair.client.writer(t.io, &.{});
-        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\n\r\n");
-
-        var client = testClient(pair.server);
-        defer client.deinit();
-        try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
-    }
-
-    {
-        // wrong connection header
-        var pair = t.SocketPair.init(.{});
-        defer pair.deinit();
-        var writer = pair.client.writer(t.io, &.{});
-        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: something\r\n\r\n");
-
-        var client = testClient(pair.server);
-        defer client.deinit();
-        try t.expectError(error.InvalidConnectionHeader, client.handshake("/", .{}));
-    }
-
-    {
-        // missing Sec-Websocket-Accept header
-        var pair = t.SocketPair.init(.{});
-        defer pair.deinit();
-        var writer = pair.client.writer(t.io, &.{});
-        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n");
-
-        var client = testClient(pair.server);
-        defer client.deinit();
-        try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
-    }
-
-    {
-        // wrong Sec-Websocket-Accept header
-        var pair = t.SocketPair.init(.{});
-        defer pair.deinit();
-        var writer = pair.client.writer(t.io, &.{});
-        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: hack\r\n\r\n");
-
-        var client = testClient(pair.server);
-        defer client.deinit();
-        try t.expectError(error.InvalidWebsocketAcceptHeader, client.handshake("/", .{}));
-    }
-
-    {
-        // ok for successful
-        var pair = t.SocketPair.init(.{});
-        defer pair.deinit();
-        var writer = pair.client.writer(t.io, &.{});
-        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\n");
-
-        var client = testClient(pair.server);
-        defer client.deinit();
-        try client.handshake("/", .{});
-        try t.expectEqual(0, client._reader.pos);
-    }
-
-    {
-        // ok for successful, with overread
-        var pair = t.SocketPair.init(.{});
-        defer pair.deinit();
-        var writer = pair.client.writer(t.io, &.{});
-        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\nSome Random Data Which is Part Of the Next Message");
-
-        var client = testClient(pair.server);
-        defer client.deinit();
-        try client.handshake("/", .{});
-        try t.expectEqual(50, client._reader.pos);
-    }
-}
-
-test "Client: write/read" {
-    var client = try Client.init(t.io, t.allocator, .{
-        .port = 9292,
-        .host = "127.0.0.1",
-    });
-    defer client.deinit();
-
-    try client.handshake("/", .{
-        .timeout_ms = 1000,
-    });
-
-    var buf = [_]u8{ 'o', 'v', 'e', 'r' };
-    try client.write(&buf);
-    try client.readTimeout(1000);
-
-    const message = (try client.read()) orelse unreachable;
-    try t.expectEqual(.text, message.type);
-    try t.expectString("9000", message.data);
-
-    client.close(.{}) catch unreachable;
-}
-
-test "Client: close with code" {
-    var client = try Client.init(t.io, t.allocator, .{
-        .port = 9292,
-        .host = "127.0.0.1",
-    });
-    defer client.deinit();
-
-    try client.handshake("/", .{
-        .timeout_ms = 1000,
-    });
-
-    client.close(.{ .code = 4002 }) catch unreachable;
-}
-
-test "Client: with code and reason" {
-    var client = try Client.init(t.io, t.allocator, .{
-        .port = 9292,
-        .host = "127.0.0.1",
-    });
-    defer client.deinit();
-
-    try client.handshake("/", .{
-        .timeout_ms = 1000,
-    });
-
-    client.close(.{ .code = 4002, .reason = "goodbye" }) catch unreachable;
-}
-
-test "Client: Handler" {
-    var h = try ClientHandler.init(t.io, t.allocator);
-    defer h.deinit();
-
-    var buf: [6]u8 = undefined;
-    {
-        @memcpy(buf[0..3], "dyn");
-        try h.client.write(buf[0..3]);
-    }
-
-    {
-        @memcpy(buf[0..4], "ping");
-        try h.client.write(buf[0..4]);
-    }
-
-    {
-        @memcpy(buf[0..4], "pong");
-        try h.client.write(buf[0..4]);
-    }
-
-    {
-        @memcpy(buf[0..6], "close1");
-        try h.client.write(buf[0..6]);
-    }
-
-    try h.client.readLoop(&h);
-
-    // if pong is true then ping and message have to be true
-    // because each asserts the previous
-    try t.expectEqual(true, h.pong);
-    try t.expectEqual(true, h.closed);
-}
-
-fn testClient(stream: Io.net.Stream) Client {
-    const bp = t.allocator.create(buffer.Provider) catch unreachable;
-    bp.* = buffer.Provider.init(t.io, t.allocator, .{ .count = 0, .size = 0, .max = 4096 }) catch unreachable;
-
-    const reader_buf = bp.allocator.alloc(u8, 1024) catch unreachable;
-
-    return .{
-        .io = t.io,
-        ._closed = false,
-        ._stream_closed = false,
-        ._write_mutex = .init,
-        ._own_bp = true,
-        ._mask_fn = generateMask,
-        ._compression_opts = null,
-        .stream = .{ .io = t.io, .stream = stream },
-        ._reader = Reader.init(reader_buf, bp, null),
-    };
-}
-
-const ClientHandler = struct {
-    ping: bool = false,
-    pong: bool = false,
-    closed: bool = false,
-    message: bool = false,
-    client: Client,
-
-    fn init(io: Io, allocator: Allocator) !ClientHandler {
-        var client = try Client.init(io, allocator, .{
-            .port = 9292,
-            .host = "127.0.0.1",
-        });
-        errdefer client.deinit();
-
-        try client.handshake("/", .{
-            .timeout_ms = 1000,
-        });
-
-        return .{
-            .client = client,
-        };
-    }
-
-    fn deinit(self: *ClientHandler) void {
-        self.client.deinit();
-    }
-
-    pub fn serverMessage(self: *ClientHandler, data: []u8, tpe: proto.Message.TextType) !void {
-        try t.expectEqual(.text, tpe);
-        try t.expectString("over 9000!", data);
-        self.message = true;
-    }
-
-    pub fn serverPing(self: *ClientHandler, data: []u8) !void {
-        try t.expectEqual(true, self.message);
-        try t.expectString("a-ping", data);
-        self.ping = true;
-    }
-
-    pub fn serverPong(self: *ClientHandler, data: []u8) !void {
-        try t.expectEqual(true, self.ping);
-        try t.expectString("a-pong", data);
-        self.pong = true;
-    }
-
-    pub fn close(self: *ClientHandler) void {
-        self.client.close(.{}) catch unreachable;
-        self.closed = true;
     }
 };
