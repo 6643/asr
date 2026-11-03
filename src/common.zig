@@ -23,6 +23,31 @@ pub fn paddedFrame(allocator: std.mem.Allocator, bytes: []const u8, len: usize) 
     return out;
 }
 
+/// Builds a `curl` argv whose TLS request goes straight to the host. The
+/// engines and both auxiliary endpoints are domestic, so the environment's
+/// proxy (`http(s)_proxy`, `all_proxy`) can only add latency and a split of
+/// traffic the proxy does not need to see. `--noproxy "*"` overrides
+/// `no_proxy` too, which matters because otherwise the env var alone can be
+/// re-enabled by the caller's shell.
+pub fn directCurlArgv(allocator: std.mem.Allocator, args: []const []const u8) !std.ArrayList([]const u8) {
+    var argv: std.ArrayList([]const u8) = .empty;
+    errdefer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{ "curl", "--noproxy", "*" });
+    try argv.appendSlice(allocator, args);
+    return argv;
+}
+
+test "curl argv ignores the environment proxy" {
+    const allocator = std.testing.allocator;
+    var argv = try directCurlArgv(allocator, &.{ "-s", "https://example.com" });
+    defer argv.deinit(allocator);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &[_][]const u8{ "curl", "--noproxy", "*", "-s", "https://example.com" },
+        argv.items,
+    );
+}
+
 test "random ids are 32 lowercase hex characters" {
     const allocator = std.testing.allocator;
     const id = try randomHexId(allocator, std.testing.io);

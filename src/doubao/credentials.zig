@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("../common.zig");
 
 const asr_settings_url = "https://is.snssdk.com/service/settings/v3/";
 const sami_config_url = "https://ime.oceancloudapi.com/api/v1/user/get_config";
@@ -216,6 +217,21 @@ fn fetchSamiToken(
     return try parseTokenField(allocator, response.body, &.{ "data", "sami_token" });
 }
 
+/// The refresh endpoints are domestic; `--noproxy "*"` keeps curl from
+/// tunneling through the environment's proxy (see `common.directCurlArgv`).
+fn curlPostArgv(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+) !std.ArrayList([]const u8) {
+    var argv = try common.directCurlArgv(allocator, &.{ "-sS", "-X", "POST", url, "--max-time", request_timeout_seconds });
+    errdefer argv.deinit(allocator);
+    for (headers) |header| try argv.appendSlice(allocator, &.{ "-H", header });
+    try argv.appendSlice(allocator, &.{ "-d", body, "-w", "\n%{http_code}" });
+    return argv;
+}
+
 fn curlPost(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -223,11 +239,8 @@ fn curlPost(
     body: []const u8,
     headers: []const []const u8,
 ) !HttpResponse {
-    var argv: std.ArrayList([]const u8) = .empty;
+    var argv = try curlPostArgv(allocator, url, body, headers);
     defer argv.deinit(allocator);
-    try argv.appendSlice(allocator, &.{ "curl", "-sS", "-X", "POST", url, "--max-time", request_timeout_seconds });
-    for (headers) |header| try argv.appendSlice(allocator, &.{ "-H", header });
-    try argv.appendSlice(allocator, &.{ "-d", body, "-w", "\n%{http_code}" });
 
     var child = try std.process.spawn(io, .{
         .argv = argv.items,
@@ -329,6 +342,17 @@ fn putOwnedString(
     const owned_field = try allocator.dupe(u8, field);
     errdefer allocator.free(owned_field);
     try object.put(allocator, owned_field, .{ .string = owned_value });
+}
+
+test "credential refresh curl ignores the environment proxy" {
+    const allocator = std.testing.allocator;
+    var argv = try curlPostArgv(allocator, "https://example.com/api", "{}", &.{"x: y"});
+    defer argv.deinit(allocator);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &[_][]const u8{ "curl", "--noproxy", "*" },
+        argv.items[0..3],
+    );
 }
 
 test "updates only token fields and preserves other credential fields" {

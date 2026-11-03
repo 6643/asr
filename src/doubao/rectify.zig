@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("../common.zig");
 
 pub const CorrectWordInfo = struct {
     source_word: []const u8,
@@ -93,29 +94,54 @@ const CurlArgs = struct {
     device_id: []const u8,
 };
 
+/// The argv plus the formatted strings it points at; `deinit` frees both.
+const CurlArgv = struct {
+    argv: std.ArrayList([]const u8),
+    owned: [3][]u8,
+
+    fn deinit(self: *CurlArgv, allocator: std.mem.Allocator) void {
+        for (self.owned) |owned| allocator.free(owned);
+        self.argv.deinit(allocator);
+    }
+};
+
+fn curlArgv(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    sami_token: []const u8,
+    device_id: []const u8,
+) !CurlArgv {
+    var owned: [3][]u8 = undefined;
+    var filled: usize = 0;
+    errdefer for (owned[0..filled]) |s| allocator.free(s);
+
+    // --max-time is a second line of defense if cancel does not interrupt curl promptly.
+    owned[filled] = try std.fmt.allocPrint(allocator, "{d}", .{@divTrunc(request_timeout_ms + 999, 1000)});
+    filled += 1;
+    owned[filled] = try std.fmt.allocPrint(allocator, "sami_token: {s}", .{sami_token});
+    filled += 1;
+    owned[filled] = try std.fmt.allocPrint(allocator, "X-Device-Id: {s}", .{device_id});
+    filled += 1;
+
+    const argv = try common.directCurlArgv(allocator, &.{
+        "-s",                                                "-X",                             "POST",
+        "https://ime.oceancloudapi.com/api/v1/rectify_text", "--max-time",                     owned[0],
+        "-H",                                                "content-type: application/json", "-H",
+        owned[1],                                            "-H",                             owned[2],
+        "-d",                                                body,
+    });
+    return .{ .argv = argv, .owned = owned };
+}
+
 fn curlRequest(args: CurlArgs) ?[]u8 {
     const allocator = args.allocator;
     const io = args.io;
-    const body = args.body;
-    const sami_token = args.sami_token;
-    const device_id = args.device_id;
 
-    const sami_hdr = std.fmt.allocPrint(allocator, "sami_token: {s}", .{sami_token}) catch return null;
-    defer allocator.free(sami_hdr);
-    const device_hdr = std.fmt.allocPrint(allocator, "X-Device-Id: {s}", .{device_id}) catch return null;
-    defer allocator.free(device_hdr);
-
-    // --max-time is a second line of defense if cancel does not interrupt curl promptly.
-    var max_time_buf: [16]u8 = undefined;
-    const max_time = std.fmt.bufPrint(&max_time_buf, "{d}", .{@divTrunc(request_timeout_ms + 999, 1000)}) catch return null;
+    var curl = curlArgv(allocator, args.body, args.sami_token, args.device_id) catch return null;
+    defer curl.deinit(allocator);
 
     var child = std.process.spawn(io, .{
-        .argv = &.{
-            "curl",                                              "-s",         "-X",     "POST",
-            "https://ime.oceancloudapi.com/api/v1/rectify_text", "--max-time", max_time, "-H",
-            "content-type: application/json",                    "-H",         sami_hdr, "-H",
-            device_hdr,                                          "-d",         body,
-        },
+        .argv = curl.argv.items,
         .stdout = .pipe,
         .stderr = .ignore,
         .stdin = .ignore,
@@ -245,6 +271,17 @@ fn codePointToByteOffset(text: []const u8, codepoint_index: usize) !usize {
         cp_count += 1;
     }
     return it.i;
+}
+
+test "rectify curl ignores the environment proxy" {
+    const allocator = std.testing.allocator;
+    var argv = try curlArgv(allocator, "body", "token", "device");
+    defer argv.deinit(allocator);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &[_][]const u8{ "curl", "--noproxy", "*" },
+        argv.argv.items[0..3],
+    );
 }
 
 test "request timeout constant is short enough for commit path" {
