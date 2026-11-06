@@ -321,8 +321,8 @@ pub const Set = struct {
                 self.logger.err("kbd", "{s}: {s}", .{ path, @errorName(err) });
                 continue;
             };
+            // `add` takes ownership: it closes `file` on every error path.
             self.add(path, file) catch |err| {
-                file.close(self.io);
                 self.logger.err("kbd", "{s}: {s}", .{ path, @errorName(err) });
                 continue;
             };
