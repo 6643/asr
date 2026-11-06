@@ -43,6 +43,12 @@ pub const DeviceReadError = error{
     Interrupted,
 };
 
+/// 泵线程停止读设备的原因，只用于把 pipe 的 EOF 细化成更准确的日志。
+pub const PumpDeath = enum(u8) { none, gone, end_of_stream, failed };
+
+/// 泵线程看到的 evdev 读 errno 该怎么处理。
+pub const PumpReadVerdict = enum { keep_reading, device_gone, failed };
+
 pub const State = struct {
     key_state: u32 = 0,
     emitted_state: u32 = 0,
@@ -469,6 +475,16 @@ fn mapReadStreamingError(err: anyerror) DeviceReadError {
     };
 }
 
+/// ENODEV/ENXIO 表示设备已被内核吊销（拔掉、休眠），不是程序错误；
+/// INTR/EAGAIN 只是重试。
+pub fn classifyPumpReadErrno(err: std.posix.E) PumpReadVerdict {
+    return switch (err) {
+        .INTR, .AGAIN => .keep_reading,
+        .NODEV, .NXIO => .device_gone,
+        else => .failed,
+    };
+}
+
 fn handlersLine(block: []const u8) ?[]const u8 {
     const prefix = "H: Handlers=";
     const start = std.mem.indexOf(u8, block, prefix) orelse return null;
@@ -847,4 +863,12 @@ test "live candidates agree with sysfs capability bitmaps" {
         defer allocator.free(bitmap);
         try std.testing.expect(supportsRightAltBitmap(bitmap));
     }
+}
+
+test "classifies pump read errnos" {
+    try std.testing.expectEqual(PumpReadVerdict.keep_reading, classifyPumpReadErrno(.INTR));
+    try std.testing.expectEqual(PumpReadVerdict.keep_reading, classifyPumpReadErrno(.AGAIN));
+    try std.testing.expectEqual(PumpReadVerdict.device_gone, classifyPumpReadErrno(.NODEV));
+    try std.testing.expectEqual(PumpReadVerdict.device_gone, classifyPumpReadErrno(.NXIO));
+    try std.testing.expectEqual(PumpReadVerdict.failed, classifyPumpReadErrno(.IO));
 }
