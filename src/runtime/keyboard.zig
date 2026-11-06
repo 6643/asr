@@ -424,6 +424,196 @@ fn drainDevice(file: std.Io.File, state: *key.State, key_code: u16, logger: outp
     if (drained > 0) logger.debug("kbd", "drained {d} buffered events", .{drained});
 }
 
+/// Moves one keyboard's evdev reads onto its own thread, so a device the kernel
+/// revoked (read returns ENODEV) surfaces as end of stream instead of a
+/// `std.Io` "unexpected errno" stack dump. The thread forwards the raw event
+/// bytes into a pipe and the app keeps reading that pipe with `std.Io`, so
+/// cancelation and `Select` semantics stay exactly as they were.
+pub const Pump = struct {
+    pub const Attachment = struct { pump: *Pump, file: std.Io.File };
+    /// Backlog accepted before the pump waits for the app to read again. 170
+    /// events is far more than a hotkey ever queues; keeping it small bounds
+    /// the per-device kernel memory.
+    pub const pipe_capacity: usize = 4096;
+
+    thread: ?std.Thread = null,
+    /// Eventfd the set writes to stop the thread. Owned here, closed in `deinit`.
+    stop_fd: std.posix.fd_t,
+    /// Why the thread stopped. Written before the pipe write end is closed, so
+    /// whoever reads end of stream afterwards sees the reason.
+    death: std.atomic.Value(u8) = .init(@backingInt(key.PumpDeath.none)),
+
+    /// Takes ownership of `evdev` on success. On failure the caller still owns
+    /// it. `file` in the result is the blocking pipe read end for the app.
+    pub fn start(allocator: std.mem.Allocator, evdev: std.Io.File) !Attachment {
+        var pipe_fds: [2]i32 = undefined;
+        if (std.posix.errno(std.os.linux.pipe2(&pipe_fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+        const read_fd = pipe_fds[0];
+        const write_fd = pipe_fds[1];
+
+        // The pump must never block inside write(): a full pipe means the app
+        // is not reading, and `closeAll` still has to be able to stop it.
+        const write_flags = std.os.linux.fcntl(write_fd, std.os.linux.F.GETFL, 0);
+        const nonblock_flag = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
+        if (std.posix.errno(write_flags) != .SUCCESS or
+            std.posix.errno(std.os.linux.fcntl(write_fd, std.os.linux.F.SETFL, write_flags | nonblock_flag)) != .SUCCESS)
+        {
+            _ = std.posix.system.close(read_fd);
+            _ = std.posix.system.close(write_fd);
+            return error.PipeFailed;
+        }
+        // Best effort: stays at the default when the kernel refuses.
+        _ = std.os.linux.fcntl(write_fd, std.os.linux.F.SETPIPE_SZ, pipe_capacity);
+
+        // Reads must never block: the pump waits in poll(), the only place a
+        // stop can interrupt it. This also lets the final read after a hangup
+        // report EOF/ENODEV instead of waiting for an event that never comes.
+        const evdev_flags = std.os.linux.fcntl(evdev.handle, std.os.linux.F.GETFL, 0);
+        if (std.posix.errno(evdev_flags) != .SUCCESS or
+            std.posix.errno(std.os.linux.fcntl(evdev.handle, std.os.linux.F.SETFL, evdev_flags | nonblock_flag)) != .SUCCESS)
+        {
+            _ = std.posix.system.close(read_fd);
+            _ = std.posix.system.close(write_fd);
+            return error.PipeFailed;
+        }
+
+        const stop_rc = std.os.linux.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
+        if (std.posix.errno(stop_rc) != .SUCCESS) {
+            _ = std.posix.system.close(read_fd);
+            _ = std.posix.system.close(write_fd);
+            return error.EventFdFailed;
+        }
+        const stop_fd: std.posix.fd_t = @intCast(stop_rc);
+
+        const pump = allocator.create(Pump) catch |err| {
+            _ = std.posix.system.close(read_fd);
+            _ = std.posix.system.close(write_fd);
+            _ = std.posix.system.close(stop_fd);
+            return err;
+        };
+        pump.* = .{ .stop_fd = stop_fd };
+
+        // Default stack size: glibc 2.44 rejects explicit sizes below its static
+        // TLS requirement with EINVAL (256 KiB does, 1 MiB does not), and the
+        // pump only needs a few hundred bytes. The cost is address space.
+        pump.thread = std.Thread.spawn(.{}, pumpMain, .{ pump, evdev.handle, write_fd }) catch |err| {
+            _ = std.posix.system.close(read_fd);
+            _ = std.posix.system.close(write_fd);
+            _ = std.posix.system.close(stop_fd);
+            allocator.destroy(pump);
+            return err;
+        };
+        return .{ .pump = pump, .file = .{ .handle = read_fd, .flags = .{ .nonblocking = false } } };
+    }
+
+    /// Stops the thread, joins it and releases this pump. The caller must clear
+    /// the field that holds it: a second call on the same allocation is not safe.
+    pub fn deinit(self: *Pump, allocator: std.mem.Allocator) void {
+        if (self.thread) |thread| {
+            const one: u64 = 1;
+            _ = std.posix.system.write(self.stop_fd, std.mem.asBytes(&one), @sizeOf(u64));
+            thread.join();
+            self.thread = null;
+        }
+        _ = std.posix.system.close(self.stop_fd);
+        allocator.destroy(self);
+    }
+
+    pub fn deathReason(self: *const Pump) key.PumpDeath {
+        return @fromBackingInt(@intCast(self.death.load(.acquire)));
+    }
+
+    fn recordDeath(self: *Pump, reason: key.PumpDeath) void {
+        self.death.store(@backingInt(reason), .release);
+    }
+};
+
+fn pumpMain(pump: *Pump, evdev_fd: std.posix.fd_t, pipe_write: std.posix.fd_t) void {
+    defer {
+        _ = std.posix.system.close(pipe_write);
+        _ = std.posix.system.close(evdev_fd);
+    }
+    var buf: [16 * key.input_event_size]u8 = undefined;
+    while (true) {
+        var fds = [2]std.posix.pollfd{
+            .{ .fd = evdev_fd, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = pump.stop_fd, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        const poll_rc = std.posix.system.poll(&fds, fds.len, -1);
+        switch (std.posix.errno(poll_rc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => {
+                pump.recordDeath(.failed);
+                return;
+            },
+        }
+        if (fds[1].revents != 0) return; // stop requested: death stays `.none`
+        const ready = fds[0].revents;
+        if (ready & (std.posix.POLL.IN | std.posix.POLL.ERR | std.posix.POLL.NVAL | std.posix.POLL.HUP) == 0) continue;
+
+        // Always drain first: events queued before a revocation stay readable.
+        const n = std.posix.system.read(evdev_fd, &buf, buf.len);
+        switch (std.posix.errno(n)) {
+            .SUCCESS => {
+                if (n == 0) {
+                    pump.recordDeath(.end_of_stream);
+                    return;
+                }
+                if (!writePipe(pump.stop_fd, pipe_write, buf[0..@intCast(n)])) return;
+                continue;
+            },
+            .INTR, .AGAIN => {
+                // Nothing buffered: now a hangup/error flag means the device left.
+                if (ready & (std.posix.POLL.ERR | std.posix.POLL.NVAL | std.posix.POLL.HUP) != 0) {
+                    pump.recordDeath(.gone);
+                    return;
+                }
+                continue;
+            },
+            else => |err| {
+                switch (key.classifyPumpReadErrno(err)) {
+                    .keep_reading => continue,
+                    .device_gone => pump.recordDeath(.gone),
+                    .failed => pump.recordDeath(.failed),
+                }
+                return;
+            },
+        }
+    }
+}
+
+/// Copies `bytes` into the pipe. Returns false when the pipe can no longer take
+/// them: the set asked the pump to stop, or the read end is gone.
+fn writePipe(stop_fd: std.posix.fd_t, fd: std.posix.fd_t, bytes: []const u8) bool {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const rc = std.posix.system.write(fd, bytes.ptr + offset, bytes.len - offset);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return false;
+                offset += @intCast(rc);
+            },
+            .INTR => {},
+            .AGAIN => {
+                var fds = [2]std.posix.pollfd{
+                    .{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 },
+                    .{ .fd = stop_fd, .events = std.posix.POLL.IN, .revents = 0 },
+                };
+                const ready = std.posix.system.poll(&fds, fds.len, -1);
+                switch (std.posix.errno(ready)) {
+                    .SUCCESS => {},
+                    .INTR => continue,
+                    else => return false,
+                }
+                if (fds[1].revents != 0) return false;
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
 /// Plays the role of a keyboard device in tests: writing to the returned write
 /// fd makes the read fd ready, closing it looks like an unplug, and an empty
 /// pipe blocks exactly like a keyboard nobody is touching.
@@ -731,4 +921,61 @@ test "rescan adds new keyboards once and ignores failures" {
     defer allocator.free(logged);
     try std.testing.expect(std.mem.indexOf(u8, logged, "added ") != null);
     try std.testing.expect(std.mem.indexOf(u8, logged, "asr-missing-keyboard") != null);
+}
+
+test "pump forwards events before reporting end of stream" {
+    const allocator = std.testing.allocator;
+    var fds: [2]i32 = undefined;
+    if (std.posix.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+    const attached = try Pump.start(allocator, .{ .handle = fds[0], .flags = .{ .nonblocking = false } });
+    defer attached.file.close(std.testing.io);
+    defer attached.pump.deinit(allocator);
+
+    const press = key.inputEvent(key.ev_key, key.right_alt, 1);
+    const release = key.inputEvent(key.ev_key, key.right_alt, 0);
+    _ = std.posix.system.write(fds[1], &press, press.len);
+    _ = std.posix.system.write(fds[1], &release, release.len);
+    _ = std.posix.system.close(fds[1]);
+
+    var state: key.State = .{};
+    try std.testing.expectEqual(key.Event.press, try key.readNextDeviceEvent(std.testing.io, attached.file, &state, key.right_alt));
+    try std.testing.expectEqual(key.Event.release, try key.readNextDeviceEvent(std.testing.io, attached.file, &state, key.right_alt));
+    try std.testing.expectError(error.EndOfStream, key.readNextDeviceEvent(std.testing.io, attached.file, &state, key.right_alt));
+    try std.testing.expectEqual(key.PumpDeath.end_of_stream, attached.pump.deathReason());
+}
+
+test "pump stops while idle" {
+    const allocator = std.testing.allocator;
+    var fds: [2]i32 = undefined;
+    if (std.posix.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+    const attached = try Pump.start(allocator, .{ .handle = fds[0], .flags = .{ .nonblocking = false } });
+    defer attached.file.close(std.testing.io);
+    defer _ = std.posix.system.close(fds[1]);
+
+    const started = std.Io.Clock.real.now(std.testing.io).toMilliseconds();
+    attached.pump.deinit(allocator);
+    const elapsed = std.Io.Clock.real.now(std.testing.io).toMilliseconds() - started;
+    try std.testing.expect(elapsed < 500);
+}
+
+test "pump stops while its pipe is full" {
+    const allocator = std.testing.allocator;
+    var fds: [2]i32 = undefined;
+    if (std.posix.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+    const attached = try Pump.start(allocator, .{ .handle = fds[0], .flags = .{ .nonblocking = false } });
+    defer attached.file.close(std.testing.io);
+    defer _ = std.posix.system.close(fds[1]);
+
+    // 171 个事件 = 4104 B，超过泵 pipe 的 4096 B 容量，且远小于假设备 pipe 的 64 KiB。
+    var batch: [171 * key.input_event_size]u8 = undefined;
+    for (0..171) |index| {
+        const event = key.inputEvent(key.ev_key, key.right_alt, 1);
+        @memcpy(batch[index * key.input_event_size ..][0..key.input_event_size], &event);
+    }
+    _ = std.posix.system.write(fds[1], &batch, batch.len);
+
+    const started = std.Io.Clock.real.now(std.testing.io).toMilliseconds();
+    attached.pump.deinit(allocator);
+    const elapsed = std.Io.Clock.real.now(std.testing.io).toMilliseconds() - started;
+    try std.testing.expect(elapsed < 500);
 }
