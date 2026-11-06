@@ -9,7 +9,11 @@ const output = @import("output.zig");
 /// only dropped at safe points (`compact`).
 pub const Device = struct {
     path: []u8,
+    /// The readable end the app waits on: the pump's pipe, or the caller's own
+    /// fd for adopted devices.
     file: std.Io.File,
+    /// Null for adopted devices (tests): they read their fd directly.
+    pump: ?*Pump = null,
     state: key.State = .{},
     dead: bool = false,
 };
@@ -78,11 +82,9 @@ pub const Set = struct {
                 logger.err("kbd", "{s}: {s}", .{ path, @errorName(err) });
                 continue;
             };
-            const owned = try allocator.dupe(u8, path);
-            set.devices.append(allocator, .{ .path = owned, .file = file }) catch |err| {
-                allocator.free(owned);
-                file.close(io);
-                return err;
+            set.add(path, file) catch |err| {
+                logger.err("kbd", "{s}: {s}", .{ path, @errorName(err) });
+                continue;
             };
             logger.info("kbd", "{s}", .{path});
         }
@@ -98,7 +100,13 @@ pub const Set = struct {
     }
 
     pub fn closeAll(self: *Set) void {
-        for (self.devices.items) |device| {
+        for (self.devices.items) |*device| {
+            // Stop the pump before closing the read end: a pump still writing
+            // would hit a closed pipe.
+            if (device.pump) |pump| {
+                pump.deinit(self.allocator);
+                device.pump = null;
+            }
             // Dead devices had their fd closed when they failed.
             if (!device.dead) device.file.close(self.io);
             self.allocator.free(device.path);
@@ -128,11 +136,24 @@ pub const Set = struct {
         return false;
     }
 
-    /// Adds one device, taking ownership of the file descriptor.
+    /// Adds one device, taking ownership of the file descriptor: every error
+    /// path closes it. The device reads through a pump from now on.
     pub fn add(self: *Set, path: []const u8, file: std.Io.File) !void {
-        const owned = try self.allocator.dupe(u8, path);
+        const owned = self.allocator.dupe(u8, path) catch |err| {
+            file.close(self.io);
+            return err;
+        };
         errdefer self.allocator.free(owned);
-        try self.devices.append(self.allocator, .{ .path = owned, .file = file });
+
+        const attached = Pump.start(self.allocator, file) catch |err| {
+            file.close(self.io);
+            return err;
+        };
+        errdefer {
+            attached.pump.deinit(self.allocator);
+            attached.file.close(self.io);
+        }
+        try self.devices.append(self.allocator, .{ .path = owned, .file = attached.file, .pump = attached.pump });
     }
 
     /// Waits for the next hotkey event from any keyboard.
@@ -227,7 +248,8 @@ pub const Set = struct {
                                 },
                                 else => {
                                     const owned_recording = self.active_handle == arm.handle;
-                                    self.logRemoved(index, err);
+                                    // Log before killDevice: the death reason lives in the pump.
+                                    self.logRemoved(index, refineRemovalError(&self.devices.items[index], err));
                                     self.killDevice(index);
                                     if (owned_recording) {
                                         self.active_handle = null;
@@ -323,6 +345,10 @@ pub const Set = struct {
         const device = &self.devices.items[index];
         if (device.dead) return;
         device.dead = true;
+        if (device.pump) |pump| {
+            pump.deinit(self.allocator);
+            device.pump = null;
+        }
         device.file.close(self.io);
     }
 
@@ -347,6 +373,18 @@ pub const Set = struct {
         self.logger.err("kbd", "{s}: {s}; removed", .{ self.devices.items[index].path, @errorName(err) });
     }
 };
+
+/// The pipe only says end of stream. Ask the pump why it stopped so the
+/// log names the real reason: a revoked device versus a vanished node.
+fn refineRemovalError(device: *const Device, err: key.DeviceReadError) key.DeviceReadError {
+    if (err != error.EndOfStream) return err;
+    const pump = device.pump orelse return err;
+    return switch (pump.deathReason()) {
+        .gone => error.KeyboardDeviceDisconnected,
+        .failed => error.ReadFailed,
+        .none, .end_of_stream => err,
+    };
+}
 
 const DeviceArm = struct {
     handle: std.posix.fd_t,
@@ -447,7 +485,7 @@ pub const Pump = struct {
     /// it. `file` in the result is the blocking pipe read end for the app.
     pub fn start(allocator: std.mem.Allocator, evdev: std.Io.File) !Attachment {
         var pipe_fds: [2]i32 = undefined;
-        if (std.posix.errno(std.os.linux.pipe2(&pipe_fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+        if (std.os.linux.errno(std.os.linux.pipe2(&pipe_fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
         const read_fd = pipe_fds[0];
         const write_fd = pipe_fds[1];
 
@@ -455,8 +493,8 @@ pub const Pump = struct {
         // is not reading, and `closeAll` still has to be able to stop it.
         const write_flags = std.os.linux.fcntl(write_fd, std.os.linux.F.GETFL, 0);
         const nonblock_flag = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
-        if (std.posix.errno(write_flags) != .SUCCESS or
-            std.posix.errno(std.os.linux.fcntl(write_fd, std.os.linux.F.SETFL, write_flags | nonblock_flag)) != .SUCCESS)
+        if (std.os.linux.errno(write_flags) != .SUCCESS or
+            std.os.linux.errno(std.os.linux.fcntl(write_fd, std.os.linux.F.SETFL, write_flags | nonblock_flag)) != .SUCCESS)
         {
             _ = std.posix.system.close(read_fd);
             _ = std.posix.system.close(write_fd);
@@ -469,8 +507,8 @@ pub const Pump = struct {
         // stop can interrupt it. This also lets the final read after a hangup
         // report EOF/ENODEV instead of waiting for an event that never comes.
         const evdev_flags = std.os.linux.fcntl(evdev.handle, std.os.linux.F.GETFL, 0);
-        if (std.posix.errno(evdev_flags) != .SUCCESS or
-            std.posix.errno(std.os.linux.fcntl(evdev.handle, std.os.linux.F.SETFL, evdev_flags | nonblock_flag)) != .SUCCESS)
+        if (std.os.linux.errno(evdev_flags) != .SUCCESS or
+            std.os.linux.errno(std.os.linux.fcntl(evdev.handle, std.os.linux.F.SETFL, evdev_flags | nonblock_flag)) != .SUCCESS)
         {
             _ = std.posix.system.close(read_fd);
             _ = std.posix.system.close(write_fd);
@@ -478,7 +516,7 @@ pub const Pump = struct {
         }
 
         const stop_rc = std.os.linux.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-        if (std.posix.errno(stop_rc) != .SUCCESS) {
+        if (std.os.linux.errno(stop_rc) != .SUCCESS) {
             _ = std.posix.system.close(read_fd);
             _ = std.posix.system.close(write_fd);
             return error.EventFdFailed;
@@ -926,7 +964,7 @@ test "rescan adds new keyboards once and ignores failures" {
 test "pump forwards events before reporting end of stream" {
     const allocator = std.testing.allocator;
     var fds: [2]i32 = undefined;
-    if (std.posix.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+    if (std.os.linux.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
     const attached = try Pump.start(allocator, .{ .handle = fds[0], .flags = .{ .nonblocking = false } });
     defer attached.file.close(std.testing.io);
     defer attached.pump.deinit(allocator);
@@ -947,7 +985,7 @@ test "pump forwards events before reporting end of stream" {
 test "pump stops while idle" {
     const allocator = std.testing.allocator;
     var fds: [2]i32 = undefined;
-    if (std.posix.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+    if (std.os.linux.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
     const attached = try Pump.start(allocator, .{ .handle = fds[0], .flags = .{ .nonblocking = false } });
     defer attached.file.close(std.testing.io);
     defer _ = std.posix.system.close(fds[1]);
@@ -961,7 +999,7 @@ test "pump stops while idle" {
 test "pump stops while its pipe is full" {
     const allocator = std.testing.allocator;
     var fds: [2]i32 = undefined;
-    if (std.posix.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+    if (std.os.linux.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
     const attached = try Pump.start(allocator, .{ .handle = fds[0], .flags = .{ .nonblocking = false } });
     defer attached.file.close(std.testing.io);
     defer _ = std.posix.system.close(fds[1]);
@@ -978,4 +1016,54 @@ test "pump stops while its pipe is full" {
     attached.pump.deinit(allocator);
     const elapsed = std.Io.Clock.real.now(std.testing.io).toMilliseconds() - started;
     try std.testing.expect(elapsed < 500);
+}
+
+test "removal error uses the pump death reason" {
+    const allocator = std.testing.allocator;
+    var device = Device{
+        .path = try fakePath(allocator, "pump"),
+        .file = .{ .handle = -1, .flags = .{ .nonblocking = false } },
+    };
+    defer allocator.free(device.path);
+
+    var pump = Pump{ .stop_fd = -1, .death = .init(@backingInt(key.PumpDeath.gone)) };
+    device.pump = &pump;
+    try std.testing.expectEqual(error.KeyboardDeviceDisconnected, refineRemovalError(&device, error.EndOfStream));
+
+    pump.death.store(@backingInt(key.PumpDeath.failed), .release);
+    try std.testing.expectEqual(error.ReadFailed, refineRemovalError(&device, error.EndOfStream));
+
+    pump.death.store(@backingInt(key.PumpDeath.none), .release);
+    try std.testing.expectEqual(error.EndOfStream, refineRemovalError(&device, error.EndOfStream));
+    try std.testing.expectEqual(error.Interrupted, refineRemovalError(&device, error.Interrupted));
+}
+
+test "set pumps a fake evdev and drops it after end of stream" {
+    const allocator = std.testing.allocator;
+    const logger: output.Logger = .{ .io = std.testing.io, .level = .err };
+    var fds: [2]i32 = undefined;
+    if (std.os.linux.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+
+    var set = Set{ .allocator = allocator, .io = std.testing.io, .logger = logger };
+    try set.add("/fake/pump", .{ .handle = fds[0], .flags = .{ .nonblocking = false } });
+    defer set.closeAll();
+    defer _ = std.posix.system.close(fds[1]);
+
+    const press = key.inputEvent(key.ev_key, key.right_alt, 1);
+    _ = std.posix.system.write(fds[1], &press, press.len);
+    const outcome = try set.readNextOrShutdown(key.right_alt, neverShutdown, null, null);
+    try std.testing.expectEqual(key.Event.press, outcome.event.kind);
+    try std.testing.expectEqualStrings("/fake/pump", outcome.event.device.path);
+}
+
+test "add closes the device when the pump cannot start" {
+    const logger: output.Logger = .{ .io = std.testing.io, .level = .err };
+    var fds: [2]i32 = undefined;
+    if (std.os.linux.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+    defer _ = std.posix.system.close(fds[1]);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var set = Set{ .allocator = failing.allocator(), .io = std.testing.io, .logger = logger };
+    try std.testing.expectError(error.OutOfMemory, set.add("/fake/fail", .{ .handle = fds[0], .flags = .{ .nonblocking = false } }));
+    try std.testing.expectEqual(std.posix.E.BADF, std.os.linux.errno(std.os.linux.fcntl(fds[0], std.os.linux.F.GETFL, 0)));
 }
