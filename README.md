@@ -70,7 +70,8 @@ zig build
 
 - 自动发现**全部**合格键盘并同时监听：判定条件是 `/proc/bus/input/devices` 里同时具备 `kbd` + `leds` + `sysrq` handler，且能力位图含 `KEY_RIGHTALT`（bit 100）。这把电源键、媒体键、离线蓝牙键盘等误报挡在外面。启动时每个生效设备打一行 `[kbd] /dev/input/eventN`。
 - **谁按的谁松**：录音由按下 RightAlt 的那把键盘的松开结束。录音期间其他键盘的事件一律忽略（`--debug` 下会看到 `[kbd] ignored event from <path>`，录音结束时会 `[kbd] drained N buffered events` 把它们清掉，不会误触发第二次录音）。
-- 每 2 秒重扫一次候选：新插上的键盘无需重启即可使用（`[kbd] added <path>`）；单个设备读失败或被拔掉只摘除该设备（`[kbd] <path>: EndOfStream; removed`），其余键盘继续工作，若暂时一把都不剩则继续重扫等待。
+- 每 2 秒重扫一次候选：新插上的键盘无需重启即可使用（`[kbd] added <path>`）；单个设备读失败或被拔掉只摘除该设备（被拔掉/休眠的设备是 `[kbd] <path>: KeyboardDeviceDisconnected; removed`，设备节点消失是 `EndOfStream; removed`），其余键盘继续工作，若暂时一把都不剩则继续重扫等待。
+- 每把设备的 evdev 读取跑在独立线程上（`runtime/keyboard.zig` 的 `Pump`），事件经管道交给热键循环。拔键盘时内核让读返回 `ENODEV`，泵自己按下而不经过 `std.Io` 的 errno 表，因此不会触发 Zig 的 `unexpected errno` 栈回溯（全局诊断保持开启），设备消失前已缓冲的按键仍会先送达。
 - 启动后绑定输入法瞬时失败（`InputMethodUnavailable`，通常是上一个进程刚被 `kill -9`）会等 300ms 重试一次，仍失败才退出。
 
 手动指定设备：
